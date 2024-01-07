@@ -23,7 +23,7 @@ impl<T> Host for WasiImpl<T>
 where
     T: WasiView,
 {
-    fn resolve_addresses(
+    async fn resolve_addresses(
         &mut self,
         network: Resource<Network>,
         name: String,
@@ -74,7 +74,7 @@ where
         &mut self,
         resource: Resource<ResolveAddressStream>,
     ) -> Result<Resource<DynPollable>> {
-        subscribe(self.table(), resource)
+        subscribe(self.table(), resource, None)
     }
 
     fn drop(&mut self, resource: Resource<ResolveAddressStream>) -> Result<()> {

@@ -1,10 +1,11 @@
-use crate::net::{SocketAddressFamily, DEFAULT_TCP_BACKLOG};
+use crate::network::SocketAddressFamily;
 use crate::p2::bindings::sockets::tcp::ErrorCode;
 use crate::p2::host::network;
 use crate::p2::{
     DynInputStream, DynOutputStream, InputStream, OutputStream, Pollable, SocketError,
     SocketResult, StreamError,
 };
+use crate::runtime::{with_ambient_tokio_runtime, AbortOnDropJoinHandle};
 use crate::runtime::{with_ambient_tokio_runtime, AbortOnDropJoinHandle};
 use anyhow::Result;
 use cap_net_ext::AddressFamily;
@@ -13,6 +14,7 @@ use io_lifetimes::views::SocketlikeView;
 use io_lifetimes::AsSocketlike;
 use rustix::io::Errno;
 use rustix::net::sockopt;
+use std::any::Any;
 use std::io;
 use std::mem;
 use std::net::{Shutdown, SocketAddr};
@@ -196,7 +198,7 @@ impl TcpSocket {
                     // been handled by our own validation slightly higher up in this
                     // function. This error mapping is here just in case there is
                     // an edge case we didn't catch.
-                    Some(Errno::AFNOSUPPORT) =>  io::Error::new(
+                    Some(Errno::AFNOSUPPORT) => io::Error::new(
                         io::ErrorKind::InvalidInput,
                         "The specified address is not a valid address for the address family of the specified socket",
                     ),
@@ -238,7 +240,7 @@ impl TcpSocket {
             TcpState::Default(..) | TcpState::Bound(..) => {}
 
             TcpState::Connecting(..) | TcpState::ConnectReady(..) => {
-                return Err(ErrorCode::ConcurrencyConflict.into())
+                return Err(ErrorCode::ConcurrencyConflict.into());
             }
 
             _ => return Err(ErrorCode::InvalidState.into()),
@@ -470,7 +472,7 @@ impl TcpSocket {
         let view = match self.tcp_state {
             TcpState::Connected { .. } => self.as_std_view()?,
             TcpState::Connecting(..) | TcpState::ConnectReady(..) => {
-                return Err(ErrorCode::ConcurrencyConflict.into())
+                return Err(ErrorCode::ConcurrencyConflict.into());
             }
             _ => return Err(ErrorCode::InvalidState.into()),
         };
@@ -749,6 +751,10 @@ impl InputStream for TcpReadStream {
     fn read(&mut self, size: usize) -> Result<bytes::Bytes, StreamError> {
         try_lock_for_stream(&self.0)?.read(size)
     }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
 }
 
 #[async_trait::async_trait]
@@ -966,6 +972,10 @@ impl OutputStream for TcpWriteStream {
 
     async fn cancel(&mut self) {
         self.0.lock().await.cancel().await
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
     }
 }
 

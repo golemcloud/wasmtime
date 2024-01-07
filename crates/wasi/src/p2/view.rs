@@ -1,6 +1,6 @@
 use crate::p2::ctx::WasiCtx;
 use wasmtime::component::ResourceTable;
-pub use wasmtime_wasi_io::{IoImpl, IoView};
+pub use wasmtime_wasi_io::{IoCtx, IoImpl, IoView};
 
 /// A trait which provides access to the [`WasiCtx`] inside the embedder's `T`
 /// of [`Store<T>`][`Store`].
@@ -73,6 +73,10 @@ pub struct WasiImpl<T>(pub IoImpl<T>);
 impl<T: IoView> IoView for WasiImpl<T> {
     fn table(&mut self) -> &mut ResourceTable {
         T::table(&mut self.0 .0)
+    }
+
+    fn io_ctx(&mut self) -> &mut IoCtx {
+        T::io_ctx(&mut self.0 .0)
     }
 }
 impl<T: WasiView> WasiView for WasiImpl<T> {

@@ -4,8 +4,10 @@ use crate::runtime::{spawn_blocking, AbortOnDropJoinHandle};
 use crate::{DirPerms, FilePerms, OpenMode, TrappableError};
 use anyhow::anyhow;
 use bytes::{Bytes, BytesMut};
+use std::any::Any;
 use std::io;
 use std::mem;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 pub type FsResult<T> = Result<T, FsError>;
@@ -80,6 +82,8 @@ pub struct File {
     pub open_mode: OpenMode,
 
     allow_blocking_current_thread: bool,
+
+    pub path: PathBuf
 }
 
 impl File {
@@ -88,12 +92,14 @@ impl File {
         perms: FilePerms,
         open_mode: OpenMode,
         allow_blocking_current_thread: bool,
+        path: PathBuf
     ) -> Self {
         Self {
             file: Arc::new(file),
             perms,
             open_mode,
             allow_blocking_current_thread,
+            path
         }
     }
 
@@ -168,6 +174,8 @@ pub struct Dir {
     pub open_mode: OpenMode,
 
     allow_blocking_current_thread: bool,
+
+    pub path: PathBuf
 }
 
 impl Dir {
@@ -177,6 +185,7 @@ impl Dir {
         file_perms: FilePerms,
         open_mode: OpenMode,
         allow_blocking_current_thread: bool,
+        path: PathBuf
     ) -> Self {
         Dir {
             dir: Arc::new(dir),
@@ -184,6 +193,7 @@ impl Dir {
             file_perms,
             open_mode,
             allow_blocking_current_thread,
+            path
         }
     }
 
@@ -332,6 +342,10 @@ impl InputStream for FileInputStream {
             _ => {}
         }
     }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
 }
 #[async_trait::async_trait]
 impl Pollable for FileInputStream {
@@ -434,6 +448,10 @@ const FILE_WRITE_CAPACITY: usize = 1024 * 1024;
 
 #[async_trait::async_trait]
 impl OutputStream for FileOutputStream {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
     fn write(&mut self, buf: Bytes) -> Result<(), StreamError> {
         match self.state {
             OutputState::Ready => {}
@@ -553,7 +571,7 @@ pub struct ReaddirIterator(
 );
 
 impl ReaddirIterator {
-    pub(crate) fn new(
+    pub fn new(
         i: impl Iterator<Item = FsResult<types::DirectoryEntry>> + Send + 'static,
     ) -> Self {
         ReaddirIterator(std::sync::Mutex::new(Box::new(i)))

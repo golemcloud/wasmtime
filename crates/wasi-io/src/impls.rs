@@ -9,7 +9,8 @@ use anyhow::{anyhow, Result};
 use core::future::Future;
 use core::pin::Pin;
 use core::task::{Context, Poll};
-use wasmtime::component::Resource;
+use std::time::Instant;
+use wasmtime::component::{Resource, ResourceTable};
 
 impl<T: IoView> poll::Host for IoImpl<T> {
     async fn poll(&mut self, pollables: Vec<Resource<DynPollable>>) -> Result<Vec<u32>> {
@@ -19,22 +20,42 @@ impl<T: IoView> poll::Host for IoImpl<T> {
             return Err(anyhow!("empty poll list"));
         }
 
-        let table = self.table();
-
         let mut table_futures: BTreeMap<u32, (MakeFuture, Vec<ReadylistIndex>)> = BTreeMap::new();
+        let mut all_supports_suspend = Some(None);
 
         for (ix, p) in pollables.iter().enumerate() {
             let ix: u32 = ix.try_into()?;
 
-            let pollable = table.get(p)?;
+            let table = self.table();
+            let pollable = get_pollable_following_overrides(table, p)?;
+
             let (_, list) = table_futures
                 .entry(pollable.index)
                 .or_insert((pollable.make_future, Vec::new()));
             list.push(ix);
+
+            match pollable.supports_suspend {
+                None => {
+                    all_supports_suspend = None;
+                }
+                Some(maximum_suspend_time) => {
+                    all_supports_suspend = all_supports_suspend.map(|maybe_max| match maybe_max {
+                        None => Some(maximum_suspend_time),
+                        Some(max) => Some(std::cmp::min(max, maximum_suspend_time)),
+                    });
+                }
+            }
+        }
+
+        if let Some(Some(deadline)) = all_supports_suspend {
+            let duration = deadline.duration_since(Instant::now());
+            if duration >= self.io_ctx().suspend_threshold {
+                return Err((self.io_ctx().suspend_signal)(duration));
+            }
         }
 
         let mut futures: Vec<(DynFuture<'_>, Vec<ReadylistIndex>)> = Vec::new();
-        for (entry, (make_future, readylist_indices)) in table.iter_entries(table_futures) {
+        for (entry, (make_future, readylist_indices)) in self.table().iter_entries(table_futures) {
             let entry = entry?;
             futures.push((make_future(entry), readylist_indices));
         }
@@ -69,17 +90,41 @@ impl<T: IoView> poll::Host for IoImpl<T> {
     }
 }
 
+fn get_pollable_following_overrides<'a>(
+    table: &'a ResourceTable,
+    pollable: &Resource<DynPollable>,
+) -> Result<&'a DynPollable> {
+    let mut pollable = table.get(&pollable)?;
+    loop {
+        if let Some(override_self) = &pollable.override_self {
+            let entry = table.get_any(pollable.index)?;
+            let pollable_override = override_self(entry);
+            if let Some(overridden_idx) = pollable_override {
+                pollable = table
+                    .get_any(overridden_idx)?
+                    .downcast_ref()
+                    .ok_or_else(|| anyhow!("Pollable override does not point to a Pollable"))?;
+            } else {
+                break;
+            }
+        } else {
+            break;
+        }
+    }
+    Ok(pollable)
+}
+
 impl<T: IoView> crate::bindings::wasi::io::poll::HostPollable for IoImpl<T> {
     async fn block(&mut self, pollable: Resource<DynPollable>) -> Result<()> {
         let table = self.table();
-        let pollable = table.get(&pollable)?;
+        let pollable = get_pollable_following_overrides(table, &pollable)?;
         let ready = (pollable.make_future)(table.get_any_mut(pollable.index)?);
         ready.await;
         Ok(())
     }
     async fn ready(&mut self, pollable: Resource<DynPollable>) -> Result<bool> {
         let table = self.table();
-        let pollable = table.get(&pollable)?;
+        let pollable = get_pollable_following_overrides(table, &pollable)?;
         let ready = (pollable.make_future)(table.get_any_mut(pollable.index)?);
         futures::pin_mut!(ready);
         Ok(matches!(
@@ -132,13 +177,13 @@ impl<T: IoView> streams::HostOutputStream for IoImpl<T> {
         Ok(bytes as u64)
     }
 
-    fn write(&mut self, stream: Resource<DynOutputStream>, bytes: Vec<u8>) -> StreamResult<()> {
+    async fn write(&mut self, stream: Resource<DynOutputStream>, bytes: Vec<u8>) -> StreamResult<()> {
         self.table().get_mut(&stream)?.write(bytes.into())?;
         Ok(())
     }
 
     fn subscribe(&mut self, stream: Resource<DynOutputStream>) -> Result<Resource<DynPollable>> {
-        subscribe(self.table(), stream)
+        subscribe(self.table(), stream, None)
     }
 
     async fn blocking_write_and_flush(
@@ -175,12 +220,12 @@ impl<T: IoView> streams::HostOutputStream for IoImpl<T> {
             .await
     }
 
-    fn write_zeroes(&mut self, stream: Resource<DynOutputStream>, len: u64) -> StreamResult<()> {
+    async fn write_zeroes(&mut self, stream: Resource<DynOutputStream>, len: u64) -> StreamResult<()> {
         self.table().get_mut(&stream)?.write_zeroes(len as usize)?;
         Ok(())
     }
 
-    fn flush(&mut self, stream: Resource<DynOutputStream>) -> StreamResult<()> {
+    async fn flush(&mut self, stream: Resource<DynOutputStream>) -> StreamResult<()> {
         self.table().get_mut(&stream)?.flush()?;
         Ok(())
     }
@@ -192,7 +237,7 @@ impl<T: IoView> streams::HostOutputStream for IoImpl<T> {
         Ok(())
     }
 
-    fn splice(
+    async fn splice(
         &mut self,
         dest: Resource<DynOutputStream>,
         src: Resource<DynInputStream>,
@@ -257,7 +302,7 @@ impl<T: IoView> streams::HostInputStream for IoImpl<T> {
         Ok(())
     }
 
-    fn read(&mut self, stream: Resource<DynInputStream>, len: u64) -> StreamResult<Vec<u8>> {
+    async fn read(&mut self, stream: Resource<DynInputStream>, len: u64) -> StreamResult<Vec<u8>> {
         let len = len.try_into().unwrap_or(usize::MAX);
         let bytes = self.table().get_mut(&stream)?.read(len)?;
         debug_assert!(bytes.len() <= len);
@@ -275,7 +320,7 @@ impl<T: IoView> streams::HostInputStream for IoImpl<T> {
         Ok(bytes.into())
     }
 
-    fn skip(&mut self, stream: Resource<DynInputStream>, len: u64) -> StreamResult<u64> {
+    async fn skip(&mut self, stream: Resource<DynInputStream>, len: u64) -> StreamResult<u64> {
         let len = len.try_into().unwrap_or(usize::MAX);
         let written = self.table().get_mut(&stream)?.skip(len)?;
         Ok(written.try_into().expect("usize always fits in u64"))
@@ -292,6 +337,6 @@ impl<T: IoView> streams::HostInputStream for IoImpl<T> {
     }
 
     fn subscribe(&mut self, stream: Resource<DynInputStream>) -> Result<Resource<DynPollable>> {
-        crate::poll::subscribe(self.table(), stream)
+        crate::poll::subscribe(self.table(), stream, None)
     }
 }

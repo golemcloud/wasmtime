@@ -41,7 +41,7 @@ where
     }
 
     fn write(&mut self, stream: Resource<OutputStream>, bytes: Vec<u8>) -> StreamResult<()> {
-        Ok(AsyncHostOutputStream::write(self, stream, bytes)?)
+        in_tokio(async { Ok(AsyncHostOutputStream::write(self, stream, bytes).await?) })
     }
 
     fn blocking_write_and_flush(
@@ -69,14 +69,13 @@ where
     }
 
     fn write_zeroes(&mut self, stream: Resource<OutputStream>, len: u64) -> StreamResult<()> {
-        Ok(AsyncHostOutputStream::write_zeroes(self, stream, len)?)
+        in_tokio(async { Ok(AsyncHostOutputStream::write_zeroes(self, stream, len).await?) })
     }
 
     fn flush(&mut self, stream: Resource<OutputStream>) -> StreamResult<()> {
-        Ok(AsyncHostOutputStream::flush(
-            self,
-            Resource::new_borrow(stream.rep()),
-        )?)
+        in_tokio(async {
+            Ok(AsyncHostOutputStream::flush(self, Resource::new_borrow(stream.rep())).await?)
+        })
     }
 
     fn blocking_flush(&mut self, stream: Resource<OutputStream>) -> StreamResult<()> {
@@ -91,7 +90,7 @@ where
         src: Resource<InputStream>,
         len: u64,
     ) -> StreamResult<u64> {
-        AsyncHostOutputStream::splice(self, dst, src, len)
+        in_tokio(async { AsyncHostOutputStream::splice(self, dst, src, len).await })
     }
 
     fn blocking_splice(
@@ -113,7 +112,7 @@ where
     }
 
     fn read(&mut self, stream: Resource<InputStream>, len: u64) -> StreamResult<Vec<u8>> {
-        AsyncHostInputStream::read(self, stream, len)
+        in_tokio(async { AsyncHostInputStream::read(self, stream, len).await })
     }
 
     fn blocking_read(&mut self, stream: Resource<InputStream>, len: u64) -> StreamResult<Vec<u8>> {
@@ -121,7 +120,7 @@ where
     }
 
     fn skip(&mut self, stream: Resource<InputStream>, len: u64) -> StreamResult<u64> {
-        AsyncHostInputStream::skip(self, stream, len)
+        in_tokio(async { AsyncHostInputStream::skip(self, stream, len).await })
     }
 
     fn blocking_skip(&mut self, stream: Resource<InputStream>, len: u64) -> StreamResult<u64> {

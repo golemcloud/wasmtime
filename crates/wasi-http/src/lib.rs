@@ -226,7 +226,51 @@ pub mod body;
 pub mod io;
 pub mod types;
 
-pub mod bindings;
+/// Raw bindings to the `wasi:http` package.
+pub mod bindings {
+    #![allow(missing_docs)]
+    wasmtime::component::bindgen!({
+        path: "wit",
+        world: "wasi:http/proxy",
+        tracing: true,
+        async: {
+            only_imports: [
+                "handle",
+                "[method]future-incoming-response.get",
+                "[method]future-trailers.get",
+                "[static]incoming-body.finish",
+                "[drop]incoming-body",
+                "[drop]incoming-response",
+                "[drop]future-incoming-response",
+            ],
+        },
+        trappable_imports: true,
+        require_store_data_send: true,
+        with: {
+            // Upstream package dependencies
+            "wasi:io": wasmtime_wasi::bindings::io,
+
+            // Configure all WIT http resources to be defined types in this
+            // crate to use the `ResourceTable` helper methods.
+            "wasi:http/types/outgoing-body": super::body::HostOutgoingBody,
+            "wasi:http/types/future-incoming-response": super::types::HostFutureIncomingResponse,
+            "wasi:http/types/outgoing-response": super::types::HostOutgoingResponse,
+            "wasi:http/types/future-trailers": super::body::HostFutureTrailers,
+            "wasi:http/types/incoming-body": super::body::HostIncomingBody,
+            "wasi:http/types/incoming-response": super::types::HostIncomingResponse,
+            "wasi:http/types/response-outparam": super::types::HostResponseOutparam,
+            "wasi:http/types/outgoing-request": super::types::HostOutgoingRequest,
+            "wasi:http/types/incoming-request": super::types::HostIncomingRequest,
+            "wasi:http/types/fields": super::types::HostFields,
+            "wasi:http/types/request-options": super::types::HostRequestOptions,
+        },
+        trappable_error_type: {
+            "wasi:http/types/error-code" => crate::HttpError,
+        },
+    });
+
+    pub use wasi::http;
+}
 
 pub use crate::error::{
     http_request_error, hyper_request_error, hyper_response_error, HttpError, HttpResult,
@@ -342,86 +386,4 @@ where
     Ok(())
 }
 
-/// Add all of the `wasi:http/proxy` world's interfaces to a [`wasmtime::component::Linker`].
-///
-/// This function will add the `sync` variant of all interfaces into the
-/// `Linker` provided. For embeddings with async support see
-/// [`add_to_linker_async`] instead.
-///
-/// # Example
-///
-/// ```
-/// use wasmtime::{Engine, Result, Config};
-/// use wasmtime::component::{ResourceTable, Linker};
-/// use wasmtime_wasi::p2::{IoView, WasiCtx, WasiView};
-/// use wasmtime_wasi_http::{WasiHttpCtx, WasiHttpView};
-///
-/// fn main() -> Result<()> {
-///     let config = Config::default();
-///     let engine = Engine::new(&config)?;
-///
-///     let mut linker = Linker::<MyState>::new(&engine);
-///     wasmtime_wasi_http::add_to_linker_sync(&mut linker)?;
-///     // ... add any further functionality to `linker` if desired ...
-///
-///     Ok(())
-/// }
-///
-/// struct MyState {
-///     ctx: WasiCtx,
-///     http_ctx: WasiHttpCtx,
-///     table: ResourceTable,
-/// }
-/// impl IoView for MyState {
-///     fn table(&mut self) -> &mut ResourceTable { &mut self.table }
-/// }
-/// impl WasiHttpView for MyState {
-///     fn ctx(&mut self) -> &mut WasiHttpCtx { &mut self.http_ctx }
-/// }
-/// impl WasiView for MyState {
-///     fn ctx(&mut self) -> &mut WasiCtx { &mut self.ctx }
-/// }
-/// ```
-pub fn add_to_linker_sync<T>(l: &mut wasmtime::component::Linker<T>) -> anyhow::Result<()>
-where
-    T: WasiHttpView + wasmtime_wasi::p2::WasiView,
-{
-    let io_closure = type_annotate_io::<T, _>(|t| wasmtime_wasi::p2::IoImpl(t));
-    // For the sync linker, use the definitions of poll and streams from the
-    // wasmtime_wasi::p2::bindings::sync space because those are defined using in_tokio.
-    wasmtime_wasi::p2::bindings::sync::io::poll::add_to_linker_get_host(l, io_closure)?;
-    wasmtime_wasi::p2::bindings::sync::io::streams::add_to_linker_get_host(l, io_closure)?;
-    // The error interface in the wasmtime_wasi is synchronous
-    wasmtime_wasi::p2::bindings::io::error::add_to_linker_get_host(l, io_closure)?;
-
-    let closure =
-        type_annotate_wasi::<T, _>(|t| wasmtime_wasi::p2::WasiImpl(wasmtime_wasi::p2::IoImpl(t)));
-
-    wasmtime_wasi::p2::bindings::clocks::wall_clock::add_to_linker_get_host(l, closure)?;
-    wasmtime_wasi::p2::bindings::clocks::monotonic_clock::add_to_linker_get_host(l, closure)?;
-    wasmtime_wasi::p2::bindings::cli::stdin::add_to_linker_get_host(l, closure)?;
-    wasmtime_wasi::p2::bindings::cli::stdout::add_to_linker_get_host(l, closure)?;
-    wasmtime_wasi::p2::bindings::cli::stderr::add_to_linker_get_host(l, closure)?;
-    wasmtime_wasi::p2::bindings::random::random::add_to_linker_get_host(l, closure)?;
-
-    add_only_http_to_linker_sync(l)?;
-
-    Ok(())
-}
-
-/// A slimmed down version of [`add_to_linker_sync`] which only adds
-/// `wasi:http` interfaces to the linker.
-///
-/// This is useful when using [`wasmtime_wasi::p2::add_to_linker_sync`] for
-/// example to avoid re-adding the same interfaces twice.
-pub fn add_only_http_to_linker_sync<T>(l: &mut wasmtime::component::Linker<T>) -> anyhow::Result<()>
-where
-    T: WasiHttpView,
-{
-    let closure = type_annotate_http::<T, _>(|t| WasiHttpImpl(IoImpl(t)));
-
-    crate::bindings::http::outgoing_handler::add_to_linker_get_host(l, closure)?;
-    crate::bindings::http::types::add_to_linker_get_host(l, closure)?;
-
-    Ok(())
-}
+pub use crate::types_impl::get_fields;

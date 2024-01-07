@@ -3,10 +3,12 @@ use anyhow::Result;
 use core::any::Any;
 use core::future::Future;
 use core::pin::Pin;
+use std::time::Instant;
 use wasmtime::component::{Resource, ResourceTable};
 
 pub type DynFuture<'a> = Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
 pub type MakeFuture = for<'a> fn(&'a mut dyn Any) -> DynFuture<'a>;
+pub type OverrideSelf = fn(&dyn Any) -> Option<u32>;
 
 /// The host representation of the `wasi:io/poll.pollable` resource.
 ///
@@ -16,8 +18,10 @@ pub type MakeFuture = for<'a> fn(&'a mut dyn Any) -> DynFuture<'a>;
 /// `DynPollable` contains a way to create a Future in each call to `poll`.
 pub struct DynPollable {
     pub(crate) index: u32,
+    pub(crate) override_self: Option<OverrideSelf>,
     pub(crate) make_future: MakeFuture,
     pub(crate) remove_index_on_delete: Option<fn(&mut ResourceTable, u32) -> Result<()>>,
+    pub(crate) supports_suspend: Option<Instant>,
 }
 
 /// The trait used to implement [`DynPollable`] to create a `pollable`
@@ -49,7 +53,7 @@ pub struct DynPollable {
 ///     let end = Instant::now() + dur;
 ///     let sleep = MySleep { end };
 ///     let sleep_resource = cx.table().push(sleep)?;
-///     subscribe(cx.table(), sleep_resource)
+///     subscribe(cx.table(), sleep_resource, None)
 /// }
 ///
 /// struct MySleep {
@@ -90,6 +94,7 @@ pub trait Pollable: Send + 'static {
 pub fn subscribe<T>(
     table: &mut ResourceTable,
     resource: Resource<T>,
+    supports_suspend: Option<Instant>,
 ) -> Result<Resource<DynPollable>>
 where
     T: Pollable,
@@ -103,6 +108,7 @@ where
 
     let pollable = DynPollable {
         index: resource.rep(),
+        override_self: None,
         remove_index_on_delete: if resource.owned() {
             Some(|table, idx| {
                 let resource = Resource::<T>::new_own(idx);
@@ -113,6 +119,59 @@ where
             None
         },
         make_future: make_future::<T>,
+        supports_suspend
+    };
+
+    Ok(table.push_child(pollable, &resource)?)
+}
+
+/// An advanced version of Pollable supporting dynamically switching the underlying table entry
+///
+/// This can be used to implement "lazy initialized" pollables.
+#[async_trait::async_trait]
+pub trait DynamicPollable: Pollable {
+    /// Returns the table index to another `Pollable` entry in case the override should happen
+    fn override_index(&self) -> Option<u32>;
+}
+
+/// Creates a `pollable` resource from a `DynamicSubscribe` implementation
+pub fn dynamic_subscribe<T>(
+    table: &mut ResourceTable,
+    resource: Resource<T>,
+    supports_suspend: Option<Instant>,
+) -> Result<Resource<DynPollable>>
+where
+    T: DynamicPollable,
+{
+    fn make_future<'a, T>(stream: &'a mut dyn Any) -> DynFuture<'a>
+    where
+        T: DynamicPollable,
+    {
+        stream.downcast_mut::<T>().unwrap().ready()
+    }
+
+    fn override_self<'a, T>(entry: &'a dyn Any) -> Option<u32>
+    where
+        T: DynamicPollable,
+    {
+        let entry = entry.downcast_ref::<T>().unwrap();
+        entry.override_index()
+    }
+
+    let pollable = DynPollable {
+        index: resource.rep(),
+        override_self: Some(override_self::<T>),
+        remove_index_on_delete: if resource.owned() {
+            Some(|table, idx| {
+                let resource = Resource::<T>::new_own(idx);
+                table.delete(resource)?;
+                Ok(())
+            })
+        } else {
+            None
+        },
+        make_future: make_future::<T>,
+        supports_suspend,
     };
 
     Ok(table.push_child(pollable, &resource)?)

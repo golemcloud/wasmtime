@@ -10,7 +10,7 @@ use crate::{
     },
     WasiHttpImpl, WasiHttpView,
 };
-use anyhow::Context;
+use anyhow::{anyhow, Context};
 use std::any::Any;
 use std::str::FromStr;
 use wasmtime::component::{Resource, ResourceTable, ResourceTableError};
@@ -69,7 +69,8 @@ fn move_fields(
     }
 }
 
-fn get_fields<'a>(
+#[allow(missing_docs)]
+pub fn get_fields<'a>(
     table: &'a mut ResourceTable,
     id: &Resource<HostFields>,
 ) -> wasmtime::Result<&'a FieldMap> {
@@ -584,7 +585,7 @@ impl<T> crate::bindings::http::types::HostIncomingResponse for WasiHttpImpl<T>
 where
     T: WasiHttpView,
 {
-    fn drop(&mut self, response: Resource<HostIncomingResponse>) -> wasmtime::Result<()> {
+    async fn drop(&mut self, response: Resource<HostIncomingResponse>) -> wasmtime::Result<()> {
         let _ = self
             .table()
             .delete(response)
@@ -660,10 +661,10 @@ where
         &mut self,
         index: Resource<HostFutureTrailers>,
     ) -> wasmtime::Result<Resource<DynPollable>> {
-        wasmtime_wasi::p2::subscribe(self.table(), index)
+        wasmtime_wasi::p2::subscribe(self.table(), index, None)
     }
 
-    fn get(
+    async fn get(
         &mut self,
         id: Resource<HostFutureTrailers>,
     ) -> wasmtime::Result<Option<Result<Result<Option<Resource<Trailers>>, types::ErrorCode>, ()>>>
@@ -705,7 +706,6 @@ where
         let body = self.table().get_mut(&id)?;
 
         if let Some(stream) = body.take_stream() {
-            let stream: DynInputStream = Box::new(stream);
             let stream = self.table().push_child(stream, &id)?;
             return Ok(Ok(stream));
         }
@@ -713,7 +713,7 @@ where
         Ok(Err(()))
     }
 
-    fn finish(
+    async fn finish(
         &mut self,
         id: Resource<HostIncomingBody>,
     ) -> wasmtime::Result<Resource<HostFutureTrailers>> {
@@ -722,7 +722,7 @@ where
         Ok(trailers)
     }
 
-    fn drop(&mut self, id: Resource<HostIncomingBody>) -> wasmtime::Result<()> {
+    async fn drop(&mut self, id: Resource<HostIncomingBody>) -> wasmtime::Result<()> {
         let _ = self.table().delete(id)?;
         Ok(())
     }
@@ -827,12 +827,12 @@ impl<T> crate::bindings::http::types::HostFutureIncomingResponse for WasiHttpImp
 where
     T: WasiHttpView,
 {
-    fn drop(&mut self, id: Resource<HostFutureIncomingResponse>) -> wasmtime::Result<()> {
+    async fn drop(&mut self, id: Resource<HostFutureIncomingResponse>) -> wasmtime::Result<()> {
         let _ = self.table().delete(id)?;
         Ok(())
     }
 
-    fn get(
+    async fn get(
         &mut self,
         id: Resource<HostFutureIncomingResponse>,
     ) -> wasmtime::Result<
@@ -844,6 +844,27 @@ where
             HostFutureIncomingResponse::Pending(_) => return Ok(None),
             HostFutureIncomingResponse::Consumed => return Ok(Some(Err(()))),
             HostFutureIncomingResponse::Ready(_) => {}
+            HostFutureIncomingResponse::Deferred { .. } => {
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                let handle = wasmtime_wasi::runtime::spawn(async move {
+                    let request = rx.await.map_err(|err| anyhow!(err))?;
+                    let HostFutureIncomingResponse::Deferred { request, config } = request
+                        else {
+                            return Err(anyhow!("unexpected incoming response state".to_string()));
+                        };
+                    let resp = crate::types::default_send_request_handler(
+                        request, config,
+                    )
+                        .await;
+                    Ok(resp)
+                });
+                tx.send(std::mem::replace(
+                    resp,
+                    HostFutureIncomingResponse::Pending(handle),
+                ))
+                    .map_err(|_| anyhow!("failed to send request to handler"))?;
+                return Ok(None);
+            }
         }
 
         let resp =
@@ -881,7 +902,7 @@ where
         &mut self,
         id: Resource<HostFutureIncomingResponse>,
     ) -> wasmtime::Result<Resource<DynPollable>> {
-        wasmtime_wasi::p2::subscribe(self.table(), id)
+        wasmtime_wasi::p2::subscribe(self.table(), id, None)
     }
 }
 

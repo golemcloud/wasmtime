@@ -20,7 +20,7 @@ impl<T> outgoing_handler::Host for WasiHttpImpl<T>
 where
     T: WasiHttpView,
 {
-    fn handle(
+    async fn handle(
         &mut self,
         request_id: Resource<HostOutgoingRequest>,
         options: Option<Resource<types::RequestOptions>>,

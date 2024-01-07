@@ -18,7 +18,7 @@ impl<T> preopens::Host for WasiImpl<T>
 where
     T: WasiView,
 {
-    fn get_directories(
+    async fn get_directories(
         &mut self,
     ) -> Result<Vec<(Resource<types::Descriptor>, String)>, anyhow::Error> {
         let mut results = Vec::new();
@@ -98,11 +98,11 @@ where
                     // this error, for POSIX compatibility.
                     #[cfg(windows)]
                     Err(e)
-                        if e.raw_os_error()
-                            == Some(windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED as _) =>
-                    {
-                        Ok(())
-                    }
+                    if e.raw_os_error()
+                        == Some(windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED as _) =>
+                        {
+                            Ok(())
+                        }
                     Err(e) => Err(e.into()),
                 }
             }
@@ -326,7 +326,7 @@ where
         // On windows, filter out files like `C:\DumpStack.log.tmp` which we
         // can't get full metadata for.
         #[cfg(windows)]
-        let entries = entries.filter(|entry| {
+            let entries = entries.filter(|entry| {
             use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_SHARING_VIOLATION};
             if let Err(ReaddirError::Io(err)) = entry {
                 if err.raw_os_error() == Some(ERROR_SHARING_VIOLATION as i32)
@@ -357,11 +357,11 @@ where
                     // this error, for POSIX compatibility.
                     #[cfg(windows)]
                     Err(e)
-                        if e.raw_os_error()
-                            == Some(windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED as _) =>
-                    {
-                        Ok(())
-                    }
+                    if e.raw_os_error()
+                        == Some(windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED as _) =>
+                        {
+                            Ok(())
+                        }
                     Err(e) => Err(e.into()),
                 }
             }
@@ -447,7 +447,7 @@ where
                     mtim.map(cap_fs_ext::SystemTimeSpec::from_std),
                 )
             })
-            .await?;
+                .await?;
         } else {
             d.run_blocking(move |d| {
                 d.set_symlink_times(
@@ -456,7 +456,7 @@ where
                     mtim.map(cap_fs_ext::SystemTimeSpec::from_std),
                 )
             })
-            .await?;
+                .await?;
         }
         Ok(())
     }
@@ -593,9 +593,10 @@ where
             NotDir,
         }
 
+        let path_clone = path.clone();
         let opened = d
             .run_blocking::<_, std::io::Result<OpenResult>>(move |d| {
-                let mut opened = d.open_with(&path, &opts)?;
+                let mut opened = d.open_with(&path_clone, &opts)?;
                 if opened.metadata()?.is_dir() {
                     Ok(OpenResult::Dir(cap_std::fs::Dir::from_std_file(
                         opened.into_std(),
@@ -619,6 +620,7 @@ where
                 d.file_perms,
                 open_mode,
                 allow_blocking_current_thread,
+                d.path.join(path)
             )))?),
 
             OpenResult::File(file) => Ok(table.push(Descriptor::File(File::new(
@@ -626,6 +628,7 @@ where
                 d.file_perms,
                 open_mode,
                 allow_blocking_current_thread,
+                d.path.join(path)
             )))?),
 
             OpenResult::NotDir => Err(ErrorCode::NotDirectory.into()),
@@ -951,6 +954,7 @@ fn from_raw_os_error(err: Option<i32>) -> Option<ErrorCode> {
         _ => return None,
     })
 }
+
 #[cfg(windows)]
 fn from_raw_os_error(raw_os_error: Option<i32>) -> Option<ErrorCode> {
     use windows_sys::Win32::Foundation;

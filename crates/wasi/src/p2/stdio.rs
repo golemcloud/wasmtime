@@ -7,6 +7,7 @@ use crate::p2::{
     InputStream, IoView, OutputStream, Pollable, StreamError, StreamResult, WasiImpl, WasiView,
 };
 use bytes::Bytes;
+use std::any::Any;
 use std::io::IsTerminal;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -126,6 +127,10 @@ impl InputStream for AsyncStdinStream {
             }
         }
     }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
 }
 
 #[async_trait::async_trait]
@@ -136,6 +141,7 @@ impl Pollable for AsyncStdinStream {
 }
 
 mod worker_thread_stdin;
+
 pub use self::worker_thread_stdin::{stdin, Stdin};
 
 /// Similar to [`StdinStream`], except for output.
@@ -242,6 +248,10 @@ impl OutputStream for OutputFileStream {
     fn check_write(&mut self) -> StreamResult<usize> {
         Ok(1024 * 1024)
     }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
 }
 
 /// This implementation will yield output streams that block on writes, as they
@@ -319,6 +329,10 @@ impl OutputStream for StdioOutputStream {
     fn check_write(&mut self) -> StreamResult<usize> {
         Ok(1024 * 1024)
     }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
 }
 
 #[async_trait::async_trait]
@@ -394,6 +408,10 @@ impl OutputStream for AsyncStdoutStream {
             }
         }
     }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
 }
 
 #[async_trait::async_trait]
@@ -440,6 +458,7 @@ where
 }
 
 pub struct TerminalInput;
+
 pub struct TerminalOutput;
 
 impl<T> terminal_input::Host for WasiImpl<T> where T: WasiView {}

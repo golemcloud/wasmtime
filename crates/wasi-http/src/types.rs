@@ -18,6 +18,7 @@ use std::time::Duration;
 use tokio::net::TcpStream;
 use tokio::time::timeout;
 use wasmtime::component::{Resource, ResourceTable};
+use wasmtime_wasi::{runtime::AbortOnDropJoinHandle, IoCtx, IoImpl, IoView, Pollable};
 use wasmtime_wasi::p2::{IoImpl, IoView, Pollable};
 use wasmtime_wasi::runtime::AbortOnDropJoinHandle;
 
@@ -233,6 +234,10 @@ impl<T: IoView> IoView for WasiHttpImpl<T> {
     fn table(&mut self) -> &mut ResourceTable {
         T::table(&mut self.0 .0)
     }
+
+    fn io_ctx(&mut self) -> &mut IoCtx {
+        T::io_ctx(&mut self.0 .0)
+    }
 }
 impl<T: WasiHttpView> WasiHttpView for WasiHttpImpl<T> {
     fn ctx(&mut self) -> &mut WasiHttpCtx {
@@ -306,6 +311,7 @@ pub(crate) fn remove_forbidden_headers(
 }
 
 /// Configuration for an outgoing request.
+#[derive(Debug)]
 pub struct OutgoingRequestConfig {
     /// Whether to use TLS for the request.
     pub use_tls: bool,
@@ -676,6 +682,13 @@ pub enum HostFutureIncomingResponse {
     Ready(anyhow::Result<Result<IncomingResponse, types::ErrorCode>>),
     /// The response has been consumed.
     Consumed,
+    /// The request is deferred, to be executed the first time the future is polled
+    Deferred {
+        /// Outgoing request
+        request: hyper::Request<HyperOutgoingBody>,
+        /// Outgoing request configuration
+        config: OutgoingRequestConfig,
+    },
 }
 
 impl HostFutureIncomingResponse {
@@ -690,6 +703,14 @@ impl HostFutureIncomingResponse {
     }
 
     /// Returns `true` if the response is ready.
+    pub fn deferred(
+        request: hyper::Request<HyperOutgoingBody>,
+        config: OutgoingRequestConfig,
+    ) -> Self {
+        Self::Deferred { request, config }
+    }
+
+    /// Returns `true` if the response is ready.
     pub fn is_ready(&self) -> bool {
         matches!(self, Self::Ready(_))
     }
@@ -698,7 +719,7 @@ impl HostFutureIncomingResponse {
     pub fn unwrap_ready(self) -> anyhow::Result<Result<IncomingResponse, types::ErrorCode>> {
         match self {
             Self::Ready(res) => res,
-            Self::Pending(_) | Self::Consumed => {
+            Self::Pending(_) | Self::Consumed | Self::Deferred { .. } => {
                 panic!("unwrap_ready called on a pending HostFutureIncomingResponse")
             }
         }
