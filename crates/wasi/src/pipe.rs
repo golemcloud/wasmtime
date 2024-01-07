@@ -9,6 +9,7 @@
 //!
 use anyhow::anyhow;
 use bytes::Bytes;
+use std::any::Any;
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 use wasmtime_wasi_io::{
@@ -77,8 +78,11 @@ impl MemoryOutputPipe {
     }
 }
 
-#[async_trait::async_trait]
 impl OutputStream for MemoryOutputPipe {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
     fn write(&mut self, bytes: Bytes) -> Result<(), StreamError> {
         let mut buf = self.buffer.lock().unwrap();
         if bytes.len() > self.capacity - buf.len() {
@@ -220,8 +224,11 @@ impl Pollable for AsyncReadStream {
 #[derive(Copy, Clone)]
 pub struct SinkOutputStream;
 
-#[async_trait::async_trait]
 impl OutputStream for SinkOutputStream {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
     fn write(&mut self, _buf: Bytes) -> Result<(), StreamError> {
         Ok(())
     }
@@ -261,8 +268,11 @@ impl Pollable for ClosedInputStream {
 #[derive(Copy, Clone)]
 pub struct ClosedOutputStream;
 
-#[async_trait::async_trait]
 impl OutputStream for ClosedOutputStream {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
     fn write(&mut self, _: Bytes) -> Result<(), StreamError> {
         Err(StreamError::Closed)
     }

@@ -2,6 +2,7 @@ use crate::poll::Pollable;
 use alloc::boxed::Box;
 use anyhow::Result;
 use bytes::Bytes;
+use std::any::Any;
 
 /// `Pollable::ready()` for `InputStream` and `OutputStream` may return
 /// prematurely due to `io::ErrorKind::WouldBlock`.
@@ -123,7 +124,7 @@ impl From<wasmtime::component::ResourceTableError> for StreamError {
 /// Host trait for implementing the `wasi:io/streams.output-stream` resource:
 /// A bytestream which can be written to.
 #[async_trait::async_trait]
-pub trait OutputStream: Pollable {
+pub trait OutputStream: Subscribe + Any {
     /// Write bytes after obtaining a permit to write those bytes
     ///
     /// Prior to calling [`write`](Self::write) the caller must call
@@ -281,6 +282,8 @@ pub trait OutputStream: Pollable {
 
     /// Cancel any asynchronous work and wait for it to wrap up.
     async fn cancel(&mut self) {}
+
+    fn as_any(&self) -> &dyn Any;
 }
 
 #[async_trait::async_trait]

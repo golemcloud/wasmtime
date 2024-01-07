@@ -660,7 +660,7 @@ where
         &mut self,
         index: Resource<HostFutureTrailers>,
     ) -> wasmtime::Result<Resource<DynPollable>> {
-        wasmtime_wasi::subscribe(self.table(), index)
+        wasmtime_wasi::subscribe(self.table(), index, None)
     }
 
     fn get(
@@ -881,7 +881,7 @@ where
         &mut self,
         id: Resource<HostFutureIncomingResponse>,
     ) -> wasmtime::Result<Resource<DynPollable>> {
-        wasmtime_wasi::subscribe(self.table(), id)
+        wasmtime_wasi::subscribe(self.table(), id, None)
     }
 }
 

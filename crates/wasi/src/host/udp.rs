@@ -288,11 +288,8 @@ where
         Ok(())
     }
 
-    fn subscribe(
-        &mut self,
-        this: Resource<udp::UdpSocket>,
-    ) -> anyhow::Result<Resource<DynPollable>> {
-        wasmtime_wasi_io::poll::subscribe(self.table(), this)
+    fn subscribe(&mut self, this: Resource<udp::UdpSocket>) -> anyhow::Result<Resource<DynPollable>> {
+        wasmtime_wasi_io::poll::subscribe(self.table(), this, None)
     }
 
     fn drop(&mut self, this: Resource<udp::UdpSocket>) -> Result<(), anyhow::Error> {
@@ -375,7 +372,7 @@ where
         &mut self,
         this: Resource<udp::IncomingDatagramStream>,
     ) -> anyhow::Result<Resource<DynPollable>> {
-        wasmtime_wasi_io::poll::subscribe(self.table(), this)
+        wasmtime_wasi_io::poll::subscribe(self.table(), this, None)
     }
 
     fn drop(&mut self, this: Resource<udp::IncomingDatagramStream>) -> Result<(), anyhow::Error> {
@@ -514,7 +511,7 @@ where
         &mut self,
         this: Resource<udp::OutgoingDatagramStream>,
     ) -> anyhow::Result<Resource<DynPollable>> {
-        wasmtime_wasi_io::poll::subscribe(self.table(), this)
+        wasmtime_wasi_io::poll::subscribe(self.table(), this, None)
     }
 
     fn drop(&mut self, this: Resource<udp::OutgoingDatagramStream>) -> Result<(), anyhow::Error> {

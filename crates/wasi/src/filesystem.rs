@@ -3,6 +3,7 @@ use crate::runtime::{spawn_blocking, AbortOnDropJoinHandle};
 use crate::{InputStream, OutputStream, Pollable, StreamError, StreamResult, TrappableError};
 use anyhow::anyhow;
 use bytes::{Bytes, BytesMut};
+use std::any::Any;
 use std::io;
 use std::mem;
 use std::sync::Arc;
@@ -466,6 +467,10 @@ const FILE_WRITE_CAPACITY: usize = 1024 * 1024;
 
 #[async_trait::async_trait]
 impl OutputStream for FileOutputStream {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
     fn write(&mut self, buf: Bytes) -> Result<(), StreamError> {
         match self.state {
             OutputState::Ready => {}

@@ -284,11 +284,8 @@ where
         socket.set_send_buffer_size(value)
     }
 
-    fn subscribe(
-        &mut self,
-        this: Resource<tcp::TcpSocket>,
-    ) -> anyhow::Result<Resource<DynPollable>> {
-        wasmtime_wasi_io::poll::subscribe(self.table(), this)
+    fn subscribe(&mut self, this: Resource<tcp::TcpSocket>) -> anyhow::Result<Resource<DynPollable>> {
+        wasmtime_wasi_io::poll::subscribe(self.table(), this, None)
     }
 
     fn shutdown(
