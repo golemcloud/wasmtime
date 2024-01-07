@@ -2,6 +2,7 @@ use crate::filesystem::FileInputStream;
 use crate::poll::Subscribe;
 use anyhow::Result;
 use bytes::Bytes;
+use std::any::Any;
 
 /// Host trait for implementing the `wasi:io/streams.input-stream` resource: A
 /// bytestream which can be read from.
@@ -81,7 +82,7 @@ impl From<wasmtime::component::ResourceTableError> for StreamError {
 /// Host trait for implementing the `wasi:io/streams.output-stream` resource:
 /// A bytestream which can be written to.
 #[async_trait::async_trait]
-pub trait HostOutputStream: Subscribe {
+pub trait HostOutputStream: Subscribe + Any {
     /// Write bytes after obtaining a permit to write those bytes
     ///
     /// Prior to calling [`write`](Self::write) the caller must call
@@ -153,6 +154,8 @@ pub trait HostOutputStream: Subscribe {
         self.ready().await;
         self.check_write()
     }
+
+    fn as_any(&self) -> &dyn Any;
 }
 
 #[async_trait::async_trait]

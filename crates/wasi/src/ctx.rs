@@ -15,6 +15,7 @@ use cap_std::ambient_authority;
 use std::path::Path;
 use std::sync::Arc;
 use std::{mem, net::SocketAddr};
+use std::time::Duration;
 use wasmtime::component::ResourceTable;
 
 /// Builder-style structure used to create a [`WasiCtx`].
@@ -52,6 +53,8 @@ pub struct WasiCtxBuilder {
     monotonic_clock: Box<dyn HostMonotonicClock + Send>,
     allowed_network_uses: AllowedNetworkUses,
     allow_blocking_current_thread: bool,
+    suspend_threshold: Duration,
+    suspend_signal: Box<dyn Fn(Duration) -> anyhow::Error + Send + Sync + 'static>,
     built: bool,
 }
 
@@ -101,6 +104,8 @@ impl WasiCtxBuilder {
             monotonic_clock: monotonic_clock(),
             allowed_network_uses: AllowedNetworkUses::default(),
             allow_blocking_current_thread: false,
+            suspend_threshold: Duration::MAX,
+            suspend_signal: Box::new(|_| unreachable!("suspend_signal not set")),
             built: false,
         }
     }
@@ -449,6 +454,16 @@ impl WasiCtxBuilder {
         self
     }
 
+    pub fn set_suspend(
+        &mut self,
+        suspend_threshold: Duration,
+        suspend_signal: impl Fn(Duration) -> anyhow::Error + Send + Sync + 'static,
+    ) -> &mut Self {
+        self.suspend_threshold = suspend_threshold;
+        self.suspend_signal = Box::new(suspend_signal);
+        self
+    }
+
     /// Uses the configured context so far to construct the final [`WasiCtx`].
     ///
     /// Note that each `WasiCtxBuilder` can only be used to "build" once, and
@@ -477,6 +492,8 @@ impl WasiCtxBuilder {
             monotonic_clock,
             allowed_network_uses,
             allow_blocking_current_thread,
+            suspend_threshold,
+            suspend_signal,
             built: _,
         } = mem::replace(self, Self::new());
         self.built = true;
@@ -496,28 +513,9 @@ impl WasiCtxBuilder {
             monotonic_clock,
             allowed_network_uses,
             allow_blocking_current_thread,
+            suspend_threshold,
+            suspend_signal,
         }
-    }
-
-    /// Builds a WASIp1 context instead of a [`WasiCtx`].
-    ///
-    /// This method is the same as [`build`](WasiCtxBuilder::build) but it
-    /// creates a [`WasiP1Ctx`] instead. This is intended for use with the
-    /// [`preview1`] module of this crate
-    ///
-    /// [`WasiP1Ctx`]: crate::preview1::WasiP1Ctx
-    /// [`preview1`]: crate::preview1
-    ///
-    /// # Panics
-    ///
-    /// Panics if this method is called twice. Each [`WasiCtxBuilder`] can be
-    /// used to create only a single [`WasiCtx`] or [`WasiP1Ctx`]. Repeated
-    /// usage of this method is not allowed and should use a second builder
-    /// instead.
-    #[cfg(feature = "preview1")]
-    pub fn build_p1(&mut self) -> crate::preview1::WasiP1Ctx {
-        let wasi = self.build();
-        crate::preview1::WasiP1Ctx::new(wasi)
     }
 }
 
@@ -617,6 +615,8 @@ pub struct WasiCtx {
     pub(crate) socket_addr_check: SocketAddrCheck,
     pub(crate) allowed_network_uses: AllowedNetworkUses,
     pub(crate) allow_blocking_current_thread: bool,
+    pub(crate) suspend_threshold: Duration,
+    pub(crate) suspend_signal: Box<dyn Fn(Duration) -> anyhow::Error + Send + Sync + 'static>,
 }
 
 impl WasiCtx {

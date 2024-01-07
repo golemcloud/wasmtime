@@ -1,3 +1,4 @@
+use std::any::Any;
 use crate::bindings::cli::{
     stderr, stdin, stdout, terminal_input, terminal_output, terminal_stderr, terminal_stdin,
     terminal_stdout,
@@ -86,16 +87,16 @@ impl HostInputStream for AsyncStdinStream {
 }
 
 impl Subscribe for AsyncStdinStream {
-    fn ready<'a, 'b>(&'a mut self) -> Pin<Box<dyn Future<Output = ()> + Send + 'b>>
-    where
-        Self: 'b,
-        'a: 'b,
+    fn ready<'a, 'b>(&'a mut self) -> Pin<Box<dyn Future<Output=()> + Send + 'b>>
+        where
+            Self: 'b,
+            'a: 'b,
     {
         struct F(AsyncStdinStream);
         impl Future for F {
             type Output = ();
             fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
-                let mut inner = self.0 .0.lock().unwrap();
+                let mut inner = self.0.0.lock().unwrap();
                 let mut fut = inner.ready();
                 fut.as_mut().poll(cx)
             }
@@ -105,6 +106,7 @@ impl Subscribe for AsyncStdinStream {
 }
 
 mod worker_thread_stdin;
+
 pub use self::worker_thread_stdin::{stdin, Stdin};
 
 /// Similar to [`StdinStream`], except for output.
@@ -211,6 +213,10 @@ impl HostOutputStream for OutputFileStream {
     fn check_write(&mut self) -> StreamResult<usize> {
         Ok(1024 * 1024)
     }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
 }
 
 /// This implementation will yield output streams that block on writes, as they
@@ -273,7 +279,7 @@ impl HostOutputStream for OutputStream {
             OutputStream::Stdout => std::io::stdout().write_all(&bytes),
             OutputStream::Stderr => std::io::stderr().write_all(&bytes),
         }
-        .map_err(|e| StreamError::LastOperationFailed(anyhow::anyhow!(e)))
+            .map_err(|e| StreamError::LastOperationFailed(anyhow::anyhow!(e)))
     }
 
     fn flush(&mut self) -> StreamResult<()> {
@@ -282,11 +288,15 @@ impl HostOutputStream for OutputStream {
             OutputStream::Stdout => std::io::stdout().flush(),
             OutputStream::Stderr => std::io::stderr().flush(),
         }
-        .map_err(|e| StreamError::LastOperationFailed(anyhow::anyhow!(e)))
+            .map_err(|e| StreamError::LastOperationFailed(anyhow::anyhow!(e)))
     }
 
     fn check_write(&mut self) -> StreamResult<usize> {
         Ok(1024 * 1024)
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
     }
 }
 
@@ -340,19 +350,23 @@ impl HostOutputStream for AsyncStdoutStream {
     fn flush(&mut self) -> Result<(), StreamError> {
         self.0.lock().unwrap().flush()
     }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
 }
 
 impl Subscribe for AsyncStdoutStream {
-    fn ready<'a, 'b>(&'a mut self) -> Pin<Box<dyn Future<Output = ()> + Send + 'b>>
-    where
-        Self: 'b,
-        'a: 'b,
+    fn ready<'a, 'b>(&'a mut self) -> Pin<Box<dyn Future<Output=()> + Send + 'b>>
+        where
+            Self: 'b,
+            'a: 'b,
     {
         struct F(AsyncStdoutStream);
         impl Future for F {
             type Output = ();
             fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
-                let mut inner = self.0 .0.lock().unwrap();
+                let mut inner = self.0.0.lock().unwrap();
                 let mut fut = inner.ready();
                 fut.as_mut().poll(cx)
             }
@@ -389,22 +403,27 @@ impl<T: WasiView> stderr::Host for T {
 }
 
 pub struct TerminalInput;
+
 pub struct TerminalOutput;
 
 impl<T: WasiView> terminal_input::Host for T {}
+
 impl<T: WasiView> terminal_input::HostTerminalInput for T {
     fn drop(&mut self, r: Resource<TerminalInput>) -> anyhow::Result<()> {
         self.table().delete(r)?;
         Ok(())
     }
 }
+
 impl<T: WasiView> terminal_output::Host for T {}
+
 impl<T: WasiView> terminal_output::HostTerminalOutput for T {
     fn drop(&mut self, r: Resource<TerminalOutput>) -> anyhow::Result<()> {
         self.table().delete(r)?;
         Ok(())
     }
 }
+
 impl<T: WasiView> terminal_stdin::Host for T {
     fn get_terminal_stdin(&mut self) -> anyhow::Result<Option<Resource<TerminalInput>>> {
         if self.ctx().stdin.isatty() {
@@ -415,6 +434,7 @@ impl<T: WasiView> terminal_stdin::Host for T {
         }
     }
 }
+
 impl<T: WasiView> terminal_stdout::Host for T {
     fn get_terminal_stdout(&mut self) -> anyhow::Result<Option<Resource<TerminalOutput>>> {
         if self.ctx().stdout.isatty() {
@@ -425,6 +445,7 @@ impl<T: WasiView> terminal_stdout::Host for T {
         }
     }
 }
+
 impl<T: WasiView> terminal_stderr::Host for T {
     fn get_terminal_stderr(&mut self) -> anyhow::Result<Option<Resource<TerminalOutput>>> {
         if self.ctx().stderr.isatty() {
@@ -466,6 +487,7 @@ mod test {
         let read4 = view2.read(10).expect("read fourth 10 bytes");
         assert_eq!(read4, "r the thre".as_bytes(), "fourth 10 bytes");
     }
+
     #[tokio::test]
     async fn async_stdin_stream() {
         // A StdinStream has the property that there are multiple

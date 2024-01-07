@@ -25,6 +25,7 @@ macro_rules! uwriteln {
 mod rust;
 mod source;
 mod types;
+
 use source::Source;
 
 #[derive(Clone)]
@@ -1505,7 +1506,7 @@ impl<'a> InterfaceGenerator<'a> {
     fn print_rust_enum<'b>(
         &mut self,
         id: TypeId,
-        cases: impl IntoIterator<Item = (String, Option<String>, &'b Docs, Option<&'b Type>)> + Clone,
+        cases: impl IntoIterator<Item=(String, Option<String>, &'b Docs, Option<&'b Type>)> + Clone,
         docs: &Docs,
         derive_component: &str,
     ) where
@@ -1609,7 +1610,7 @@ impl<'a> InterfaceGenerator<'a> {
         id: TypeId,
         mode: TypeMode,
         name: &str,
-        cases: impl IntoIterator<Item = (String, Option<&'b Type>)>,
+        cases: impl IntoIterator<Item=(String, Option<&'b Type>)>,
     ) where
         Self: Sized,
     {
@@ -2511,7 +2512,7 @@ fn func_field_name(resolve: &Resolve, func: &Function) -> String {
     name.to_snake_case()
 }
 
-fn get_resources<'a>(resolve: &'a Resolve, id: InterfaceId) -> impl Iterator<Item = &'a str> + 'a {
+fn get_resources<'a>(resolve: &'a Resolve, id: InterfaceId) -> impl Iterator<Item=&'a str> + 'a {
     resolve.interfaces[id]
         .types
         .iter()
@@ -2524,7 +2525,7 @@ fn get_resources<'a>(resolve: &'a Resolve, id: InterfaceId) -> impl Iterator<Ite
 fn get_world_resources<'a>(
     resolve: &'a Resolve,
     id: WorldId,
-) -> impl Iterator<Item = &'a str> + 'a {
+) -> impl Iterator<Item=&'a str> + 'a {
     resolve.worlds[id]
         .imports
         .iter()

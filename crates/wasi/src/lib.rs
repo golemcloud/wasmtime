@@ -192,10 +192,6 @@ mod ip_name_lookup;
 mod network;
 pub mod pipe;
 mod poll;
-#[cfg(feature = "preview1")]
-pub mod preview0;
-#[cfg(feature = "preview1")]
-pub mod preview1;
 mod random;
 pub mod runtime;
 mod stdio;

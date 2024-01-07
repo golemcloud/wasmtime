@@ -1,6 +1,7 @@
 use crate::{HostOutputStream, StreamError, Subscribe};
 use anyhow::anyhow;
 use bytes::Bytes;
+use std::any::Any;
 use std::sync::{Arc, Mutex};
 
 #[derive(Debug)]
@@ -162,6 +163,10 @@ impl AsyncWriteStream {
 }
 
 impl HostOutputStream for AsyncWriteStream {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
     fn write(&mut self, bytes: Bytes) -> Result<(), StreamError> {
         let mut state = self.worker.state();
         state.check_error()?;

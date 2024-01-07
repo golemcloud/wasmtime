@@ -70,7 +70,7 @@ impl<T: WasiView> HostResolveAddressStream for T {
         &mut self,
         resource: Resource<ResolveAddressStream>,
     ) -> Result<Resource<Pollable>> {
-        subscribe(self.table(), resource)
+        subscribe(self.table(), resource, None)
     }
 
     fn drop(&mut self, resource: Resource<ResolveAddressStream>) -> Result<()> {

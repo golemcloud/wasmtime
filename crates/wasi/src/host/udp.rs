@@ -285,7 +285,7 @@ impl<T: WasiView> udp::HostUdpSocket for T {
     }
 
     fn subscribe(&mut self, this: Resource<udp::UdpSocket>) -> anyhow::Result<Resource<Pollable>> {
-        crate::poll::subscribe(self.table(), this)
+        crate::poll::subscribe(self.table(), this, None)
     }
 
     fn drop(&mut self, this: Resource<udp::UdpSocket>) -> Result<(), anyhow::Error> {
@@ -365,7 +365,7 @@ impl<T: WasiView> udp::HostIncomingDatagramStream for T {
         &mut self,
         this: Resource<udp::IncomingDatagramStream>,
     ) -> anyhow::Result<Resource<Pollable>> {
-        crate::poll::subscribe(self.table(), this)
+        crate::poll::subscribe(self.table(), this, None)
     }
 
     fn drop(&mut self, this: Resource<udp::IncomingDatagramStream>) -> Result<(), anyhow::Error> {
@@ -499,7 +499,7 @@ impl<T: WasiView> udp::HostOutgoingDatagramStream for T {
         &mut self,
         this: Resource<udp::OutgoingDatagramStream>,
     ) -> anyhow::Result<Resource<Pollable>> {
-        crate::poll::subscribe(self.table(), this)
+        crate::poll::subscribe(self.table(), this, None)
     }
 
     fn drop(&mut self, this: Resource<udp::OutgoingDatagramStream>) -> Result<(), anyhow::Error> {

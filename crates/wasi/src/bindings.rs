@@ -173,6 +173,18 @@ mod async_io {
                 "poll",
                 "[method]pollable.block",
                 "[method]pollable.ready",
+                "get-random-bytes",
+                "get-random-u64",
+                "insecure-seed",
+                "get-insecure-random-bytes",
+                "get-insecure-random-u64",
+                "now",
+                "resolution",
+                "subscribe-instant",
+                "subscribe-duration",
+                "get-environment",
+                "get-arguments",
+                "initial-cwd"
             ],
         },
         trappable_error_type: {
