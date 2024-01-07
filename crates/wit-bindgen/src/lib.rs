@@ -25,6 +25,7 @@ macro_rules! uwriteln {
 mod rust;
 mod source;
 mod types;
+
 use source::Source;
 
 #[derive(Clone)]
@@ -2003,7 +2004,7 @@ impl<'a> InterfaceGenerator<'a> {
     fn print_rust_enum<'b>(
         &mut self,
         id: TypeId,
-        cases: impl IntoIterator<Item = (String, Option<String>, &'b Docs, Option<&'b Type>)> + Clone,
+        cases: impl IntoIterator<Item=(String, Option<String>, &'b Docs, Option<&'b Type>)> + Clone,
         docs: &Docs,
         derive_component: &str,
     ) where
@@ -2111,7 +2112,7 @@ impl<'a> InterfaceGenerator<'a> {
         id: TypeId,
         mode: TypeMode,
         name: &str,
-        cases: impl IntoIterator<Item = (String, Option<&'b Type>)>,
+        cases: impl IntoIterator<Item=(String, Option<&'b Type>)>,
     ) where
         Self: Sized,
     {

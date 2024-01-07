@@ -58,7 +58,7 @@ where
     }
 
     fn subscribe(&mut self, stream: Resource<OutputStream>) -> anyhow::Result<Resource<Pollable>> {
-        subscribe(self.table(), stream)
+        subscribe(self.table(), stream, None)
     }
 
     async fn blocking_write_and_flush(
@@ -216,7 +216,7 @@ where
     }
 
     fn subscribe(&mut self, stream: Resource<InputStream>) -> anyhow::Result<Resource<Pollable>> {
-        crate::poll::subscribe(self.table(), stream)
+        crate::poll::subscribe(self.table(), stream, None)
     }
 }
 

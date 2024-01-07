@@ -11,6 +11,7 @@ use crate::poll::Subscribe;
 use crate::{HostInputStream, HostOutputStream, StreamError};
 use anyhow::anyhow;
 use bytes::Bytes;
+use std::any::Any;
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 
@@ -76,6 +77,10 @@ impl MemoryOutputPipe {
 }
 
 impl HostOutputStream for MemoryOutputPipe {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
     fn write(&mut self, bytes: Bytes) -> Result<(), StreamError> {
         let mut buf = self.buffer.lock().unwrap();
         if bytes.len() > self.capacity - buf.len() {
@@ -218,6 +223,10 @@ impl Subscribe for AsyncReadStream {
 pub struct SinkOutputStream;
 
 impl HostOutputStream for SinkOutputStream {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
     fn write(&mut self, _buf: Bytes) -> Result<(), StreamError> {
         Ok(())
     }
@@ -258,6 +267,10 @@ impl Subscribe for ClosedInputStream {
 pub struct ClosedOutputStream;
 
 impl HostOutputStream for ClosedOutputStream {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
     fn write(&mut self, _: Bytes) -> Result<(), StreamError> {
         Err(StreamError::Closed)
     }

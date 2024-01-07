@@ -1,3 +1,4 @@
+use std::any::Any;
 use crate::bindings::sockets::tcp::ErrorCode;
 use crate::host::network;
 use crate::network::SocketAddressFamily;
@@ -49,7 +50,7 @@ enum TcpState {
     },
 
     /// An outgoing connection is started via `start_connect`.
-    Connecting(Pin<Box<dyn Future<Output = io::Result<tokio::net::TcpStream>> + Send>>),
+    Connecting(Pin<Box<dyn Future<Output=io::Result<tokio::net::TcpStream>> + Send>>),
 
     /// An outgoing connection is ready to be established.
     ConnectReady(io::Result<tokio::net::TcpStream>),
@@ -199,7 +200,7 @@ impl TcpSocket {
                     // been handled by our own validation slightly higher up in this
                     // function. This error mapping is here just in case there is
                     // an edge case we didn't catch.
-                    Some(Errno::AFNOSUPPORT) =>  io::Error::new(
+                    Some(Errno::AFNOSUPPORT) => io::Error::new(
                         io::ErrorKind::InvalidInput,
                         "The specified address is not a valid address for the address family of the specified socket",
                     ),
@@ -241,7 +242,7 @@ impl TcpSocket {
             TcpState::Default(..) | TcpState::Bound(..) => {}
 
             TcpState::Connecting(..) | TcpState::ConnectReady(..) => {
-                return Err(ErrorCode::ConcurrencyConflict.into())
+                return Err(ErrorCode::ConcurrencyConflict.into());
             }
 
             _ => return Err(ErrorCode::InvalidState.into()),
@@ -253,9 +254,9 @@ impl TcpSocket {
 
         let (TcpState::Default(tokio_socket) | TcpState::Bound(tokio_socket)) =
             std::mem::replace(&mut self.tcp_state, TcpState::Closed)
-        else {
-            unreachable!();
-        };
+            else {
+                unreachable!();
+            };
 
         let future = tokio_socket.connect(remote_address);
 
@@ -365,9 +366,9 @@ impl TcpSocket {
             listener,
             pending_accept,
         } = &mut self.tcp_state
-        else {
-            return Err(ErrorCode::InvalidState.into());
-        };
+            else {
+                return Err(ErrorCode::InvalidState.into());
+            };
 
         let result = match pending_accept.take() {
             Some(result) => result,
@@ -473,7 +474,7 @@ impl TcpSocket {
         let view = match self.tcp_state {
             TcpState::Connected { .. } => self.as_std_view()?,
             TcpState::Connecting(..) | TcpState::ConnectReady(..) => {
-                return Err(ErrorCode::ConcurrencyConflict.into())
+                return Err(ErrorCode::ConcurrencyConflict.into());
             }
             _ => return Err(ErrorCode::InvalidState.into()),
         };
@@ -680,7 +681,7 @@ impl Subscribe for TcpSocket {
                     let result = futures::future::poll_fn(|cx| {
                         listener.poll_accept(cx).map_ok(|(stream, _)| stream)
                     })
-                    .await;
+                        .await;
                     *pending_accept = Some(result);
                 }
             },
@@ -969,6 +970,10 @@ impl HostOutputStream for TcpWriteStream {
 
     async fn cancel(&mut self) {
         self.0.lock().await.cancel().await
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
     }
 }
 

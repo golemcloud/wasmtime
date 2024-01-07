@@ -5,6 +5,7 @@ use crate::{
 };
 use anyhow::anyhow;
 use bytes::{Bytes, BytesMut};
+use std::any::Any;
 use std::io;
 use std::mem;
 use std::sync::Arc;
@@ -468,6 +469,10 @@ const FILE_WRITE_CAPACITY: usize = 1024 * 1024;
 
 #[async_trait::async_trait]
 impl HostOutputStream for FileOutputStream {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
     fn write(&mut self, buf: Bytes) -> Result<(), StreamError> {
         match self.state {
             OutputState::Ready => {}

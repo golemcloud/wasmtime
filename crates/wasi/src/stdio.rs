@@ -1,3 +1,4 @@
+use std::any::Any;
 use crate::bindings::cli::{
     stderr, stdin, stdout, terminal_input, terminal_output, terminal_stderr, terminal_stdin,
     terminal_stdout,
@@ -136,6 +137,7 @@ impl Subscribe for AsyncStdinStream {
 }
 
 mod worker_thread_stdin;
+
 pub use self::worker_thread_stdin::{stdin, Stdin};
 
 /// Similar to [`StdinStream`], except for output.
@@ -242,6 +244,10 @@ impl HostOutputStream for OutputFileStream {
     fn check_write(&mut self) -> StreamResult<usize> {
         Ok(1024 * 1024)
     }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
 }
 
 /// This implementation will yield output streams that block on writes, as they
@@ -304,7 +310,7 @@ impl HostOutputStream for OutputStream {
             OutputStream::Stdout => std::io::stdout().write_all(&bytes),
             OutputStream::Stderr => std::io::stderr().write_all(&bytes),
         }
-        .map_err(|e| StreamError::LastOperationFailed(anyhow::anyhow!(e)))
+            .map_err(|e| StreamError::LastOperationFailed(anyhow::anyhow!(e)))
     }
 
     fn flush(&mut self) -> StreamResult<()> {
@@ -313,11 +319,15 @@ impl HostOutputStream for OutputStream {
             OutputStream::Stdout => std::io::stdout().flush(),
             OutputStream::Stderr => std::io::stderr().flush(),
         }
-        .map_err(|e| StreamError::LastOperationFailed(anyhow::anyhow!(e)))
+            .map_err(|e| StreamError::LastOperationFailed(anyhow::anyhow!(e)))
     }
 
     fn check_write(&mut self) -> StreamResult<usize> {
         Ok(1024 * 1024)
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
     }
 }
 
@@ -394,6 +404,10 @@ impl HostOutputStream for AsyncStdoutStream {
             }
         }
     }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
 }
 
 #[async_trait::async_trait]
@@ -440,6 +454,7 @@ where
 }
 
 pub struct TerminalInput;
+
 pub struct TerminalOutput;
 
 impl<T> terminal_input::Host for WasiImpl<T> where T: WasiView {}
