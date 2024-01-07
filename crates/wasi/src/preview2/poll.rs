@@ -6,8 +6,9 @@ use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use wasmtime::component::{Resource, ResourceTable};
+use std::time::Instant;
 
-pub type PollableFuture<'a> = Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
+pub type PollableFuture<'a> = Pin<Box<dyn Future<Output=()> + Send + 'a>>;
 pub type MakeFuture = for<'a> fn(&'a mut dyn Any) -> PollableFuture<'a>;
 pub type ClosureFuture = Box<dyn Fn() -> PollableFuture<'static> + Send + Sync + 'static>;
 
@@ -21,6 +22,7 @@ pub struct Pollable {
     index: u32,
     make_future: MakeFuture,
     remove_index_on_delete: Option<fn(&mut ResourceTable, u32) -> Result<()>>,
+    pub supports_suspend: Option<Instant>,
 }
 
 #[async_trait::async_trait]
@@ -35,13 +37,17 @@ pub trait Subscribe: Send + Sync + 'static {
 /// resource is deleted. Otherwise the returned resource is considered a "child"
 /// of the given `resource` which means that the given resource cannot be
 /// deleted while the `pollable` is still alive.
-pub fn subscribe<T>(table: &mut ResourceTable, resource: Resource<T>) -> Result<Resource<Pollable>>
+pub fn subscribe<T>(
+    table: &mut ResourceTable,
+    resource: Resource<T>,
+    supports_suspend: Option<Instant>
+) -> Result<Resource<Pollable>>
 where
     T: Subscribe,
 {
     fn make_future<'a, T>(stream: &'a mut dyn Any) -> PollableFuture<'a>
-    where
-        T: Subscribe,
+        where
+            T: Subscribe,
     {
         stream.downcast_mut::<T>().unwrap().ready()
     }
@@ -58,6 +64,7 @@ where
             None
         },
         make_future: make_future::<T>,
+        supports_suspend,
     };
 
     Ok(table.push_child(pollable, &resource)?)
@@ -68,22 +75,41 @@ impl<T: WasiView> poll::Host for T {
     async fn poll(&mut self, pollables: Vec<Resource<Pollable>>) -> Result<Vec<u32>> {
         type ReadylistIndex = u32;
 
-        let table = self.table_mut();
-
         let mut table_futures: HashMap<u32, (MakeFuture, Vec<ReadylistIndex>)> = HashMap::new();
+        let mut all_supports_suspend = Some(None);
 
         for (ix, p) in pollables.iter().enumerate() {
             let ix: u32 = ix.try_into()?;
 
-            let pollable = table.get(p)?;
+            let pollable = self.table_mut().get(p)?;
             let (_, list) = table_futures
                 .entry(pollable.index)
                 .or_insert((pollable.make_future, Vec::new()));
             list.push(ix);
+
+            match pollable.supports_suspend {
+                None => {
+                    all_supports_suspend = None;
+                }
+                Some(maximum_suspend_time) => {
+                    all_supports_suspend = all_supports_suspend.map(|maybe_max| match maybe_max {
+                        None => Some(maximum_suspend_time),
+                        Some(max) => Some(std::cmp::min(max, maximum_suspend_time)),
+                    });
+                }
+            }
         }
 
+        if let Some(Some(deadline)) = all_supports_suspend {
+            let duration = deadline.duration_since(Instant::now());
+            if duration >= self.ctx().suspend_threshold {
+                return Err((self.ctx().suspend_signal)(duration));
+            }
+        }
         let mut futures: Vec<(PollableFuture<'_>, Vec<ReadylistIndex>)> = Vec::new();
-        for (entry, (make_future, readylist_indices)) in table.iter_entries(table_futures) {
+        for (entry, (make_future, readylist_indices)) in
+        self.table_mut().iter_entries(table_futures)
+        {
             let entry = entry?;
             futures.push((make_future(entry), readylist_indices));
         }

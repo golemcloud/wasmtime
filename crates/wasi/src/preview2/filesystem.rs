@@ -4,6 +4,7 @@ use crate::preview2::{
 };
 use anyhow::anyhow;
 use bytes::{Bytes, BytesMut};
+use std::any::Any;
 use std::io;
 use std::mem;
 use std::sync::Arc;
@@ -215,6 +216,10 @@ impl FileOutputStream {
 const FILE_WRITE_CAPACITY: usize = 1024 * 1024;
 
 impl HostOutputStream for FileOutputStream {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
     fn write(&mut self, buf: Bytes) -> Result<(), StreamError> {
         use system_interface::fs::FileIoExt;
         match self.state {

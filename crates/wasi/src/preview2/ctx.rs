@@ -12,6 +12,7 @@ use crate::preview2::{
 use cap_rand::{Rng, RngCore, SeedableRng};
 use std::sync::Arc;
 use std::{mem, net::SocketAddr};
+use std::time::Duration;
 use wasmtime::component::ResourceTable;
 
 pub struct WasiCtxBuilder {
@@ -28,6 +29,8 @@ pub struct WasiCtxBuilder {
     wall_clock: Box<dyn HostWallClock + Send + Sync>,
     monotonic_clock: Box<dyn HostMonotonicClock + Send + Sync>,
     allowed_network_uses: AllowedNetworkUses,
+    suspend_threshold: Duration,
+    suspend_signal: Box<dyn Fn(Duration) -> anyhow::Error + Send + Sync + 'static>,
     built: bool,
 }
 
@@ -78,6 +81,8 @@ impl WasiCtxBuilder {
             wall_clock: wall_clock(),
             monotonic_clock: monotonic_clock(),
             allowed_network_uses: AllowedNetworkUses::default(),
+            suspend_threshold: Duration::MAX,
+            suspend_signal: Box::new(|_| unreachable!("suspend_signal not set")),
             built: false,
         }
     }
@@ -222,6 +227,16 @@ impl WasiCtxBuilder {
         self
     }
 
+    pub fn set_suspend(
+        &mut self,
+        suspend_threshold: Duration,
+        suspend_signal: impl Fn(Duration) -> anyhow::Error + Send + Sync + 'static,
+    ) -> &mut Self {
+        self.suspend_threshold = suspend_threshold;
+        self.suspend_signal = Box::new(suspend_signal);
+        self
+    }
+
     /// Uses the configured context so far to construct the final `WasiCtx`.
     ///
     /// Note that each `WasiCtxBuilder` can only be used to "build" once, and
@@ -247,6 +262,8 @@ impl WasiCtxBuilder {
             wall_clock,
             monotonic_clock,
             allowed_network_uses,
+            suspend_threshold,
+            suspend_signal,
             built: _,
         } = mem::replace(self, Self::new());
         self.built = true;
@@ -265,6 +282,8 @@ impl WasiCtxBuilder {
             wall_clock,
             monotonic_clock,
             allowed_network_uses,
+            suspend_signal,
+            suspend_threshold,
         }
     }
 }
@@ -290,6 +309,8 @@ pub struct WasiCtx {
     pub(crate) stderr: Box<dyn StdoutStream>,
     pub(crate) socket_addr_check: SocketAddrCheck,
     pub(crate) allowed_network_uses: AllowedNetworkUses,
+    pub(crate) suspend_threshold: Duration,
+    pub(crate) suspend_signal: Box<dyn Fn(Duration) -> anyhow::Error + Send + Sync + 'static>,
 }
 
 pub struct AllowedNetworkUses {
