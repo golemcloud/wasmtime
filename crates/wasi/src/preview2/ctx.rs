@@ -12,6 +12,7 @@ use cap_std::net::Pool;
 use cap_std::{ambient_authority, AmbientAuthority};
 use std::mem;
 use std::net::{Ipv4Addr, Ipv6Addr};
+use std::time::Duration;
 
 pub struct WasiCtxBuilder {
     stdin: Box<dyn StdinStream>,
@@ -28,6 +29,8 @@ pub struct WasiCtxBuilder {
     wall_clock: Box<dyn HostWallClock + Send + Sync>,
     monotonic_clock: Box<dyn HostMonotonicClock + Send + Sync>,
     allow_ip_name_lookup: bool,
+    suspend_threshold: Duration,
+    suspend_signal: Box<dyn Fn(Duration) -> anyhow::Error + Send + Sync + 'static>,
     built: bool,
 }
 
@@ -78,6 +81,8 @@ impl WasiCtxBuilder {
             wall_clock: wall_clock(),
             monotonic_clock: monotonic_clock(),
             allow_ip_name_lookup: false,
+            suspend_threshold: Duration::MAX,
+            suspend_signal: Box::new(|_| unreachable!("suspend_signal not set")),
             built: false,
         }
     }
@@ -254,6 +259,16 @@ impl WasiCtxBuilder {
         self
     }
 
+    pub fn set_suspend(
+        &mut self,
+        suspend_threshold: Duration,
+        suspend_signal: impl Fn(Duration) -> anyhow::Error + Send + Sync + 'static,
+    ) -> &mut Self {
+        self.suspend_threshold = suspend_threshold;
+        self.suspend_signal = Box::new(suspend_signal);
+        self
+    }
+
     /// Uses the configured context so far to construct the final `WasiCtx`.
     ///
     /// Note that each `WasiCtxBuilder` can only be used to "build" once, and
@@ -279,6 +294,8 @@ impl WasiCtxBuilder {
             wall_clock,
             monotonic_clock,
             allow_ip_name_lookup,
+            suspend_threshold,
+            suspend_signal,
             built: _,
         } = mem::replace(self, Self::new());
         self.built = true;
@@ -297,6 +314,8 @@ impl WasiCtxBuilder {
             wall_clock,
             monotonic_clock,
             allow_ip_name_lookup,
+            suspend_signal,
+            suspend_threshold,
         }
     }
 }
@@ -322,4 +341,6 @@ pub struct WasiCtx {
     pub(crate) stderr: Box<dyn StdoutStream>,
     pub(crate) pool: Pool,
     pub(crate) allow_ip_name_lookup: bool,
+    pub(crate) suspend_threshold: Duration,
+    pub(crate) suspend_signal: Box<dyn Fn(Duration) -> anyhow::Error + Send + Sync + 'static>,
 }

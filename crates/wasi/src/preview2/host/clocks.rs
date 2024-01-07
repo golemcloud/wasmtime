@@ -6,6 +6,7 @@ use crate::preview2::bindings::{
 };
 use crate::preview2::poll::{subscribe, Subscribe};
 use crate::preview2::{Pollable, WasiView};
+use async_trait::async_trait;
 use cap_std::time::SystemTime;
 use std::time::Duration;
 use wasmtime::component::Resource;
@@ -24,8 +25,9 @@ impl TryFrom<SystemTime> for Datetime {
     }
 }
 
+#[async_trait]
 impl<T: WasiView> wall_clock::Host for T {
-    fn now(&mut self) -> anyhow::Result<Datetime> {
+    async fn now(&mut self) -> anyhow::Result<Datetime> {
         let now = self.ctx().wall_clock.now();
         Ok(Datetime {
             seconds: now.as_secs(),
@@ -33,7 +35,7 @@ impl<T: WasiView> wall_clock::Host for T {
         })
     }
 
-    fn resolution(&mut self) -> anyhow::Result<Datetime> {
+    async fn resolution(&mut self) -> anyhow::Result<Datetime> {
         let res = self.ctx().wall_clock.resolution();
         Ok(Datetime {
             seconds: res.as_secs(),
@@ -46,31 +48,35 @@ fn subscribe_to_duration(
     table: &mut crate::preview2::Table,
     duration: tokio::time::Duration,
 ) -> anyhow::Result<Resource<Pollable>> {
-    let sleep = if duration.is_zero() {
-        table.push(Deadline::Past)?
+    let (sleep, suspend_until) = if duration.is_zero() {
+        (table.push(Deadline::Past)?, None)
     } else if let Some(deadline) = tokio::time::Instant::now().checked_add(duration) {
         // NB: this resource created here is not actually exposed to wasm, it's
         // only an internal implementation detail used to match the signature
         // expected by `subscribe`.
-        table.push(Deadline::Instant(deadline))?
+        (
+            table.push(Deadline::Instant(deadline))?,
+            Some(deadline.into()),
+        )
     } else {
         // If the user specifies a time so far in the future we can't
         // represent it, wait forever rather than trap.
-        table.push(Deadline::Never)?
+        (table.push(Deadline::Never)?, None)
     };
-    subscribe(table, sleep)
+    subscribe(table, sleep, suspend_until)
 }
 
+#[async_trait]
 impl<T: WasiView> monotonic_clock::Host for T {
-    fn now(&mut self) -> anyhow::Result<Instant> {
+    async fn now(&mut self) -> anyhow::Result<Instant> {
         Ok(self.ctx().monotonic_clock.now())
     }
 
-    fn resolution(&mut self) -> anyhow::Result<Instant> {
+    async fn resolution(&mut self) -> anyhow::Result<Instant> {
         Ok(self.ctx().monotonic_clock.resolution())
     }
 
-    fn subscribe_instant(&mut self, when: Instant) -> anyhow::Result<Resource<Pollable>> {
+    async fn subscribe_instant(&mut self, when: Instant) -> anyhow::Result<Resource<Pollable>> {
         let clock_now = self.ctx().monotonic_clock.now();
         let duration = if when > clock_now {
             Duration::from_nanos(when - clock_now)
@@ -80,7 +86,10 @@ impl<T: WasiView> monotonic_clock::Host for T {
         subscribe_to_duration(&mut self.table_mut(), duration)
     }
 
-    fn subscribe_duration(&mut self, duration: WasiDuration) -> anyhow::Result<Resource<Pollable>> {
+    async fn subscribe_duration(
+        &mut self,
+        duration: WasiDuration,
+    ) -> anyhow::Result<Resource<Pollable>> {
         subscribe_to_duration(&mut self.table_mut(), Duration::from_nanos(duration))
     }
 }

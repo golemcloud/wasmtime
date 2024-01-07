@@ -9,6 +9,7 @@ use std::future::Future;
 use std::mem;
 use std::task::{Context, Poll};
 use std::{pin::Pin, sync::Arc, time::Duration};
+use std::any::Any;
 use tokio::sync::{mpsc, oneshot};
 use wasmtime_wasi::preview2::{
     self, poll_noop, AbortOnDropJoinHandle, HostInputStream, HostOutputStream, StreamError,
@@ -549,6 +550,8 @@ impl BodyWriteStream {
 
 #[async_trait::async_trait]
 impl HostOutputStream for BodyWriteStream {
+    fn as_any(&self) -> &dyn Any { self }
+
     fn write(&mut self, bytes: Bytes) -> Result<(), StreamError> {
         let len = bytes.len();
         match self.writer.try_send(bytes) {

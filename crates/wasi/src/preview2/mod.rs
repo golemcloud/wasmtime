@@ -88,6 +88,7 @@ pub mod bindings {
                 }
             });
         }
+
         pub use self::_internal::wasi::{filesystem, io};
     }
 
@@ -151,6 +152,18 @@ pub mod bindings {
                 "poll",
                 "[method]pollable.block",
                 "[method]pollable.ready",
+                "get-random-bytes",
+                "get-random-u64",
+                "insecure-seed",
+                "get-insecure-random-bytes",
+                "get-insecure-random-u64",
+                "now",
+                "resolution",
+                "subscribe-instant",
+                "subscribe-duration",
+                "get-environment",
+                "get-arguments",
+                "initial-cwd"
             ],
         },
         trappable_error_type: {
@@ -189,27 +202,32 @@ pub(crate) static RUNTIME: once_cell::sync::Lazy<tokio::runtime::Runtime> =
     });
 
 pub struct AbortOnDropJoinHandle<T>(tokio::task::JoinHandle<T>);
+
 impl<T> Drop for AbortOnDropJoinHandle<T> {
     fn drop(&mut self) {
         self.0.abort()
     }
 }
+
 impl<T> std::ops::Deref for AbortOnDropJoinHandle<T> {
     type Target = tokio::task::JoinHandle<T>;
     fn deref(&self) -> &Self::Target {
         &self.0
     }
 }
+
 impl<T> std::ops::DerefMut for AbortOnDropJoinHandle<T> {
     fn deref_mut(&mut self) -> &mut tokio::task::JoinHandle<T> {
         &mut self.0
     }
 }
+
 impl<T> From<tokio::task::JoinHandle<T>> for AbortOnDropJoinHandle<T> {
     fn from(jh: tokio::task::JoinHandle<T>) -> Self {
         AbortOnDropJoinHandle(jh)
     }
 }
+
 impl<T> Future for AbortOnDropJoinHandle<T> {
     type Output = T;
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {

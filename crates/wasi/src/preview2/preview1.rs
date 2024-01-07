@@ -520,7 +520,8 @@ wiggle::from_witx!({
             fd_filestat_set_times, fd_read, fd_pread, fd_seek, fd_sync, fd_readdir, fd_write,
             fd_pwrite, poll_oneoff, path_create_directory, path_filestat_get,
             path_filestat_set_times, path_link, path_open, path_readlink, path_remove_directory,
-            path_rename, path_symlink, path_unlink_file
+            path_rename, path_symlink, path_unlink_file,
+            random_get, clock_res_get, clock_time_get, args_get, args_sizes_get, environ_get, environ_sizes_get
         }
     },
     errors: { errno => trappable Error },
@@ -539,7 +540,8 @@ mod sync {
                 fd_filestat_set_times, fd_read, fd_pread, fd_seek, fd_sync, fd_readdir, fd_write,
                 fd_pwrite, poll_oneoff, path_create_directory, path_filestat_get,
                 path_filestat_set_times, path_link, path_open, path_readlink, path_remove_directory,
-                path_rename, path_symlink, path_unlink_file
+                path_rename, path_symlink, path_unlink_file,
+                random_get, clock_res_get, clock_time_get, args_get, args_sizes_get, environ_get, environ_sizes_get
             }
         },
         errors: { errno => trappable Error },
@@ -860,12 +862,13 @@ impl<
     > wasi_snapshot_preview1::WasiSnapshotPreview1 for T
 {
     #[instrument(skip(self))]
-    fn args_get<'b>(
+    async fn args_get<'b>(
         &mut self,
         argv: &GuestPtr<'b, GuestPtr<'b, u8>>,
         argv_buf: &GuestPtr<'b, u8>,
     ) -> Result<(), types::Error> {
         self.get_arguments()
+            .await
             .context("failed to call `get-arguments`")
             .map_err(types::Error::trap)?
             .into_iter()
@@ -882,9 +885,10 @@ impl<
     }
 
     #[instrument(skip(self))]
-    fn args_sizes_get(&mut self) -> Result<(types::Size, types::Size), types::Error> {
+    async fn args_sizes_get(&mut self) -> Result<(types::Size, types::Size), types::Error> {
         let args = self
             .get_arguments()
+            .await
             .context("failed to call `get-arguments`")
             .map_err(types::Error::trap)?;
         let num = args.len().try_into().map_err(|_| types::Errno::Overflow)?;
@@ -898,12 +902,13 @@ impl<
     }
 
     #[instrument(skip(self))]
-    fn environ_get<'b>(
+    async fn environ_get<'b>(
         &mut self,
         environ: &GuestPtr<'b, GuestPtr<'b, u8>>,
         environ_buf: &GuestPtr<'b, u8>,
     ) -> Result<(), types::Error> {
         self.get_environment()
+            .await
             .context("failed to call `get-environment`")
             .map_err(types::Error::trap)?
             .into_iter()
@@ -925,9 +930,10 @@ impl<
     }
 
     #[instrument(skip(self))]
-    fn environ_sizes_get(&mut self) -> Result<(types::Size, types::Size), types::Error> {
+    async fn environ_sizes_get(&mut self) -> Result<(types::Size, types::Size), types::Error> {
         let environ = self
             .get_environment()
+            .await
             .context("failed to call `get-environment`")
             .map_err(types::Error::trap)?;
         let num = environ.len().try_into()?;
@@ -940,13 +946,18 @@ impl<
     }
 
     #[instrument(skip(self))]
-    fn clock_res_get(&mut self, id: types::Clockid) -> Result<types::Timestamp, types::Error> {
+    async fn clock_res_get(
+        &mut self,
+        id: types::Clockid,
+    ) -> Result<types::Timestamp, types::Error> {
         let res = match id {
             types::Clockid::Realtime => wall_clock::Host::resolution(self)
+                .await
                 .context("failed to call `wall_clock::resolution`")
                 .map_err(types::Error::trap)?
                 .try_into()?,
             types::Clockid::Monotonic => monotonic_clock::Host::resolution(self)
+                .await
                 .context("failed to call `monotonic_clock::resolution`")
                 .map_err(types::Error::trap)?,
             types::Clockid::ProcessCputimeId | types::Clockid::ThreadCputimeId => {
@@ -957,17 +968,19 @@ impl<
     }
 
     #[instrument(skip(self))]
-    fn clock_time_get(
+    async fn clock_time_get(
         &mut self,
         id: types::Clockid,
         _precision: types::Timestamp,
     ) -> Result<types::Timestamp, types::Error> {
         let now = match id {
             types::Clockid::Realtime => wall_clock::Host::now(self)
+                .await
                 .context("failed to call `wall_clock::now`")
                 .map_err(types::Error::trap)?
                 .try_into()?,
             types::Clockid::Monotonic => monotonic_clock::Host::now(self)
+                .await
                 .context("failed to call `monotonic_clock::now`")
                 .map_err(types::Error::trap)?,
             types::Clockid::ProcessCputimeId | types::Clockid::ThreadCputimeId => {
@@ -2044,6 +2057,7 @@ impl<
                         types::Clockid::Realtime if !absolute => (timeout, false),
                         types::Clockid::Realtime => {
                             let now = wall_clock::Host::now(self)
+                                .await
                                 .context("failed to call `wall_clock::now`")
                                 .map_err(types::Error::trap)?;
 
@@ -2067,10 +2081,12 @@ impl<
                     };
                     if absolute {
                         monotonic_clock::Host::subscribe_instant(self, timeout)
+                            .await
                             .context("failed to call `monotonic_clock::subscribe_instant`")
                             .map_err(types::Error::trap)?
                     } else {
                         monotonic_clock::Host::subscribe_duration(self, timeout)
+                            .await
                             .context("failed to call `monotonic_clock::subscribe_duration`")
                             .map_err(types::Error::trap)?
                     }
@@ -2279,13 +2295,14 @@ impl<
     }
 
     #[instrument(skip(self))]
-    fn random_get<'a>(
+    async fn random_get<'a>(
         &mut self,
         buf: &GuestPtr<'a, u8>,
         buf_len: types::Size,
     ) -> Result<(), types::Error> {
         let rand = self
             .get_random_bytes(buf_len.into())
+            .await
             .context("failed to call `get-random-bytes`")
             .map_err(types::Error::trap)?;
         write_bytes(buf, &rand)?;
