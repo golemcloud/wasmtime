@@ -138,7 +138,7 @@ pub fn default_send_request(
     Ok(fut)
 }
 
-async fn handler(
+pub async fn handler(
     authority: String,
     use_tls: bool,
     connect_timeout: Duration,
