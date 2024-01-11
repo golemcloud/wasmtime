@@ -124,6 +124,10 @@ impl HostInputStream for TcpReadStream {
         buf.truncate(n);
         Ok(buf.freeze())
     }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
 }
 
 #[async_trait::async_trait]
