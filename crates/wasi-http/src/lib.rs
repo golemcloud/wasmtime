@@ -16,7 +16,12 @@ pub mod bindings {
             import wasi:http/types@0.2.0;
         ",
         tracing: true,
-        async: false,
+        async: {
+            only_imports: [
+                "[method]future-incoming-response.get",
+                "[method]future-trailers.get",
+            ],
+        },
         with: {
             "wasi:io/error": wasmtime_wasi::preview2::bindings::io::error,
             "wasi:io/streams": wasmtime_wasi::preview2::bindings::io::streams,

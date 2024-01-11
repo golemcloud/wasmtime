@@ -139,7 +139,7 @@ pub fn default_send_request(
     Ok(fut)
 }
 
-pub async fn handler(
+pub(crate) async fn handler(
     authority: String,
     use_tls: bool,
     connect_timeout: Duration,
@@ -405,11 +405,16 @@ pub enum HostFutureIncomingResponse {
     Pending(FutureIncomingResponseHandle),
     Ready(anyhow::Result<Result<IncomingResponseInternal, types::ErrorCode>>),
     Consumed,
+    Deferred(OutgoingRequest)
 }
 
 impl HostFutureIncomingResponse {
     pub fn new(handle: FutureIncomingResponseHandle) -> Self {
         Self::Pending(handle)
+    }
+
+    pub fn deferred(request: OutgoingRequest) -> Self {
+        Self::Deferred(request)
     }
 
     pub fn is_ready(&self) -> bool {
@@ -421,7 +426,7 @@ impl HostFutureIncomingResponse {
     ) -> anyhow::Result<Result<IncomingResponseInternal, types::ErrorCode>> {
         match self {
             Self::Ready(res) => res,
-            Self::Pending(_) | Self::Consumed => {
+            Self::Pending(_) | Self::Consumed | Self::Deferred(_) => {
                 panic!("unwrap_ready called on a pending HostFutureIncomingResponse")
             }
         }
