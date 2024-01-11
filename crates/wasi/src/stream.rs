@@ -6,7 +6,7 @@ use std::any::Any;
 /// Host trait for implementing the `wasi:io/streams.input-stream` resource: A
 /// bytestream which can be read from.
 #[async_trait::async_trait]
-pub trait HostInputStream: Subscribe {
+pub trait HostInputStream: Subscribe + Any {
     /// Reads up to `size` bytes, returning a buffer holding these bytes on
     /// success.
     ///
@@ -46,6 +46,8 @@ pub trait HostInputStream: Subscribe {
 
     /// Cancel any asynchronous work and wait for it to wrap up.
     async fn cancel(&mut self) {}
+
+    fn as_any(&self) -> &dyn Any;
 }
 
 /// Representation of the `error` resource type in the `wasi:io/error`

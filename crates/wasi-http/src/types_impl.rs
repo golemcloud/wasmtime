@@ -1,5 +1,6 @@
 //! Implementation for the `wasi:http/types` interface.
 
+use crate::types::OutgoingRequest;
 use crate::{
     bindings::http::types::{self, Headers, Method, Scheme, StatusCode, Trailers},
     body::{HostFutureTrailers, HostIncomingBody, HostOutgoingBody, StreamContext},
@@ -10,7 +11,8 @@ use crate::{
     },
     WasiHttpImpl, WasiHttpView,
 };
-use anyhow::Context;
+use anyhow::{anyhow, Context};
+use async_trait::async_trait;
 use std::any::Any;
 use std::str::FromStr;
 use wasmtime::component::{Resource, ResourceTable};
@@ -72,7 +74,7 @@ fn move_fields(
     }
 }
 
-fn get_fields<'a>(
+pub fn get_fields<'a>(
     table: &'a mut ResourceTable,
     id: &Resource<HostFields>,
 ) -> wasmtime::Result<&'a FieldMap> {
@@ -644,6 +646,7 @@ where
     }
 }
 
+#[async_trait]
 impl<T> crate::bindings::http::types::HostFutureTrailers for WasiHttpImpl<T>
 where
     T: WasiHttpView,
@@ -663,7 +666,7 @@ where
         wasmtime_wasi::subscribe(self.table(), index, None)
     }
 
-    fn get(
+    async fn get(
         &mut self,
         id: Resource<HostFutureTrailers>,
     ) -> wasmtime::Result<Option<Result<Result<Option<Resource<Trailers>>, types::ErrorCode>, ()>>>
@@ -820,6 +823,7 @@ where
     }
 }
 
+#[async_trait]
 impl<T> crate::bindings::http::types::HostFutureIncomingResponse for WasiHttpImpl<T>
 where
     T: WasiHttpView,
@@ -829,7 +833,7 @@ where
         Ok(())
     }
 
-    fn get(
+    async fn get(
         &mut self,
         id: Resource<HostFutureIncomingResponse>,
     ) -> wasmtime::Result<
@@ -841,6 +845,39 @@ where
             HostFutureIncomingResponse::Pending(_) => return Ok(None),
             HostFutureIncomingResponse::Consumed => return Ok(Some(Err(()))),
             HostFutureIncomingResponse::Ready(_) => {}
+            HostFutureIncomingResponse::Deferred(_) => {
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                let handle = wasmtime_wasi::preview2::spawn(async move {
+                    let request = rx.await.map_err(|err| anyhow!(err))?;
+                    let HostFutureIncomingResponse::Deferred(OutgoingRequest {
+                        use_tls,
+                        authority,
+                        request,
+                        connect_timeout,
+                        first_byte_timeout,
+                        between_bytes_timeout,
+                    }) = request
+                    else {
+                        return Err(anyhow!("unexpected incoming response state".to_string()));
+                    };
+                    let resp = crate::types::handler(
+                        authority,
+                        use_tls,
+                        connect_timeout,
+                        first_byte_timeout,
+                        request,
+                        between_bytes_timeout,
+                    )
+                    .await;
+                    Ok(resp)
+                });
+                tx.send(std::mem::replace(
+                    resp,
+                    HostFutureIncomingResponse::Pending(handle),
+                ))
+                .map_err(|_| anyhow!("failed to send request to handler"))?;
+                return Ok(None);
+            }
         }
 
         let resp =
