@@ -48,6 +48,10 @@ impl InputStream for MemoryInputPipe {
         let read = buffer.split_to(size);
         Ok(read)
     }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
 }
 
 #[async_trait::async_trait]
@@ -204,6 +208,10 @@ impl InputStream for AsyncReadStream {
             None => {}
         }
     }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
 }
 #[async_trait::async_trait]
 impl Pollable for AsyncReadStream {
@@ -256,6 +264,10 @@ pub struct ClosedInputStream;
 impl InputStream for ClosedInputStream {
     fn read(&mut self, _size: usize) -> Result<Bytes, StreamError> {
         Err(StreamError::Closed)
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
     }
 }
 

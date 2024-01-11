@@ -269,6 +269,8 @@ impl InputStream for HostIncomingBodyStream {
             }
         }
     }
+
+    fn as_any(&self) -> &dyn Any { self }
 }
 
 #[async_trait::async_trait]

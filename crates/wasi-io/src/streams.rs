@@ -16,7 +16,7 @@ const MAX_BLOCKING_ATTEMPTS: u8 = 10;
 /// Host trait for implementing the `wasi:io/streams.input-stream` resource: A
 /// bytestream which can be read from.
 #[async_trait::async_trait]
-pub trait InputStream: Pollable {
+pub trait InputStream: Subscribe + Any {
     /// Reads up to `size` bytes, returning a buffer holding these bytes on
     /// success.
     ///
@@ -72,6 +72,8 @@ pub trait InputStream: Pollable {
 
     /// Cancel any asynchronous work and wait for it to wrap up.
     async fn cancel(&mut self) {}
+
+    fn as_any(&self) -> &dyn Any;
 }
 
 /// Representation of the `error` resource type in the `wasi:io/error`
