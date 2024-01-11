@@ -510,6 +510,7 @@ pub enum HostFutureIncomingResponse {
     Ready(anyhow::Result<Result<IncomingResponse, types::ErrorCode>>),
     /// The response has been consumed.
     Consumed,
+    Deferred(OutgoingRequest)
 }
 
 impl HostFutureIncomingResponse {
@@ -524,6 +525,10 @@ impl HostFutureIncomingResponse {
     }
 
     /// Returns `true` if the response is ready.
+    pub fn deferred(request: OutgoingRequest) -> Self {
+        Self::Deferred(request)
+    }
+
     pub fn is_ready(&self) -> bool {
         matches!(self, Self::Ready(_))
     }
@@ -532,7 +537,7 @@ impl HostFutureIncomingResponse {
     pub fn unwrap_ready(self) -> anyhow::Result<Result<IncomingResponse, types::ErrorCode>> {
         match self {
             Self::Ready(res) => res,
-            Self::Pending(_) | Self::Consumed => {
+            Self::Pending(_) | Self::Consumed | Self::Deferred(_) => {
                 panic!("unwrap_ready called on a pending HostFutureIncomingResponse")
             }
         }

@@ -55,7 +55,12 @@ pub mod bindings {
             import wasi:http/types@0.2.0;
         ",
         tracing: true,
-        async: false,
+        async: {
+            only_imports: [
+                "[method]future-incoming-response.get",
+                "[method]future-trailers.get",
+            ],
+        },
         trappable_imports: true,
         with: {
             // Upstream package dependencies
