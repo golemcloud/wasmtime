@@ -492,7 +492,6 @@ impl<T: WasiHttpView> crate::bindings::http::types::HostOutgoingRequest for T {
         let req = self.table().get_mut(&request)?;
 
         if let Some(s) = authority.as_ref() {
-            println!("checking authority {s}");
             let auth = match http::uri::Authority::from_str(s.as_str()) {
                 Ok(auth) => auth,
                 Err(_) => return Ok(Err(())),
@@ -611,7 +610,6 @@ impl<T: WasiHttpView> crate::bindings::http::types::HostIncomingResponse for T {
 
         match r.body.take() {
             Some(body) => {
-                println!("Got incoming body {body:?}");
                 let id = self.table().push(body)?;
                 Ok(Ok(id))
             }
