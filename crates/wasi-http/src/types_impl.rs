@@ -1,6 +1,5 @@
 //! Implementation for the `wasi:http/types` interface.
 
-use crate::types::OutgoingRequest;
 use crate::{
     bindings::http::types::{self, Headers, Method, Scheme, StatusCode, Trailers},
     body::{HostFutureTrailers, HostIncomingBody, HostOutgoingBody, StreamContext},
@@ -845,37 +844,25 @@ where
             HostFutureIncomingResponse::Pending(_) => return Ok(None),
             HostFutureIncomingResponse::Consumed => return Ok(Some(Err(()))),
             HostFutureIncomingResponse::Ready(_) => {}
-            HostFutureIncomingResponse::Deferred(_) => {
+            HostFutureIncomingResponse::Deferred { .. } => {
                 let (tx, rx) = tokio::sync::oneshot::channel();
-                let handle = wasmtime_wasi::preview2::spawn(async move {
+                let handle = wasmtime_wasi::runtime::spawn(async move {
                     let request = rx.await.map_err(|err| anyhow!(err))?;
-                    let HostFutureIncomingResponse::Deferred(OutgoingRequest {
-                        use_tls,
-                        authority,
-                        request,
-                        connect_timeout,
-                        first_byte_timeout,
-                        between_bytes_timeout,
-                    }) = request
-                    else {
-                        return Err(anyhow!("unexpected incoming response state".to_string()));
-                    };
-                    let resp = crate::types::handler(
-                        authority,
-                        use_tls,
-                        connect_timeout,
-                        first_byte_timeout,
-                        request,
-                        between_bytes_timeout,
+                    let HostFutureIncomingResponse::Deferred { request, config } = request
+                        else {
+                            return Err(anyhow!("unexpected incoming response state".to_string()));
+                        };
+                    let resp = crate::types::default_send_request_handler(
+                        request, config,
                     )
-                    .await;
+                        .await;
                     Ok(resp)
                 });
                 tx.send(std::mem::replace(
                     resp,
                     HostFutureIncomingResponse::Pending(handle),
                 ))
-                .map_err(|_| anyhow!("failed to send request to handler"))?;
+                    .map_err(|_| anyhow!("failed to send request to handler"))?;
                 return Ok(None);
             }
         }

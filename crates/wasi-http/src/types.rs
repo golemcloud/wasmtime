@@ -377,9 +377,9 @@ pub async fn default_send_request_handler(
                 connect_timeout,
                 hyper::client::conn::http1::handshake(stream),
             )
-            .await
-            .map_err(|_| types::ErrorCode::ConnectionTimeout)?
-            .map_err(hyper_request_error)?;
+                .await
+                .map_err(|_| types::ErrorCode::ConnectionTimeout)?
+                .map_err(hyper_request_error)?;
 
             let worker = wasmtime_wasi::runtime::spawn(async move {
                 match conn.await {
@@ -399,9 +399,9 @@ pub async fn default_send_request_handler(
             // TODO: we should plumb the builder through the http context, and use it here
             hyper::client::conn::http1::handshake(tcp_stream),
         )
-        .await
-        .map_err(|_| types::ErrorCode::ConnectionTimeout)?
-        .map_err(hyper_request_error)?;
+            .await
+            .map_err(|_| types::ErrorCode::ConnectionTimeout)?
+            .map_err(hyper_request_error)?;
 
         let worker = wasmtime_wasi::runtime::spawn(async move {
             match conn.await {
@@ -526,7 +526,7 @@ impl HostIncomingRequest {
 pub struct HostResponseOutparam {
     /// The sender for sending a response.
     pub result:
-        tokio::sync::oneshot::Sender<Result<hyper::Response<HyperOutgoingBody>, types::ErrorCode>>,
+    tokio::sync::oneshot::Sender<Result<hyper::Response<HyperOutgoingBody>, types::ErrorCode>>,
 }
 
 /// The concrete type behind a `wasi:http/types/outgoing-response` resource.
@@ -628,7 +628,7 @@ pub type FieldMap = hyper::HeaderMap;
 
 /// A handle to a future incoming response.
 pub type FutureIncomingResponseHandle =
-    AbortOnDropJoinHandle<anyhow::Result<Result<IncomingResponse, types::ErrorCode>>>;
+AbortOnDropJoinHandle<anyhow::Result<Result<IncomingResponse, types::ErrorCode>>>;
 
 /// A response that is in the process of being received.
 #[derive(Debug)]
@@ -652,7 +652,13 @@ pub enum HostFutureIncomingResponse {
     Ready(anyhow::Result<Result<IncomingResponse, types::ErrorCode>>),
     /// The response has been consumed.
     Consumed,
-    Deferred(OutgoingRequest)
+    /// The request is deferred, to be executed the first time the future is polled
+    Deferred {
+        /// Outgoing request
+        request: hyper::Request<HyperOutgoingBody>,
+        /// Outgoing request configuration
+        config: OutgoingRequestConfig,
+    },
 }
 
 impl HostFutureIncomingResponse {
@@ -667,10 +673,15 @@ impl HostFutureIncomingResponse {
     }
 
     /// Returns `true` if the response is ready.
-    pub fn deferred(request: OutgoingRequest) -> Self {
-        Self::Deferred(request)
+    pub fn deferred(request: hyper::Request<HyperOutgoingBody>,
+                    config: OutgoingRequestConfig) -> Self {
+        Self::Deferred {
+            request,
+            config,
+        }
     }
 
+    /// Returns `true` if the response is ready.
     pub fn is_ready(&self) -> bool {
         matches!(self, Self::Ready(_))
     }
@@ -679,7 +690,7 @@ impl HostFutureIncomingResponse {
     pub fn unwrap_ready(self) -> anyhow::Result<Result<IncomingResponse, types::ErrorCode>> {
         match self {
             Self::Ready(res) => res,
-            Self::Pending(_) | Self::Consumed | Self::Deferred(_) => {
+            Self::Pending(_) | Self::Consumed | Self::Deferred { .. } => {
                 panic!("unwrap_ready called on a pending HostFutureIncomingResponse")
             }
         }

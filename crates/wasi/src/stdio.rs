@@ -127,6 +127,10 @@ impl HostInputStream for AsyncStdinStream {
             }
         }
     }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
 }
 
 #[async_trait::async_trait]
