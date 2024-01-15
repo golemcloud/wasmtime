@@ -84,6 +84,10 @@ impl HostInputStream for AsyncStdinStream {
     fn skip(&mut self, size: usize) -> Result<usize, crate::StreamError> {
         self.0.lock().unwrap().skip(size)
     }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
 }
 
 impl Subscribe for AsyncStdinStream {
