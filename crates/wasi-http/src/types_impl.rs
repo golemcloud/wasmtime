@@ -624,7 +624,6 @@ impl<T: WasiHttpView> crate::bindings::http::types::HostIncomingResponse for T {
 
         match r.body.take() {
             Some(body) => {
-                println!("Got incoming body {body:?}");
                 let id = self.table().push(body)?;
                 Ok(Ok(id))
             }
