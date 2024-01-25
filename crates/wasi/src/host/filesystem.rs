@@ -10,11 +10,13 @@ use crate::filesystem::{
 use crate::{DirPerms, FilePerms, FsError, FsResult, WasiView};
 use anyhow::Context;
 use wasmtime::component::Resource;
+use async_trait::async_trait;
 
 mod sync;
 
+#[async_trait]
 impl<T: WasiView> preopens::Host for T {
-    fn get_directories(
+    async fn get_directories(
         &mut self,
     ) -> Result<Vec<(Resource<types::Descriptor>, String)>, anyhow::Error> {
         let mut results = Vec::new();
@@ -90,11 +92,11 @@ impl<T: WasiView> HostDescriptor for T {
                     // this error, for POSIX compatibility.
                     #[cfg(windows)]
                     Err(e)
-                        if e.raw_os_error()
-                            == Some(windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED as _) =>
-                    {
-                        Ok(())
-                    }
+                    if e.raw_os_error()
+                        == Some(windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED as _) =>
+                        {
+                            Ok(())
+                        }
                     Err(e) => Err(e.into()),
                 }
             }
@@ -318,7 +320,7 @@ impl<T: WasiView> HostDescriptor for T {
         // On windows, filter out files like `C:\DumpStack.log.tmp` which we
         // can't get full metadata for.
         #[cfg(windows)]
-        let entries = entries.filter(|entry| {
+            let entries = entries.filter(|entry| {
             use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_SHARING_VIOLATION};
             if let Err(ReaddirError::Io(err)) = entry {
                 if err.raw_os_error() == Some(ERROR_SHARING_VIOLATION as i32)
@@ -349,11 +351,11 @@ impl<T: WasiView> HostDescriptor for T {
                     // this error, for POSIX compatibility.
                     #[cfg(windows)]
                     Err(e)
-                        if e.raw_os_error()
-                            == Some(windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED as _) =>
-                    {
-                        Ok(())
-                    }
+                    if e.raw_os_error()
+                        == Some(windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED as _) =>
+                        {
+                            Ok(())
+                        }
                     Err(e) => Err(e.into()),
                 }
             }
@@ -439,7 +441,7 @@ impl<T: WasiView> HostDescriptor for T {
                     mtim.map(cap_fs_ext::SystemTimeSpec::from_std),
                 )
             })
-            .await?;
+                .await?;
         } else {
             d.spawn_blocking(move |d| {
                 d.set_symlink_times(
@@ -448,7 +450,7 @@ impl<T: WasiView> HostDescriptor for T {
                     mtim.map(cap_fs_ext::SystemTimeSpec::from_std),
                 )
             })
-            .await?;
+                .await?;
         }
         Ok(())
     }
@@ -939,6 +941,7 @@ fn from_raw_os_error(err: Option<i32>) -> Option<ErrorCode> {
         _ => return None,
     })
 }
+
 #[cfg(windows)]
 fn from_raw_os_error(raw_os_error: Option<i32>) -> Option<ErrorCode> {
     use windows_sys::Win32::Foundation;
