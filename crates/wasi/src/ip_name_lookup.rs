@@ -24,7 +24,7 @@ impl<T> Host for WasiImpl<T>
 where
     T: WasiView,
 {
-    fn resolve_addresses(
+    async fn resolve_addresses(
         &mut self,
         network: Resource<Network>,
         name: String,

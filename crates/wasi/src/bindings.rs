@@ -181,6 +181,7 @@ pub mod sync {
             require_store_data_send: true,
         });
     }
+
     pub use self::generated::exports;
     pub use self::generated::wasi::*;
 
@@ -396,6 +397,8 @@ mod async_io {
                 "get-environment",
                 "get-arguments",
                 "initial-cwd",
+                "get-directories",
+                "resolve-addresses"
                 "[method]tcp-socket.start-bind",
                 "[method]tcp-socket.start-connect",
                 "[method]udp-socket.start-bind",
