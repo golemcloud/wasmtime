@@ -9,11 +9,13 @@ use crate::preview2::filesystem::{FileInputStream, FileOutputStream};
 use crate::preview2::{DirPerms, FilePerms, FsError, FsResult, WasiView};
 use anyhow::Context;
 use wasmtime::component::{Resource, ResourceTable};
+use async_trait::async_trait;
 
 mod sync;
 
+#[async_trait]
 impl<T: WasiView> preopens::Host for T {
-    fn get_directories(
+    async fn get_directories(
         &mut self,
     ) -> Result<Vec<(Resource<types::Descriptor>, String)>, anyhow::Error> {
         let mut results = Vec::new();
