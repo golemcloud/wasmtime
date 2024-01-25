@@ -29,8 +29,6 @@ mod ip_name_lookup;
 mod network;
 pub mod pipe;
 mod poll;
-#[cfg(feature = "preview1-on-preview2")]
-pub mod preview1;
 mod random;
 mod stdio;
 mod stream;
@@ -163,7 +161,8 @@ pub mod bindings {
                 "subscribe-duration",
                 "get-environment",
                 "get-arguments",
-                "initial-cwd"
+                "initial-cwd",
+                "get-directories"
             ],
         },
         trappable_error_type: {
