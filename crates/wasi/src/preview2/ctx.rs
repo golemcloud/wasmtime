@@ -12,6 +12,7 @@ use crate::preview2::{
 use cap_rand::{Rng, RngCore, SeedableRng};
 use std::sync::Arc;
 use std::{mem, net::SocketAddr};
+use std::path::PathBuf;
 use std::time::Duration;
 use wasmtime::component::ResourceTable;
 
@@ -150,7 +151,7 @@ impl WasiCtxBuilder {
         path: impl AsRef<str>,
     ) -> &mut Self {
         self.preopens
-            .push((Dir::new(dir, perms, file_perms), path.as_ref().to_owned()));
+            .push((Dir::new(dir, perms, file_perms, PathBuf::from(path.as_ref())), path.as_ref().to_owned()));
         self
     }
 
