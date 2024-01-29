@@ -149,9 +149,10 @@ impl WasiCtxBuilder {
         perms: DirPerms,
         file_perms: FilePerms,
         path: impl AsRef<str>,
+        host_path: PathBuf,
     ) -> &mut Self {
         self.preopens
-            .push((Dir::new(dir, perms, file_perms, PathBuf::from(path.as_ref())), path.as_ref().to_owned()));
+            .push((Dir::new(dir, perms, file_perms, host_path), path.as_ref().to_owned()));
         self
     }
 
