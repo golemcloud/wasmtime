@@ -8,6 +8,7 @@ use bytes::{Bytes, BytesMut};
 use std::any::Any;
 use std::io;
 use std::mem;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 pub type FsResult<T> = Result<T, FsError>;
@@ -98,6 +99,8 @@ pub struct File {
     pub open_mode: OpenMode,
 
     allow_blocking_current_thread: bool,
+
+    pub path: PathBuf
 }
 
 impl File {
@@ -106,12 +109,14 @@ impl File {
         perms: FilePerms,
         open_mode: OpenMode,
         allow_blocking_current_thread: bool,
+        path: PathBuf
     ) -> Self {
         Self {
             file: Arc::new(file),
             perms,
             open_mode,
             allow_blocking_current_thread,
+            path
         }
     }
 
@@ -203,6 +208,8 @@ pub struct Dir {
     pub open_mode: OpenMode,
 
     allow_blocking_current_thread: bool,
+
+    pub path: PathBuf
 }
 
 impl Dir {
@@ -212,6 +219,7 @@ impl Dir {
         file_perms: FilePerms,
         open_mode: OpenMode,
         allow_blocking_current_thread: bool,
+        path: PathBuf
     ) -> Self {
         Dir {
             dir: Arc::new(dir),
@@ -219,6 +227,7 @@ impl Dir {
             file_perms,
             open_mode,
             allow_blocking_current_thread,
+            path
         }
     }
 

@@ -12,7 +12,7 @@ use crate::{
 use anyhow::Result;
 use cap_rand::{Rng, RngCore, SeedableRng};
 use cap_std::ambient_authority;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::{future::Future, pin::Pin};
 use std::{mem, net::SocketAddr};
@@ -351,6 +351,7 @@ impl WasiCtxBuilder {
                 file_perms,
                 open_mode,
                 self.allow_blocking_current_thread,
+                PathBuf::from(guest_path.as_ref()),
             ),
             guest_path.as_ref().to_owned(),
         ));
