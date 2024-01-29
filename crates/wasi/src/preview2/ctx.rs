@@ -12,6 +12,7 @@ use cap_std::net::Pool;
 use cap_std::{ambient_authority, AmbientAuthority};
 use std::mem;
 use std::net::{Ipv4Addr, Ipv6Addr};
+use std::path::PathBuf;
 use std::time::Duration;
 
 pub struct WasiCtxBuilder {
@@ -150,7 +151,7 @@ impl WasiCtxBuilder {
         path: impl AsRef<str>,
     ) -> &mut Self {
         self.preopens
-            .push((Dir::new(dir, perms, file_perms), path.as_ref().to_owned()));
+            .push((Dir::new(dir, perms, file_perms, PathBuf::from(path.as_ref())), path.as_ref().to_owned()));
         self
     }
 
