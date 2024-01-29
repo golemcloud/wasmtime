@@ -594,6 +594,7 @@ where
             NotDir,
         }
 
+        let path_clone = path.clone();
         let opened = d
             .run_blocking::<_, std::io::Result<OpenResult>>(move |d| {
                 let mut opened = d.open_with(&path, &opts)?;
@@ -620,6 +621,7 @@ where
                 d.file_perms,
                 open_mode,
                 allow_blocking_current_thread,
+                d.path.join(path)
             )))?),
 
             OpenResult::File(file) => Ok(table.push(Descriptor::File(File::new(
@@ -627,6 +629,7 @@ where
                 d.file_perms,
                 open_mode,
                 allow_blocking_current_thread,
+                d.path.join(path)
             )))?),
 
             OpenResult::NotDir => Err(ErrorCode::NotDirectory.into()),
