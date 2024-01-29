@@ -12,7 +12,7 @@ use crate::{
 use anyhow::Result;
 use cap_rand::{Rng, RngCore, SeedableRng};
 use cap_std::ambient_authority;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::{mem, net::SocketAddr};
 use std::time::Duration;
@@ -350,6 +350,7 @@ impl WasiCtxBuilder {
                 file_perms,
                 open_mode,
                 self.allow_blocking_current_thread,
+                PathBuf::from(guest_path.as_ref()),
             ),
             guest_path.as_ref().to_owned(),
         ));
@@ -421,8 +422,8 @@ impl WasiCtxBuilder {
     /// Returning `true` will permit socket connections to the `SocketAddr`,
     /// while returning `false` will reject the connection.
     pub fn socket_addr_check<F>(&mut self, check: F) -> &mut Self
-    where
-        F: Fn(&SocketAddr, SocketAddrUse) -> bool + Send + Sync + 'static,
+        where
+            F: Fn(&SocketAddr, SocketAddrUse) -> bool + Send + Sync + 'static,
     {
         self.socket_addr_check = SocketAddrCheck(Arc::new(check));
         self

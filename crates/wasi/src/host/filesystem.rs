@@ -587,9 +587,10 @@ impl<T: WasiView> HostDescriptor for T {
             NotDir,
         }
 
+        let path_clone = path.clone();
         let opened = d
             .spawn_blocking::<_, std::io::Result<OpenResult>>(move |d| {
-                let mut opened = d.open_with(&path, &opts)?;
+                let mut opened = d.open_with(&path_clone, &opts)?;
                 if opened.metadata()?.is_dir() {
                     Ok(OpenResult::Dir(cap_std::fs::Dir::from_std_file(
                         opened.into_std(),
@@ -613,6 +614,7 @@ impl<T: WasiView> HostDescriptor for T {
                 d.file_perms,
                 open_mode,
                 allow_blocking_current_thread,
+                d.path.join(path)
             )))?),
 
             OpenResult::File(file) => Ok(table.push(Descriptor::File(File::new(
@@ -620,6 +622,7 @@ impl<T: WasiView> HostDescriptor for T {
                 d.file_perms,
                 open_mode,
                 allow_blocking_current_thread,
+                d.path.join(path)
             )))?),
 
             OpenResult::NotDir => Err(ErrorCode::NotDirectory.into()),
