@@ -351,7 +351,7 @@ impl WasiCtxBuilder {
                 file_perms,
                 open_mode,
                 self.allow_blocking_current_thread,
-                PathBuf::from(guest_path.as_ref()),
+                PathBuf::from(host_path.as_ref()),
             ),
             guest_path.as_ref().to_owned(),
         ));
