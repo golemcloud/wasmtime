@@ -601,7 +601,7 @@ pub struct ReaddirIterator(
 );
 
 impl ReaddirIterator {
-    pub(crate) fn new(
+    pub fn new(
         i: impl Iterator<Item = FsResult<types::DirectoryEntry>> + Send + 'static,
     ) -> Self {
         ReaddirIterator(std::sync::Mutex::new(Box::new(i)))
