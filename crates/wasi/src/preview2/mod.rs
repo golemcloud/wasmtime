@@ -161,7 +161,8 @@ pub mod bindings {
                 "get-environment",
                 "get-arguments",
                 "initial-cwd",
-                "get-directories"
+                "get-directories",
+                "resolve-addresses"
             ],
         },
         trappable_error_type: {
