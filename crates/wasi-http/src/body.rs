@@ -9,11 +9,10 @@ use std::future::Future;
 use std::mem;
 use std::task::{Context, Poll};
 use std::{pin::Pin, sync::Arc, time::Duration};
+use std::any::Any;
+use async_trait::async_trait;
 use tokio::sync::{mpsc, oneshot};
-use wasmtime_wasi::preview2::{
-    self, poll_noop, AbortOnDropJoinHandle, HostInputStream, HostOutputStream, StreamError,
-    Subscribe,
-};
+use wasmtime_wasi::preview2::{self, poll_noop, AbortOnDropJoinHandle, HostInputStream, HostOutputStream, StreamError, Subscribe, StreamResult, InputStream};
 
 pub type HyperIncomingBody = BoxBody<Bytes, types::ErrorCode>;
 
@@ -86,6 +85,16 @@ pub struct HostIncomingBody {
     worker: Option<Arc<AbortOnDropJoinHandle<()>>>,
 }
 
+impl std::fmt::Debug for HostIncomingBody {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.body {
+            IncomingBodyState::Start(_) => write!(f, "HostIncomingBody {{ Start }}"),
+            IncomingBodyState::InBodyStream(_) => write!(f, "HostIncomingBody {{ InBodyStream }}"),
+            IncomingBodyState::Failing(_) => write!(f, "HostIncomingBody {{ Failing }}"),
+        }
+    }
+}
+
 enum IncomingBodyState {
     /// The body is stored here meaning that within `HostIncomingBody` the
     /// `take_stream` method can be called for example.
@@ -95,6 +104,8 @@ enum IncomingBodyState {
     /// currently owned here. The body will be sent back over this channel when
     /// it's done, however.
     InBodyStream(oneshot::Receiver<StreamEnd>),
+
+    Failing(String),
 }
 
 /// Message sent when a `HostIncomingBodyStream` is done to the
@@ -118,26 +129,35 @@ impl HostIncomingBody {
         }
     }
 
+    pub fn failing(error: String) -> HostIncomingBody {
+        HostIncomingBody {
+            body: IncomingBodyState::Failing(error),
+            worker: None,
+        }
+    }
+
     pub fn retain_worker(&mut self, worker: &Arc<AbortOnDropJoinHandle<()>>) {
         assert!(self.worker.is_none());
         self.worker = Some(worker.clone());
     }
 
-    pub fn take_stream(&mut self) -> Option<HostIncomingBodyStream> {
+    pub fn take_stream(&mut self) -> Option<InputStream> {
         match &mut self.body {
             IncomingBodyState::Start(_) => {}
+            IncomingBodyState::Failing(error) => return Some(InputStream::Host(Box::new(FailingStream { error: error.clone() }))),
             IncomingBodyState::InBodyStream(_) => return None,
         }
         let (tx, rx) = oneshot::channel();
         let body = match mem::replace(&mut self.body, IncomingBodyState::InBodyStream(rx)) {
             IncomingBodyState::Start(b) => b,
             IncomingBodyState::InBodyStream(_) => unreachable!(),
+            IncomingBodyState::Failing(_) => unreachable!(),
         };
-        Some(HostIncomingBodyStream {
+        Some(InputStream::Host(Box::new(HostIncomingBodyStream {
             state: IncomingBodyStreamState::Open { body, tx },
             buffer: Bytes::new(),
             error: None,
-        })
+        })))
     }
 
     pub fn into_future_trailers(self) -> HostFutureTrailers {
@@ -204,6 +224,8 @@ impl HostInputStream for HostIncomingBodyStream {
             }
         }
     }
+
+    fn as_any(&self) -> &dyn Any { self }
 }
 
 #[async_trait::async_trait]
@@ -338,9 +360,14 @@ impl Subscribe for HostFutureTrailers {
             HostFutureTrailers::Waiting(body) => body,
             HostFutureTrailers::Done(_) => return,
         };
+        if let IncomingBodyState::Failing(_) = &mut body.body {
+            *self = HostFutureTrailers::Done(Err(types::ErrorCode::ConnectionTerminated));
+            return;
+        }
         let hyper_body = match &mut body.body {
             IncomingBodyState::Start(body) => body,
             IncomingBodyState::InBodyStream(_) => unreachable!(),
+            IncomingBodyState::Failing(_) => unreachable!(),
         };
         let result = loop {
             match hyper_body.frame().await {
@@ -549,6 +576,8 @@ impl BodyWriteStream {
 
 #[async_trait::async_trait]
 impl HostOutputStream for BodyWriteStream {
+    fn as_any(&self) -> &dyn Any { self }
+
     fn write(&mut self, bytes: Bytes) -> Result<(), StreamError> {
         let len = bytes.len();
         match self.writer.try_send(bytes) {
@@ -613,5 +642,26 @@ impl Subscribe for BodyWriteStream {
         // the channel or it's already closed then this will return immediately.
         // If the channel is full this will block until capacity opens up.
         let _ = self.writer.reserve().await;
+    }
+}
+
+
+pub struct FailingStream {
+    error: String
+}
+
+#[async_trait]
+impl Subscribe for FailingStream {
+    async fn ready(&mut self) {
+    }
+}
+
+impl HostInputStream for FailingStream {
+    fn read(&mut self, _size: usize) -> StreamResult<Bytes> {
+        Err(StreamError::trap(&self.error))
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
     }
 }

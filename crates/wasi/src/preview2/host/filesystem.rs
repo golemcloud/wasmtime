@@ -8,12 +8,14 @@ use crate::preview2::filesystem::{Descriptor, Dir, File, ReaddirIterator};
 use crate::preview2::filesystem::{FileInputStream, FileOutputStream};
 use crate::preview2::{DirPerms, FilePerms, FsError, FsResult, Table, WasiView};
 use anyhow::Context;
+use async_trait::async_trait;
 use wasmtime::component::Resource;
 
 mod sync;
 
+#[async_trait]
 impl<T: WasiView> preopens::Host for T {
-    fn get_directories(
+    async fn get_directories(
         &mut self,
     ) -> Result<Vec<(Resource<types::Descriptor>, String)>, anyhow::Error> {
         let mut results = Vec::new();
@@ -562,9 +564,10 @@ impl<T: WasiView> HostDescriptor for T {
             NotDir,
         }
 
+        let path_clone = path.clone();
         let opened = d
             .spawn_blocking::<_, std::io::Result<OpenResult>>(move |d| {
-                let mut opened = d.open_with(&path, &opts)?;
+                let mut opened = d.open_with(&path_clone, &opts)?;
                 if opened.metadata()?.is_dir() {
                     Ok(OpenResult::Dir(cap_std::fs::Dir::from_std_file(
                         opened.into_std(),
@@ -583,12 +586,13 @@ impl<T: WasiView> HostDescriptor for T {
 
         match opened {
             OpenResult::Dir(dir) => {
-                Ok(table.push(Descriptor::Dir(Dir::new(dir, d.perms, d.file_perms)))?)
+                Ok(table.push(Descriptor::Dir(Dir::new(dir, d.perms, d.file_perms, d.path.join(path))))?)
             }
 
             OpenResult::File(file) => Ok(table.push(Descriptor::File(File::new(
                 file,
                 mask_file_perms(d.file_perms, flags),
+                d.path.join(path)
             )))?),
 
             OpenResult::NotDir => Err(ErrorCode::NotDirectory.into()),
