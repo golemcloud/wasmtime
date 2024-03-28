@@ -1,3 +1,4 @@
+use async_trait::async_trait;
 use crate::{
     bindings::http::{
         outgoing_handler,
@@ -12,8 +13,9 @@ use http_body_util::{BodyExt, Empty};
 use hyper::Method;
 use wasmtime::component::Resource;
 
+#[async_trait]
 impl<T: WasiHttpView> outgoing_handler::Host for T {
-    fn handle(
+    async fn handle(
         &mut self,
         request_id: Resource<HostOutgoingRequest>,
         options: Option<Resource<types::RequestOptions>>,
