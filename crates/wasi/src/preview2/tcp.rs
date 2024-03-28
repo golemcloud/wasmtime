@@ -8,6 +8,7 @@ use anyhow::{Error, Result};
 use cap_net_ext::{AddressFamily, Blocking};
 use io_lifetimes::raw::{FromRawSocketlike, IntoRawSocketlike};
 use rustix::net::sockopt;
+use std::any::Any;
 use std::io;
 use std::mem;
 use std::sync::Arc;
@@ -123,6 +124,10 @@ impl HostInputStream for TcpReadStream {
         buf.truncate(n);
         Ok(buf.freeze())
     }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
 }
 
 #[async_trait::async_trait]
@@ -185,6 +190,10 @@ impl TcpWriteStream {
 }
 
 impl HostOutputStream for TcpWriteStream {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
     fn write(&mut self, mut bytes: bytes::Bytes) -> Result<(), StreamError> {
         match self.last_write {
             LastWrite::Done => {}

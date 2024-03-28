@@ -8,6 +8,7 @@ use crate::preview2::{
     HostInputStream, HostOutputStream, StreamError, StreamResult, Subscribe, WasiView,
 };
 use bytes::Bytes;
+use std::any::Any;
 use std::io::IsTerminal;
 use wasmtime::component::Resource;
 
@@ -155,6 +156,9 @@ enum OutputStream {
 }
 
 impl HostOutputStream for OutputStream {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
     fn write(&mut self, bytes: Bytes) -> StreamResult<()> {
         use std::io::Write;
         match self {

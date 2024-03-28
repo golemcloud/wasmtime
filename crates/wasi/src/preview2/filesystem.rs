@@ -4,8 +4,10 @@ use crate::preview2::{
 };
 use anyhow::anyhow;
 use bytes::{Bytes, BytesMut};
+use std::any::Any;
 use std::io;
 use std::mem;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 pub type FsResult<T> = Result<T, FsError>;
@@ -74,13 +76,15 @@ pub struct File {
     /// [`spawn_blocking`]: Self::spawn_blocking
     pub file: Arc<cap_std::fs::File>,
     pub perms: FilePerms,
+    pub path: PathBuf
 }
 
 impl File {
-    pub fn new(file: cap_std::fs::File, perms: FilePerms) -> Self {
+    pub fn new(file: cap_std::fs::File, perms: FilePerms, path: PathBuf) -> Self {
         Self {
             file: Arc::new(file),
             perms,
+            path
         }
     }
 
@@ -109,14 +113,16 @@ pub struct Dir {
     pub dir: Arc<cap_std::fs::Dir>,
     pub perms: DirPerms,
     pub file_perms: FilePerms,
+    pub path: PathBuf
 }
 
 impl Dir {
-    pub fn new(dir: cap_std::fs::Dir, perms: DirPerms, file_perms: FilePerms) -> Self {
+    pub fn new(dir: cap_std::fs::Dir, perms: DirPerms, file_perms: FilePerms, path: PathBuf) -> Self {
         Dir {
             dir: Arc::new(dir),
             perms,
             file_perms,
+            path
         }
     }
 
@@ -215,6 +221,10 @@ impl FileOutputStream {
 const FILE_WRITE_CAPACITY: usize = 1024 * 1024;
 
 impl HostOutputStream for FileOutputStream {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
     fn write(&mut self, buf: Bytes) -> Result<(), StreamError> {
         use system_interface::fs::FileIoExt;
         match self.state {
@@ -305,7 +315,7 @@ pub struct ReaddirIterator(
 );
 
 impl ReaddirIterator {
-    pub(crate) fn new(
+    pub fn new(
         i: impl Iterator<Item = FsResult<types::DirectoryEntry>> + Send + 'static,
     ) -> Self {
         ReaddirIterator(std::sync::Mutex::new(Box::new(i)))
