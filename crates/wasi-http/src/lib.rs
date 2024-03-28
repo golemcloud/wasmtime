@@ -240,6 +240,7 @@ pub mod bindings {
         tracing: true,
         async: {
             only_imports: [
+                "handle",
                 "[method]future-incoming-response.get",
                 "[method]future-trailers.get",
             ],
