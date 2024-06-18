@@ -255,7 +255,7 @@ mod write_stream;
 pub use self::clocks::{HostMonotonicClock, HostWallClock};
 pub use self::ctx::{WasiCtx, WasiCtxBuilder};
 pub use self::error::{I32Exit, TrappableError};
-pub use self::filesystem::{DirPerms, FileInputStream, FilePerms, FsError, FsResult};
+pub use self::filesystem::{DirPerms, FileInputStream, FilePerms, FsError, FsResult, ReaddirIterator};
 pub use self::network::{Network, SocketAddrUse, SocketError, SocketResult};
 pub use self::random::{thread_rng, Deterministic};
 pub use self::stdio::{
