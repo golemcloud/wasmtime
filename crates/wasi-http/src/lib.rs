@@ -95,3 +95,5 @@ pub use crate::error::{
 };
 #[doc(inline)]
 pub use crate::types::{WasiHttpCtx, WasiHttpView};
+
+pub use crate::types_impl::get_fields;
