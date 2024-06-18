@@ -359,11 +359,13 @@ impl<T> MaybeUninitExt<T> for core::mem::MaybeUninit<T> {
 
 #[cfg(feature = "runtime")]
 mod runtime;
+
 #[cfg(feature = "runtime")]
 pub use runtime::*;
 
 #[cfg(any(feature = "cranelift", feature = "winch"))]
 mod compile;
+
 #[cfg(any(feature = "cranelift", feature = "winch"))]
 pub use compile::{CodeBuilder, CodeHint};
 
@@ -376,11 +378,13 @@ pub use crate::engine::*;
 
 #[cfg(feature = "std")]
 mod sync_std;
+
 #[cfg(feature = "std")]
 use sync_std as sync;
 
 #[cfg_attr(feature = "std", allow(dead_code))]
 mod sync_nostd;
+
 #[cfg(not(feature = "std"))]
 use sync_nostd as sync;
 
@@ -424,3 +428,6 @@ pub mod _internal {
     // Exported just for the CLI.
     pub use crate::runtime::vm::MmapVec;
 }
+
+/// Version number of this crate.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
