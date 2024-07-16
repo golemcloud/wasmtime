@@ -70,6 +70,7 @@ fn move_fields(
     }
 }
 
+#[allow(missing_docs)]
 pub fn get_fields<'a>(
     table: &'a mut ResourceTable,
     id: &Resource<HostFields>,
