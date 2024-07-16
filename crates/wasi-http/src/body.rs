@@ -700,7 +700,7 @@ impl Subscribe for FailingStream {
 
 impl HostInputStream for FailingStream {
     fn read(&mut self, _size: usize) -> StreamResult<Bytes> {
-        Err(StreamError::trap(&self.error))
+        Err(StreamError::LastOperationFailed(anyhow!(self.error.clone())))
     }
 
     fn as_any(&self) -> &dyn Any {
