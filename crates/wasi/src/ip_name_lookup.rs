@@ -21,7 +21,7 @@ pub enum ResolveAddressStream {
 
 #[async_trait::async_trait]
 impl<T: WasiView> Host for T {
-    fn resolve_addresses(
+    async fn resolve_addresses(
         &mut self,
         network: Resource<Network>,
         name: String,
@@ -70,7 +70,7 @@ impl<T: WasiView> HostResolveAddressStream for T {
         &mut self,
         resource: Resource<ResolveAddressStream>,
     ) -> Result<Resource<Pollable>> {
-        subscribe(self.table(), resource)
+        subscribe(self.table(), resource, None)
     }
 
     fn drop(&mut self, resource: Resource<ResolveAddressStream>) -> Result<()> {

@@ -37,6 +37,7 @@ pub mod sync {
             skip_mut_forwarding_impls: true,
         });
     }
+
     pub use self::generated::exports;
     pub use self::generated::wasi::{filesystem, io};
 
@@ -165,14 +166,31 @@ mod async_io {
                 "[method]output-stream.forward",
                 "[method]output-stream.splice",
                 "[method]output-stream.blocking-splice",
+                "[method]output-stream.flush",
                 "[method]output-stream.blocking-flush",
+                "[method]output-stream.write",
                 "[method]output-stream.blocking-write",
                 "[method]output-stream.blocking-write-and-flush",
+                "[method]output-stream.write-zeroes",
                 "[method]output-stream.blocking-write-zeroes-and-flush",
                 "[method]directory-entry-stream.read-directory-entry",
                 "poll",
                 "[method]pollable.block",
                 "[method]pollable.ready",
+                 "get-random-bytes",
+                "get-random-u64",
+                "insecure-seed",
+                "get-insecure-random-bytes",
+                "get-insecure-random-u64",
+                "now",
+                "resolution",
+                "subscribe-instant",
+                "subscribe-duration",
+                "get-environment",
+                "get-arguments",
+                "initial-cwd",
+                "get-directories",
+                "resolve-addresses"
             ],
         },
         trappable_error_type: {

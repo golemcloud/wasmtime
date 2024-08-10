@@ -10,7 +10,8 @@ use crate::{
     },
     WasiHttpView,
 };
-use anyhow::Context;
+use anyhow::{anyhow, Context};
+use async_trait::async_trait;
 use std::any::Any;
 use std::str::FromStr;
 use wasmtime::component::{Resource, ResourceTable};
@@ -69,7 +70,8 @@ fn move_fields(
     }
 }
 
-fn get_fields<'a>(
+#[allow(missing_docs)]
+pub fn get_fields<'a>(
     table: &'a mut ResourceTable,
     id: &Resource<HostFields>,
 ) -> wasmtime::Result<&'a FieldMap> {
@@ -640,6 +642,7 @@ impl<T: WasiHttpView> crate::bindings::http::types::HostIncomingResponse for T {
     }
 }
 
+#[async_trait]
 impl<T: WasiHttpView> crate::bindings::http::types::HostFutureTrailers for T {
     fn drop(&mut self, id: Resource<HostFutureTrailers>) -> wasmtime::Result<()> {
         let _ = self
@@ -653,10 +656,10 @@ impl<T: WasiHttpView> crate::bindings::http::types::HostFutureTrailers for T {
         &mut self,
         index: Resource<HostFutureTrailers>,
     ) -> wasmtime::Result<Resource<Pollable>> {
-        wasmtime_wasi::subscribe(self.table(), index)
+        wasmtime_wasi::subscribe(self.table(), index, None)
     }
 
-    fn get(
+    async fn get(
         &mut self,
         id: Resource<HostFutureTrailers>,
     ) -> wasmtime::Result<Option<Result<Result<Option<Resource<Trailers>>, types::ErrorCode>, ()>>>
@@ -695,7 +698,6 @@ impl<T: WasiHttpView> crate::bindings::http::types::HostIncomingBody for T {
         let body = self.table().get_mut(&id)?;
 
         if let Some(stream) = body.take_stream() {
-            let stream = InputStream::Host(Box::new(stream));
             let stream = self.table().push_child(stream, &id)?;
             return Ok(Ok(stream));
         }
@@ -807,13 +809,14 @@ impl<T: WasiHttpView> crate::bindings::http::types::HostOutgoingResponse for T {
     }
 }
 
+#[async_trait]
 impl<T: WasiHttpView> crate::bindings::http::types::HostFutureIncomingResponse for T {
     fn drop(&mut self, id: Resource<HostFutureIncomingResponse>) -> wasmtime::Result<()> {
         let _ = self.table().delete(id)?;
         Ok(())
     }
 
-    fn get(
+    async fn get(
         &mut self,
         id: Resource<HostFutureIncomingResponse>,
     ) -> wasmtime::Result<
@@ -825,6 +828,27 @@ impl<T: WasiHttpView> crate::bindings::http::types::HostFutureIncomingResponse f
             HostFutureIncomingResponse::Pending(_) => return Ok(None),
             HostFutureIncomingResponse::Consumed => return Ok(Some(Err(()))),
             HostFutureIncomingResponse::Ready(_) => {}
+            HostFutureIncomingResponse::Deferred { .. } => {
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                let handle = wasmtime_wasi::runtime::spawn(async move {
+                    let request = rx.await.map_err(|err| anyhow!(err))?;
+                    let HostFutureIncomingResponse::Deferred { request, config } = request
+                        else {
+                            return Err(anyhow!("unexpected incoming response state".to_string()));
+                        };
+                    let resp = crate::types::default_send_request_handler(
+                        request, config,
+                    )
+                        .await;
+                    Ok(resp)
+                });
+                tx.send(std::mem::replace(
+                    resp,
+                    HostFutureIncomingResponse::Pending(handle),
+                ))
+                    .map_err(|_| anyhow!("failed to send request to handler"))?;
+                return Ok(None);
+            }
         }
 
         let resp =
@@ -862,7 +886,7 @@ impl<T: WasiHttpView> crate::bindings::http::types::HostFutureIncomingResponse f
         &mut self,
         id: Resource<HostFutureIncomingResponse>,
     ) -> wasmtime::Result<Resource<Pollable>> {
-        wasmtime_wasi::subscribe(self.table(), id)
+        wasmtime_wasi::subscribe(self.table(), id, None)
     }
 }
 

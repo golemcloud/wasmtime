@@ -43,13 +43,13 @@ impl<T: WasiView> streams::HostOutputStream for T {
         Ok(bytes as u64)
     }
 
-    fn write(&mut self, stream: Resource<OutputStream>, bytes: Vec<u8>) -> StreamResult<()> {
+    async fn write(&mut self, stream: Resource<OutputStream>, bytes: Vec<u8>) -> StreamResult<()> {
         self.table().get_mut(&stream)?.write(bytes.into())?;
         Ok(())
     }
 
     fn subscribe(&mut self, stream: Resource<OutputStream>) -> anyhow::Result<Resource<Pollable>> {
-        subscribe(self.table(), stream)
+        subscribe(self.table(), stream, None)
     }
 
     async fn blocking_write_and_flush(
@@ -106,12 +106,12 @@ impl<T: WasiView> streams::HostOutputStream for T {
         Ok(())
     }
 
-    fn write_zeroes(&mut self, stream: Resource<OutputStream>, len: u64) -> StreamResult<()> {
+    async fn write_zeroes(&mut self, stream: Resource<OutputStream>, len: u64) -> StreamResult<()> {
         self.table().get_mut(&stream)?.write_zeroes(len as usize)?;
         Ok(())
     }
 
-    fn flush(&mut self, stream: Resource<OutputStream>) -> StreamResult<()> {
+    async fn flush(&mut self, stream: Resource<OutputStream>) -> StreamResult<()> {
         self.table().get_mut(&stream)?.flush()?;
         Ok(())
     }
@@ -220,7 +220,7 @@ impl<T: WasiView> streams::HostInputStream for T {
     }
 
     fn subscribe(&mut self, stream: Resource<InputStream>) -> anyhow::Result<Resource<Pollable>> {
-        crate::poll::subscribe(self.table(), stream)
+        crate::poll::subscribe(self.table(), stream, None)
     }
 }
 
@@ -265,7 +265,9 @@ pub mod sync {
         }
 
         fn write(&mut self, stream: Resource<OutputStream>, bytes: Vec<u8>) -> StreamResult<()> {
-            Ok(AsyncHostOutputStream::write(self, stream, bytes)?)
+            in_tokio(async {
+                Ok(AsyncHostOutputStream::write(self, stream, bytes).await?)
+            })
         }
 
         fn blocking_write_and_flush(
@@ -296,14 +298,18 @@ pub mod sync {
         }
 
         fn write_zeroes(&mut self, stream: Resource<OutputStream>, len: u64) -> StreamResult<()> {
-            Ok(AsyncHostOutputStream::write_zeroes(self, stream, len)?)
+            in_tokio(async {
+                Ok(AsyncHostOutputStream::write_zeroes(self, stream, len).await?)
+            })
         }
 
         fn flush(&mut self, stream: Resource<OutputStream>) -> StreamResult<()> {
-            Ok(AsyncHostOutputStream::flush(
-                self,
-                Resource::new_borrow(stream.rep()),
-            )?)
+            in_tokio(async {
+                Ok(AsyncHostOutputStream::flush(
+                    self,
+                    Resource::new_borrow(stream.rep()),
+                ).await?)
+            })
         }
 
         fn blocking_flush(&mut self, stream: Resource<OutputStream>) -> StreamResult<()> {

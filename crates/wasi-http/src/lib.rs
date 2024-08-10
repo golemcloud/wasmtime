@@ -55,7 +55,13 @@ pub mod bindings {
             import wasi:http/types@0.2.0;
         ",
         tracing: true,
-        async: false,
+        async: {
+            only_imports: [
+                "handle",
+                "[method]future-incoming-response.get",
+                "[method]future-trailers.get",
+            ],
+        },
         trappable_imports: true,
         with: {
             // Upstream package dependencies
@@ -89,3 +95,5 @@ pub use crate::error::{
 };
 #[doc(inline)]
 pub use crate::types::{WasiHttpCtx, WasiHttpView};
+
+pub use crate::types_impl::get_fields;

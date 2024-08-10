@@ -11,6 +11,7 @@ use crate::poll::Subscribe;
 use crate::{HostInputStream, HostOutputStream, StreamError};
 use anyhow::anyhow;
 use bytes::Bytes;
+use std::any::Any;
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 
@@ -45,6 +46,10 @@ impl HostInputStream for MemoryInputPipe {
         let read = buffer.split_to(size);
         Ok(read)
     }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
 }
 
 #[async_trait::async_trait]
@@ -76,6 +81,10 @@ impl MemoryOutputPipe {
 }
 
 impl HostOutputStream for MemoryOutputPipe {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
     fn write(&mut self, bytes: Bytes) -> Result<(), StreamError> {
         let mut buf = self.buffer.lock().unwrap();
         if bytes.len() > self.capacity - buf.len() {
@@ -190,6 +199,10 @@ impl HostInputStream for AsyncReadStream {
             ))),
         }
     }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
 }
 #[async_trait::async_trait]
 impl Subscribe for AsyncReadStream {
@@ -211,6 +224,10 @@ impl Subscribe for AsyncReadStream {
 pub struct SinkOutputStream;
 
 impl HostOutputStream for SinkOutputStream {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
     fn write(&mut self, _buf: Bytes) -> Result<(), StreamError> {
         Ok(())
     }
@@ -239,6 +256,10 @@ impl HostInputStream for ClosedInputStream {
     fn read(&mut self, _size: usize) -> Result<Bytes, StreamError> {
         Err(StreamError::Closed)
     }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
 }
 
 #[async_trait::async_trait]
@@ -251,6 +272,10 @@ impl Subscribe for ClosedInputStream {
 pub struct ClosedOutputStream;
 
 impl HostOutputStream for ClosedOutputStream {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
     fn write(&mut self, _: Bytes) -> Result<(), StreamError> {
         Err(StreamError::Closed)
     }
