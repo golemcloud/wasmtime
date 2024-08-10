@@ -52,7 +52,7 @@ where
         Ok(bytes as u64)
     }
 
-    fn write(&mut self, stream: Resource<OutputStream>, bytes: Vec<u8>) -> StreamResult<()> {
+    async fn write(&mut self, stream: Resource<OutputStream>, bytes: Vec<u8>) -> StreamResult<()> {
         self.table().get_mut(&stream)?.write(bytes.into())?;
         Ok(())
     }
@@ -95,12 +95,12 @@ where
             .await
     }
 
-    fn write_zeroes(&mut self, stream: Resource<OutputStream>, len: u64) -> StreamResult<()> {
+    async fn write_zeroes(&mut self, stream: Resource<OutputStream>, len: u64) -> StreamResult<()> {
         self.table().get_mut(&stream)?.write_zeroes(len as usize)?;
         Ok(())
     }
 
-    fn flush(&mut self, stream: Resource<OutputStream>) -> StreamResult<()> {
+    async fn flush(&mut self, stream: Resource<OutputStream>) -> StreamResult<()> {
         self.table().get_mut(&stream)?.flush()?;
         Ok(())
     }
@@ -273,9 +273,11 @@ where
         Ok(AsyncHostOutputStream::check_write(self, stream)?)
     }
 
-    fn write(&mut self, stream: Resource<OutputStream>, bytes: Vec<u8>) -> StreamResult<()> {
-        Ok(AsyncHostOutputStream::write(self, stream, bytes)?)
-    }
+        fn write(&mut self, stream: Resource<OutputStream>, bytes: Vec<u8>) -> StreamResult<()> {
+            in_tokio(async {
+                Ok(AsyncHostOutputStream::write(self, stream, bytes).await?)
+            })
+        }
 
     fn blocking_write_and_flush(
         &mut self,
@@ -301,16 +303,20 @@ where
         Ok(AsyncHostOutputStream::subscribe(self, stream)?)
     }
 
-    fn write_zeroes(&mut self, stream: Resource<OutputStream>, len: u64) -> StreamResult<()> {
-        Ok(AsyncHostOutputStream::write_zeroes(self, stream, len)?)
-    }
+        fn write_zeroes(&mut self, stream: Resource<OutputStream>, len: u64) -> StreamResult<()> {
+            in_tokio(async {
+                Ok(AsyncHostOutputStream::write_zeroes(self, stream, len).await?)
+            })
+        }
 
-    fn flush(&mut self, stream: Resource<OutputStream>) -> StreamResult<()> {
-        Ok(AsyncHostOutputStream::flush(
-            self,
-            Resource::new_borrow(stream.rep()),
-        )?)
-    }
+        fn flush(&mut self, stream: Resource<OutputStream>) -> StreamResult<()> {
+            in_tokio(async {
+                Ok(AsyncHostOutputStream::flush(
+                    self,
+                    Resource::new_borrow(stream.rep()),
+                ).await?)
+            })
+        }
 
     fn blocking_flush(&mut self, stream: Resource<OutputStream>) -> StreamResult<()> {
         in_tokio(async {
