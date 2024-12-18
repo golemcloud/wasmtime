@@ -582,11 +582,12 @@ where
     }
 }
 
+#[async_trait]
 impl<T> crate::bindings::http::types::HostIncomingResponse for WasiHttpImpl<T>
 where
     T: WasiHttpView,
 {
-    fn drop(&mut self, response: Resource<HostIncomingResponse>) -> wasmtime::Result<()> {
+    async fn drop(&mut self, response: Resource<HostIncomingResponse>) -> wasmtime::Result<()> {
         let _ = self
             .table()
             .delete(response)
@@ -697,6 +698,7 @@ where
     }
 }
 
+#[async_trait]
 impl<T> crate::bindings::http::types::HostIncomingBody for WasiHttpImpl<T>
 where
     T: WasiHttpView,
@@ -724,7 +726,7 @@ where
         Ok(trailers)
     }
 
-    fn drop(&mut self, id: Resource<HostIncomingBody>) -> wasmtime::Result<()> {
+    async fn drop(&mut self, id: Resource<HostIncomingBody>) -> wasmtime::Result<()> {
         let _ = self.table().delete(id)?;
         Ok(())
     }
@@ -827,7 +829,7 @@ impl<T> crate::bindings::http::types::HostFutureIncomingResponse for WasiHttpImp
 where
     T: WasiHttpView,
 {
-    fn drop(&mut self, id: Resource<HostFutureIncomingResponse>) -> wasmtime::Result<()> {
+    async fn drop(&mut self, id: Resource<HostFutureIncomingResponse>) -> wasmtime::Result<()> {
         let _ = self.table().delete(id)?;
         Ok(())
     }
