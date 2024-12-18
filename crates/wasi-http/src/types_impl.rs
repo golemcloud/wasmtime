@@ -718,7 +718,7 @@ where
         Ok(Err(()))
     }
 
-    fn finish(
+    async fn finish(
         &mut self,
         id: Resource<HostIncomingBody>,
     ) -> wasmtime::Result<Resource<HostFutureTrailers>> {
