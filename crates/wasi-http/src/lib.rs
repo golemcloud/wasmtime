@@ -237,6 +237,7 @@ pub mod bindings {
                 "handle",
                 "[method]future-incoming-response.get",
                 "[method]future-trailers.get",
+                "[static]incoming-body.finish",
                 "[drop]incoming-body",
                 "[drop]incoming-response",
                 "[drop]future-incoming-response",
