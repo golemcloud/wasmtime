@@ -374,6 +374,10 @@ impl InputStream for FileInputStream {
             _ => {}
         }
     }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
 }
 #[async_trait::async_trait]
 impl Pollable for FileInputStream {
