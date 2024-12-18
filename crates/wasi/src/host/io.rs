@@ -112,7 +112,7 @@ where
         Ok(())
     }
 
-    fn splice(
+    async fn splice(
         &mut self,
         dest: Resource<OutputStream>,
         src: Resource<InputStream>,
@@ -181,7 +181,7 @@ where
         Ok(())
     }
 
-    fn read(&mut self, stream: Resource<InputStream>, len: u64) -> StreamResult<Vec<u8>> {
+    async fn read(&mut self, stream: Resource<InputStream>, len: u64) -> StreamResult<Vec<u8>> {
         let len = len.try_into().unwrap_or(usize::MAX);
         let bytes = self.table().get_mut(&stream)?.read(len)?;
         debug_assert!(bytes.len() <= len);
@@ -199,7 +199,7 @@ where
         Ok(bytes.into())
     }
 
-    fn skip(&mut self, stream: Resource<InputStream>, len: u64) -> StreamResult<u64> {
+    async fn skip(&mut self, stream: Resource<InputStream>, len: u64) -> StreamResult<u64> {
         let len = len.try_into().unwrap_or(usize::MAX);
         let written = self.table().get_mut(&stream)?.skip(len)?;
         Ok(written.try_into().expect("usize always fits in u64"))
@@ -217,162 +217,5 @@ where
 
     fn subscribe(&mut self, stream: Resource<InputStream>) -> anyhow::Result<Resource<Pollable>> {
         crate::poll::subscribe(self.table(), stream, None)
-    }
-}
-
-pub mod sync {
-    use crate::{
-        bindings::io::streams::{
-            self as async_streams, Host as AsyncHost, HostInputStream as AsyncHostInputStream,
-            HostOutputStream as AsyncHostOutputStream,
-        },
-        bindings::sync::io::poll::Pollable,
-        bindings::sync::io::streams::{self, InputStream, OutputStream},
-        runtime::in_tokio,
-        StreamError, StreamResult, WasiImpl, WasiView,
-    };
-    use wasmtime::component::Resource;
-
-    impl From<async_streams::StreamError> for streams::StreamError {
-        fn from(other: async_streams::StreamError) -> Self {
-            match other {
-                async_streams::StreamError::LastOperationFailed(e) => Self::LastOperationFailed(e),
-                async_streams::StreamError::Closed => Self::Closed,
-            }
-        }
-    }
-
-    impl<T> streams::Host for WasiImpl<T>
-    where
-        T: WasiView,
-    {
-        fn convert_stream_error(
-            &mut self,
-            err: StreamError,
-        ) -> anyhow::Result<streams::StreamError> {
-            Ok(AsyncHost::convert_stream_error(self, err)?.into())
-        }
-    }
-
-    impl<T> streams::HostOutputStream for WasiImpl<T>
-    where
-        T: WasiView,
-    {
-        fn drop(&mut self, stream: Resource<OutputStream>) -> anyhow::Result<()> {
-            in_tokio(async { AsyncHostOutputStream::drop(self, stream).await })
-        }
-
-        fn check_write(&mut self, stream: Resource<OutputStream>) -> StreamResult<u64> {
-            Ok(AsyncHostOutputStream::check_write(self, stream)?)
-        }
-
-        fn write(&mut self, stream: Resource<OutputStream>, bytes: Vec<u8>) -> StreamResult<()> {
-            in_tokio(async {
-                Ok(AsyncHostOutputStream::write(self, stream, bytes).await?)
-            })
-        }
-
-        fn blocking_write_and_flush(
-            &mut self,
-            stream: Resource<OutputStream>,
-            bytes: Vec<u8>,
-        ) -> StreamResult<()> {
-            in_tokio(async {
-                AsyncHostOutputStream::blocking_write_and_flush(self, stream, bytes).await
-            })
-        }
-
-        fn blocking_write_zeroes_and_flush(
-            &mut self,
-            stream: Resource<OutputStream>,
-            len: u64,
-        ) -> StreamResult<()> {
-            in_tokio(async {
-                AsyncHostOutputStream::blocking_write_zeroes_and_flush(self, stream, len).await
-            })
-        }
-
-        fn subscribe(
-            &mut self,
-            stream: Resource<OutputStream>,
-        ) -> anyhow::Result<Resource<Pollable>> {
-            Ok(AsyncHostOutputStream::subscribe(self, stream)?)
-        }
-
-        fn write_zeroes(&mut self, stream: Resource<OutputStream>, len: u64) -> StreamResult<()> {
-            in_tokio(async {
-                Ok(AsyncHostOutputStream::write_zeroes(self, stream, len).await?)
-            })
-        }
-
-        fn flush(&mut self, stream: Resource<OutputStream>) -> StreamResult<()> {
-            in_tokio(async {
-                Ok(AsyncHostOutputStream::flush(
-                    self,
-                    Resource::new_borrow(stream.rep()),
-                ).await?)
-            })
-        }
-
-        fn blocking_flush(&mut self, stream: Resource<OutputStream>) -> StreamResult<()> {
-            in_tokio(async {
-                AsyncHostOutputStream::blocking_flush(self, Resource::new_borrow(stream.rep()))
-                    .await
-            })
-        }
-
-        fn splice(
-            &mut self,
-            dst: Resource<OutputStream>,
-            src: Resource<InputStream>,
-            len: u64,
-        ) -> StreamResult<u64> {
-            AsyncHostOutputStream::splice(self, dst, src, len)
-        }
-
-        fn blocking_splice(
-            &mut self,
-            dst: Resource<OutputStream>,
-            src: Resource<InputStream>,
-            len: u64,
-        ) -> StreamResult<u64> {
-            in_tokio(async { AsyncHostOutputStream::blocking_splice(self, dst, src, len).await })
-        }
-    }
-
-    impl<T> streams::HostInputStream for WasiImpl<T>
-    where
-        T: WasiView,
-    {
-        fn drop(&mut self, stream: Resource<InputStream>) -> anyhow::Result<()> {
-            in_tokio(async { AsyncHostInputStream::drop(self, stream).await })
-        }
-
-        fn read(&mut self, stream: Resource<InputStream>, len: u64) -> StreamResult<Vec<u8>> {
-            AsyncHostInputStream::read(self, stream, len)
-        }
-
-        fn blocking_read(
-            &mut self,
-            stream: Resource<InputStream>,
-            len: u64,
-        ) -> StreamResult<Vec<u8>> {
-            in_tokio(async { AsyncHostInputStream::blocking_read(self, stream, len).await })
-        }
-
-        fn skip(&mut self, stream: Resource<InputStream>, len: u64) -> StreamResult<u64> {
-            AsyncHostInputStream::skip(self, stream, len)
-        }
-
-        fn blocking_skip(&mut self, stream: Resource<InputStream>, len: u64) -> StreamResult<u64> {
-            in_tokio(async { AsyncHostInputStream::blocking_skip(self, stream, len).await })
-        }
-
-        fn subscribe(
-            &mut self,
-            stream: Resource<InputStream>,
-        ) -> anyhow::Result<Resource<Pollable>> {
-            AsyncHostInputStream::subscribe(self, stream)
-        }
     }
 }
