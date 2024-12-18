@@ -401,7 +401,7 @@ mod async_io {
                 "get-arguments",
                 "initial-cwd",
                 "get-directories",
-                "resolve-addresses"
+                "resolve-addresses",
                 "[method]tcp-socket.start-bind",
                 "[method]tcp-socket.start-connect",
                 "[method]udp-socket.start-bind",

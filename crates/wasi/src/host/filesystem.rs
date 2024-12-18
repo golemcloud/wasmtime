@@ -599,7 +599,7 @@ where
         let path_clone = path.clone();
         let opened = d
             .run_blocking::<_, std::io::Result<OpenResult>>(move |d| {
-                let mut opened = d.open_with(&path, &opts)?;
+                let mut opened = d.open_with(&path_clone, &opts)?;
                 if opened.metadata()?.is_dir() {
                     Ok(OpenResult::Dir(cap_std::fs::Dir::from_std_file(
                         opened.into_std(),

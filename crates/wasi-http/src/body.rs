@@ -59,7 +59,7 @@ impl HostIncomingBody {
     pub fn take_stream(&mut self) -> Option<InputStream> {
         match &mut self.body {
             IncomingBodyState::Start(_) => {}
-            IncomingBodyState::Failing(error) => return Some(InputStream::Host(Box::new(FailingStream { error: error.clone() }))),
+            IncomingBodyState::Failing(error) => return Some(Box::new(FailingStream { error: error.clone() })),
             IncomingBodyState::InBodyStream(_) => return None,
         }
         let (tx, rx) = oneshot::channel();
@@ -68,11 +68,11 @@ impl HostIncomingBody {
             IncomingBodyState::InBodyStream(_) => unreachable!(),
             IncomingBodyState::Failing(_) => unreachable!(),
         };
-        Some(InputStream::Host(Box::new(HostIncomingBodyStream {
+        Some(Box::new(HostIncomingBodyStream {
             state: IncomingBodyStreamState::Open { body, tx },
             buffer: Bytes::new(),
             error: None,
-        })))
+        }))
     }
 
     /// Convert this body into a `HostFutureTrailers` resource.

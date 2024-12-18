@@ -737,11 +737,6 @@ impl TcpReader {
         self.closed = true;
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-}
-
     async fn ready(&mut self) {
         if self.closed {
             return;
@@ -757,6 +752,10 @@ struct TcpReadStream(Arc<Mutex<TcpReader>>);
 impl HostInputStream for TcpReadStream {
     fn read(&mut self, size: usize) -> Result<bytes::Bytes, StreamError> {
         try_lock_for_stream(&self.0)?.read(size)
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
     }
 }
 

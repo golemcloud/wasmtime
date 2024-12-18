@@ -230,11 +230,7 @@ pub mod bindings {
     #![allow(missing_docs)]
     wasmtime::component::bindgen!({
         path: "wit",
-        interfaces: "
-            import wasi:http/incoming-handler@0.2.0;
-            import wasi:http/outgoing-handler@0.2.0;
-            import wasi:http/types@0.2.0;
-        ",
+        world: "wasi:http/proxy",
         tracing: true,
         async: {
             only_imports: [
@@ -244,6 +240,7 @@ pub mod bindings {
             ],
         },
         trappable_imports: true,
+        require_store_data_send: true,
         with: {
             // Upstream package dependencies
             "wasi:io": wasmtime_wasi::bindings::io,

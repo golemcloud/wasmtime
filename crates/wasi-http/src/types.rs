@@ -272,6 +272,7 @@ pub(crate) fn remove_forbidden_headers(
 }
 
 /// Configuration for an outgoing request.
+#[derive(Debug)]
 pub struct OutgoingRequestConfig {
     /// Whether to use TLS for the request.
     pub use_tls: bool,

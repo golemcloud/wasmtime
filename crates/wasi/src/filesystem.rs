@@ -376,6 +376,10 @@ impl HostInputStream for FileInputStream {
             _ => {}
         }
     }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
 }
 #[async_trait::async_trait]
 impl Subscribe for FileInputStream {
