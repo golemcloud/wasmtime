@@ -257,6 +257,7 @@ pub use self::ctx::{WasiCtx, WasiCtxBuilder};
 pub use self::error::{I32Exit, TrappableError};
 pub use self::filesystem::{DirPerms, FileInputStream, FilePerms, FsError, FsResult, ReaddirIterator};
 pub use self::network::{Network, SocketAddrUse, SocketError, SocketResult};
+pub use self::poll::{dynamic_subscribe, subscribe, ClosureFuture, DynamicSubscribe, OverrideSelf, MakeFuture, Pollable, PollableFuture, Subscribe};
 pub use self::random::{thread_rng, Deterministic};
 pub use self::stdio::{
     stderr, stdin, stdout, AsyncStdinStream, AsyncStdoutStream, IsATTY, OutputFile, Stderr, Stdin,
