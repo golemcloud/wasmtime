@@ -250,6 +250,12 @@ impl ResourceTable {
     }
 
     /// Returns the raw `Any` at the `key` index provided.
+    pub fn get_any(&self, key: u32) -> Result<&dyn Any, ResourceTableError> {
+        let r = self.occupied(key)?;
+        Ok(&*r.entry)
+    }
+
+    /// Returns the raw `Any` at the `key` index provided.
     pub fn get_any_mut(&mut self, key: u32) -> Result<&mut dyn Any, ResourceTableError> {
         let r = self.occupied_mut(key)?;
         Ok(&mut *r.entry)
