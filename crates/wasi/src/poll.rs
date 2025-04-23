@@ -198,18 +198,7 @@ where
             let ix: u32 = ix.try_into()?;
 
             let table = self.table();
-            let mut pollable = table.get(p)?;
-
-            if let Some(override_self) = &pollable.override_self {
-                let entry = table.get_any(pollable.index)?;
-                let pollable_override = override_self(entry);
-                if let Some(overridden_idx) = pollable_override {
-                    pollable = table
-                        .get_any_mut(overridden_idx)?
-                        .downcast_ref()
-                        .ok_or_else(|| anyhow!("Pollable override does not point to a Pollable"))?;
-                }
-            }
+            let pollable = get_pollable_following_overrides(table, p)?;
 
             let (_, list) = table_futures
                 .entry(pollable.index)
@@ -279,19 +268,17 @@ where
 {
     async fn block(&mut self, pollable: Resource<Pollable>) -> Result<()> {
         let table = self.table();
-        let pollable = table.get(&pollable)?;
-        let index = pollable.index;
-        // TODO: override support
-        let ready = (pollable.make_future)(table.get_any_mut(index)?);
+        let pollable = get_pollable_following_overrides(table, &pollable)?;
+
+        let ready = (pollable.make_future)(table.get_any_mut(pollable.index)?);
         ready.await;
         Ok(())
     }
     async fn ready(&mut self, pollable: Resource<Pollable>) -> Result<bool> {
         let table = self.table();
-        let pollable = table.get(&pollable)?;
-        let index = pollable.index;
-        // TODO: override support
-        let ready = (pollable.make_future)(table.get_any_mut(index)?);
+        let pollable = get_pollable_following_overrides(table, &pollable)?;
+
+        let ready = (pollable.make_future)(table.get_any_mut(pollable.index)?);
         futures::pin_mut!(ready);
         Ok(matches!(
             futures::future::poll_immediate(ready).await,
@@ -305,6 +292,30 @@ where
         }
         Ok(())
     }
+}
+
+fn get_pollable_following_overrides<'a>(
+    table: &'a ResourceTable,
+    pollable: &Resource<Pollable>,
+) -> Result<&'a Pollable> {
+    let mut pollable = table.get(&pollable)?;
+    loop {
+        if let Some(override_self) = &pollable.override_self {
+            let entry = table.get_any(pollable.index)?;
+            let pollable_override = override_self(entry);
+            if let Some(overridden_idx) = pollable_override {
+                pollable = table
+                    .get_any(overridden_idx)?
+                    .downcast_ref()
+                    .ok_or_else(|| anyhow!("Pollable override does not point to a Pollable"))?;
+            } else {
+                break;
+            }
+        } else {
+            break;
+        }
+    }
+    Ok(pollable)
 }
 
 pub mod sync {
