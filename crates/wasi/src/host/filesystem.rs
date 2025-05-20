@@ -9,12 +9,10 @@ use crate::filesystem::{
 use crate::{DirPerms, FilePerms, FsError, FsResult, IoView, WasiImpl, WasiView};
 use anyhow::Context;
 use wasmtime::component::Resource;
-use async_trait::async_trait;
 use wasmtime_wasi_io::streams::{DynInputStream, DynOutputStream};
 
 mod sync;
 
-#[async_trait]
 impl<T> preopens::Host for WasiImpl<T>
 where
     T: WasiView,

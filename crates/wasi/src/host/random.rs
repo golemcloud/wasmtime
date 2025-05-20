@@ -1,9 +1,7 @@
 use crate::bindings::random::{insecure, insecure_seed, random};
-use async_trait::async_trait;
 use crate::{WasiImpl, WasiView};
 use cap_rand::{distributions::Standard, Rng};
 
-#[async_trait]
 impl<T> random::Host for WasiImpl<T>
 where
     T: WasiView,
@@ -20,7 +18,6 @@ where
     }
 }
 
-#[async_trait]
 impl<T> insecure::Host for WasiImpl<T>
 where
     T: WasiView,
@@ -37,7 +34,6 @@ where
     }
 }
 
-#[async_trait]
 impl<T> insecure_seed::Host for WasiImpl<T>
 where
     T: WasiView,

@@ -1,8 +1,6 @@
-use async_trait::async_trait;
 use crate::bindings::cli::environment;
 use crate::{WasiImpl, WasiView};
 
-#[async_trait]
 impl<T> environment::Host for WasiImpl<T>
 where
     T: WasiView,

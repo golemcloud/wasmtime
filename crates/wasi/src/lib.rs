@@ -255,9 +255,10 @@ mod write_stream;
 pub use self::clocks::{HostMonotonicClock, HostWallClock};
 pub use self::ctx::{WasiCtx, WasiCtxBuilder};
 pub use self::error::{I32Exit, TrappableError};
-pub use self::filesystem::{DirPerms, FileInputStream, FilePerms, FsError, FsResult, ReaddirIterator};
+pub use self::filesystem::{
+    DirPerms, FileInputStream, FilePerms, FsError, FsResult, ReaddirIterator,
+};
 pub use self::network::{Network, SocketAddrUse, SocketError, SocketResult};
-pub use self::poll::{dynamic_subscribe, subscribe, ClosureFuture, DynamicSubscribe, OverrideSelf, MakeFuture, Pollable, PollableFuture, Subscribe};
 pub use self::random::{thread_rng, Deterministic};
 pub use self::stdio::{
     stderr, stdin, stdout, AsyncStdinStream, AsyncStdoutStream, IsATTY, OutputFile, Stderr, Stdin,
@@ -275,12 +276,15 @@ pub use wasmtime::component::{ResourceTable, ResourceTableError};
 // These contents of wasmtime-wasi-io are re-exported by this crate for compatibility:
 // they were originally defined in this crate before being factored out, and many
 // users of this crate depend on them at these names.
-pub use wasmtime_wasi_io::poll::{subscribe, DynFuture, DynPollable, MakeFuture, Pollable};
+pub use wasmtime_wasi_io::poll::{
+    dynamic_subscribe, subscribe, DynFuture, DynPollable, DynamicPollable, MakeFuture,
+    OverrideSelf, Pollable,
+};
 pub use wasmtime_wasi_io::streams::{
     DynInputStream, DynOutputStream, Error as IoError, InputStream, OutputStream, StreamError,
     StreamResult,
 };
-pub use wasmtime_wasi_io::{IoImpl, IoView};
+pub use wasmtime_wasi_io::{IoCtx, IoImpl, IoView};
 
 /// Add all WASI interfaces from this crate into the `linker` provided.
 ///
@@ -320,6 +324,7 @@ pub use wasmtime_wasi_io::{IoImpl, IoView};
 ///         MyState {
 ///             ctx: builder.build(),
 ///             table: ResourceTable::new(),
+///             io_ctx: 
 ///         },
 ///     );
 ///
@@ -331,10 +336,12 @@ pub use wasmtime_wasi_io::{IoImpl, IoView};
 /// struct MyState {
 ///     ctx: WasiCtx,
 ///     table: ResourceTable,
+///     io_ctx: IoCtx
 /// }
 ///
 /// impl IoView for MyState {
 ///     fn table(&mut self) -> &mut ResourceTable { &mut self.table }
+///     fn ctx(&mut self) -> &mut IoCtx { &mut self.io_ctx }
 /// }
 /// impl WasiView for MyState {
 ///     fn ctx(&mut self) -> &mut WasiCtx { &mut self.ctx }

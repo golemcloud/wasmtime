@@ -36,6 +36,7 @@ pub use async_trait::async_trait;
 pub use ::bytes;
 
 use alloc::boxed::Box;
+use std::time::Duration;
 use wasmtime::component::ResourceTable;
 
 /// A trait which provides access to the [`ResourceTable`] inside the
@@ -52,14 +53,16 @@ use wasmtime::component::ResourceTable;
 /// ```
 /// use wasmtime::{Config, Engine};
 /// use wasmtime::component::{ResourceTable, Linker};
-/// use wasmtime_wasi_io::{IoView, add_to_linker_async};
+/// use wasmtime_wasi_io::{IoCtx, IoView, add_to_linker_async};
 ///
 /// struct MyState {
 ///     table: ResourceTable,
+///     ctx: IoCtx
 /// }
 ///
 /// impl IoView for MyState {
 ///     fn table(&mut self) -> &mut ResourceTable { &mut self.table }
+///     fn ctx(&mut self) -> &mut IoCtx { &mut self.ctx }
 /// }
 /// let mut config = Config::new();
 /// config.async_support(true);
@@ -78,16 +81,32 @@ pub trait IoView: Send {
     /// Embedders can add custom resources to this table as well to give
     /// resources to wasm as well.
     fn table(&mut self) -> &mut ResourceTable;
+
+    /// Gets mutable access to the Io configuration context
+    fn io_ctx(&mut self) -> &mut IoCtx;
 }
 impl<T: ?Sized + IoView> IoView for &mut T {
     fn table(&mut self) -> &mut ResourceTable {
         T::table(self)
+    }
+
+    fn io_ctx(&mut self) -> &mut IoCtx {
+        T::io_ctx(self)
     }
 }
 impl<T: ?Sized + IoView> IoView for Box<T> {
     fn table(&mut self) -> &mut ResourceTable {
         T::table(self)
     }
+
+    fn io_ctx(&mut self) -> &mut IoCtx {
+        T::io_ctx(self)
+    }
+}
+
+pub struct IoCtx {
+    pub suspend_threshold: Duration,
+    pub suspend_signal: Box<dyn Fn(Duration) -> anyhow::Error + Send + Sync + 'static>,
 }
 
 /// A small newtype wrapper which serves as the basis for implementations of
@@ -109,6 +128,10 @@ pub struct IoImpl<T>(pub T);
 impl<T: IoView> IoView for IoImpl<T> {
     fn table(&mut self) -> &mut ResourceTable {
         T::table(&mut self.0)
+    }
+
+    fn io_ctx(&mut self) -> &mut IoCtx {
+        T::io_ctx(&mut self.0)
     }
 }
 
@@ -137,7 +160,7 @@ impl<T: IoView> IoView for IoImpl<T> {
 /// ```
 /// use wasmtime::{Engine, Result, Store, Config};
 /// use wasmtime::component::{ResourceTable, Linker};
-/// use wasmtime_wasi_io::IoView;
+/// use wasmtime_wasi_io::{IoCtx, IoView};
 ///
 /// fn main() -> Result<()> {
 ///     let mut config = Config::new();
@@ -152,6 +175,10 @@ impl<T: IoView> IoView for IoImpl<T> {
 ///         &engine,
 ///         MyState {
 ///             table: ResourceTable::new(),
+///             ctx: IoCtx {
+///                 suspend_threshold: std::time::Duration::MAX,
+///                 suspend_signal: Box::new(|_| unreachable!("suspend_signal not set")),
+///             }
 ///         },
 ///     );
 ///
@@ -162,10 +189,12 @@ impl<T: IoView> IoView for IoImpl<T> {
 ///
 /// struct MyState {
 ///     table: ResourceTable,
+///     ctx: IoCtx
 /// }
 ///
 /// impl IoView for MyState {
 ///     fn table(&mut self) -> &mut ResourceTable { &mut self.table }
+///     fn ctx(&mut self) -> &mut IoCtx { &mut self.ctx }
 /// }
 /// ```
 pub fn add_to_linker_async<T: IoView>(

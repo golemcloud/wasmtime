@@ -59,7 +59,7 @@ impl HostIncomingBody {
     }
 
     /// Try taking the stream of this body, if it's available.
-    pub fn take_stream(&mut self) -> Option<InputStream> {
+    pub fn take_stream(&mut self) -> Option<Box<dyn InputStream>> {
         match &mut self.body {
             IncomingBodyState::Start(_) => {}
             IncomingBodyState::Failing(error) => return Some(Box::new(FailingStream { error: error.clone() })),
@@ -703,12 +703,12 @@ pub struct FailingStream {
 }
 
 #[async_trait]
-impl Subscribe for FailingStream {
+impl Pollable for FailingStream {
     async fn ready(&mut self) {}
 }
 
-impl HostInputStream for FailingStream {
-    fn read(&mut self, _size: usize) -> StreamResult<Bytes> {
+impl InputStream for FailingStream {
+    fn read(&mut self, _size: usize) -> Result<Bytes, StreamError> {
         Err(StreamError::LastOperationFailed(anyhow!(self.error.clone())))
     }
 

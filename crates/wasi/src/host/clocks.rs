@@ -1,6 +1,5 @@
 #![allow(unused_variables)]
 
-use async_trait::async_trait;
 use crate::bindings::{
     clocks::monotonic_clock::{self, Duration as WasiDuration, Instant},
     clocks::wall_clock::{self, Datetime},
@@ -25,7 +24,6 @@ impl TryFrom<SystemTime> for Datetime {
     }
 }
 
-#[async_trait]
 impl<T> wall_clock::Host for WasiImpl<T>
 where
     T: WasiView,
@@ -69,7 +67,6 @@ fn subscribe_to_duration(
     subscribe(table, sleep, suspend_until)
 }
 
-#[async_trait]
 impl<T> monotonic_clock::Host for WasiImpl<T>
 where
     T: WasiView,

@@ -1012,7 +1012,7 @@ impl IoView for Host {
 }
 impl WasiView for Host {
     fn ctx(&mut self) -> &mut wasmtime_wasi::WasiCtx {
-        self.preview2_ctx().ctx()
+        self.preview2_ctx().io_ctx()
     }
 }
 

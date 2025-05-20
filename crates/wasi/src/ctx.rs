@@ -17,7 +17,7 @@ use std::sync::Arc;
 use std::{future::Future, pin::Pin};
 use std::{mem, net::SocketAddr};
 use std::time::Duration;
-use wasmtime::component::ResourceTable;
+use wasmtime_wasi_io::IoCtx;
 
 /// Builder-style structure used to create a [`WasiCtx`].
 ///
@@ -29,13 +29,14 @@ use wasmtime::component::ResourceTable;
 ///
 /// ```
 /// use wasmtime_wasi::{WasiCtxBuilder, WasiCtx};
+/// use wasmtime_wasi_io::IoCtx;
 ///
 /// let mut wasi = WasiCtxBuilder::new();
 /// wasi.arg("./foo.wasm");
 /// wasi.arg("--help");
 /// wasi.env("FOO", "bar");
 ///
-/// let wasi: WasiCtx = wasi.build();
+/// let ctxs: (WasiCtx, IoCtx) = wasi.build();
 /// ```
 ///
 /// [`Store`]: wasmtime::Store
@@ -479,7 +480,7 @@ impl WasiCtxBuilder {
     /// Panics if this method is called twice. Each [`WasiCtxBuilder`] can be
     /// used to create only a single [`WasiCtx`]. Repeated usage of this method
     /// is not allowed and should use a second builder instead.
-    pub fn build(&mut self) -> WasiCtx {
+    pub fn build(&mut self) -> (WasiCtx, IoCtx) {
         assert!(!self.built);
 
         let Self {
@@ -503,7 +504,7 @@ impl WasiCtxBuilder {
         } = mem::replace(self, Self::new());
         self.built = true;
 
-        WasiCtx {
+        let wasi_ctx = WasiCtx {
             stdin,
             stdout,
             stderr,
@@ -518,9 +519,12 @@ impl WasiCtxBuilder {
             monotonic_clock,
             allowed_network_uses,
             allow_blocking_current_thread,
+        };
+        let io_ctx = IoCtx {
             suspend_threshold,
             suspend_signal,
-        }
+        };
+        (wasi_ctx, io_ctx)
     }
 }
 
@@ -540,15 +544,19 @@ impl WasiCtxBuilder {
 /// # Example
 ///
 /// ```
-/// use wasmtime_wasi::{WasiCtx, ResourceTable, WasiView, IoView, WasiCtxBuilder};
+/// use wasmtime_wasi::{WasiCtx, ResourceTable, WasiView, IoView, WasiCtxBuilder};///
+///
+/// use wasmtime_wasi_io::IoCtx;
 ///
 /// struct MyState {
 ///     ctx: WasiCtx,
 ///     table: ResourceTable,
+///     io_ctx: IoCtx
 /// }
 ///
 /// impl IoView for MyState {
 ///     fn table(&mut self) -> &mut ResourceTable { &mut self.table }
+///     fn ctx(&mut self) -> &mut IoCtx { &mut self.io_ctx }
 /// }
 /// impl WasiView for MyState {
 ///     fn ctx(&mut self) -> &mut WasiCtx { &mut self.ctx }
@@ -561,9 +569,11 @@ impl WasiCtxBuilder {
 ///         wasi.arg("--help");
 ///         wasi.env("FOO", "bar");
 ///
+///         let (ctx, io_ctx) = wasi.build();
 ///         MyState {
-///             ctx: wasi.build(),
+///             ctx,
 ///             table: ResourceTable::new(),
+///             io_ctx
 ///         }
 ///     }
 /// }
@@ -583,8 +593,6 @@ pub struct WasiCtx {
     pub(crate) socket_addr_check: SocketAddrCheck,
     pub(crate) allowed_network_uses: AllowedNetworkUses,
     pub(crate) allow_blocking_current_thread: bool,
-    pub(crate) suspend_threshold: Duration,
-    pub(crate) suspend_signal: Box<dyn Fn(Duration) -> anyhow::Error + Send + Sync + 'static>,
 }
 
 impl WasiCtx {

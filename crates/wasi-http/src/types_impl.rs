@@ -11,7 +11,6 @@ use crate::{
     WasiHttpImpl, WasiHttpView,
 };
 use anyhow::{anyhow, Context};
-use async_trait::async_trait;
 use std::any::Any;
 use std::str::FromStr;
 use wasmtime::component::{Resource, ResourceTable, ResourceTableError};
@@ -582,7 +581,6 @@ where
     }
 }
 
-#[async_trait]
 impl<T> crate::bindings::http::types::HostIncomingResponse for WasiHttpImpl<T>
 where
     T: WasiHttpView,
@@ -647,7 +645,6 @@ where
     }
 }
 
-#[async_trait]
 impl<T> crate::bindings::http::types::HostFutureTrailers for WasiHttpImpl<T>
 where
     T: WasiHttpView,
@@ -698,7 +695,6 @@ where
     }
 }
 
-#[async_trait]
 impl<T> crate::bindings::http::types::HostIncomingBody for WasiHttpImpl<T>
 where
     T: WasiHttpView,
@@ -710,7 +706,6 @@ where
         let body = self.table().get_mut(&id)?;
 
         if let Some(stream) = body.take_stream() {
-            let stream: DynInputStream = Box::new(stream);
             let stream = self.table().push_child(stream, &id)?;
             return Ok(Ok(stream));
         }
@@ -828,7 +823,6 @@ where
     }
 }
 
-#[async_trait]
 impl<T> crate::bindings::http::types::HostFutureIncomingResponse for WasiHttpImpl<T>
 where
     T: WasiHttpView,

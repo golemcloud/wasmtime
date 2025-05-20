@@ -18,7 +18,7 @@ use std::time::Duration;
 use tokio::net::TcpStream;
 use tokio::time::timeout;
 use wasmtime::component::{Resource, ResourceTable};
-use wasmtime_wasi::{runtime::AbortOnDropJoinHandle, IoImpl, IoView, Pollable};
+use wasmtime_wasi::{runtime::AbortOnDropJoinHandle, IoCtx, IoImpl, IoView, Pollable};
 
 /// Capture the state necessary for use in the wasi-http API implementation.
 #[derive(Debug)]
@@ -232,6 +232,10 @@ impl<T: IoView> IoView for WasiHttpImpl<T> {
     fn table(&mut self) -> &mut ResourceTable {
         T::table(&mut self.0 .0)
     }
+
+    fn io_ctx(&mut self) -> &mut IoCtx {
+        T::io_ctx(&mut self.0 .0)
+    }
 }
 impl<T: WasiHttpView> WasiHttpView for WasiHttpImpl<T> {
     fn ctx(&mut self) -> &mut WasiHttpCtx {
@@ -423,9 +427,9 @@ pub async fn default_send_request_handler(
             // TODO: we should plumb the builder through the http context, and use it here
             hyper::client::conn::http1::handshake(tcp_stream),
         )
-            .await
-            .map_err(|_| types::ErrorCode::ConnectionTimeout)?
-            .map_err(hyper_request_error)?;
+        .await
+        .map_err(|_| types::ErrorCode::ConnectionTimeout)?
+        .map_err(hyper_request_error)?;
 
         let worker = wasmtime_wasi::runtime::spawn(async move {
             match conn.await {
@@ -550,7 +554,7 @@ impl HostIncomingRequest {
 pub struct HostResponseOutparam {
     /// The sender for sending a response.
     pub result:
-    tokio::sync::oneshot::Sender<Result<hyper::Response<HyperOutgoingBody>, types::ErrorCode>>,
+        tokio::sync::oneshot::Sender<Result<hyper::Response<HyperOutgoingBody>, types::ErrorCode>>,
 }
 
 /// The concrete type behind a `wasi:http/types/outgoing-response` resource.
@@ -652,7 +656,7 @@ pub type FieldMap = hyper::HeaderMap;
 
 /// A handle to a future incoming response.
 pub type FutureIncomingResponseHandle =
-AbortOnDropJoinHandle<anyhow::Result<Result<IncomingResponse, types::ErrorCode>>>;
+    AbortOnDropJoinHandle<anyhow::Result<Result<IncomingResponse, types::ErrorCode>>>;
 
 /// A response that is in the process of being received.
 #[derive(Debug)]
@@ -697,12 +701,11 @@ impl HostFutureIncomingResponse {
     }
 
     /// Returns `true` if the response is ready.
-    pub fn deferred(request: hyper::Request<HyperOutgoingBody>,
-                    config: OutgoingRequestConfig) -> Self {
-        Self::Deferred {
-            request,
-            config,
-        }
+    pub fn deferred(
+        request: hyper::Request<HyperOutgoingBody>,
+        config: OutgoingRequestConfig,
+    ) -> Self {
+        Self::Deferred { request, config }
     }
 
     /// Returns `true` if the response is ready.

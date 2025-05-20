@@ -1,6 +1,5 @@
 //! Implementation of the `wasi:http/outgoing-handler` interface.
 
-use async_trait::async_trait;
 use crate::{
     bindings::http::{
         outgoing_handler,
@@ -17,7 +16,6 @@ use hyper::Method;
 use wasmtime::component::Resource;
 use wasmtime_wasi::IoView;
 
-#[async_trait]
 impl<T> outgoing_handler::Host for WasiHttpImpl<T>
 where
     T: WasiHttpView,

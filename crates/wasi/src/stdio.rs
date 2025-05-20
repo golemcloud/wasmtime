@@ -1,4 +1,3 @@
-use std::any::Any;
 use crate::bindings::cli::{
     stderr, stdin, stdout, terminal_input, terminal_output, terminal_stderr, terminal_stdin,
     terminal_stdout,
@@ -8,6 +7,7 @@ use crate::{
     InputStream, IoView, OutputStream, Pollable, StreamError, StreamResult, WasiImpl, WasiView,
 };
 use bytes::Bytes;
+use std::any::Any;
 use std::io::IsTerminal;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -314,7 +314,7 @@ impl OutputStream for StdioOutputStream {
             StdioOutputStream::Stdout => std::io::stdout().write_all(&bytes),
             StdioOutputStream::Stderr => std::io::stderr().write_all(&bytes),
         }
-            .map_err(|e| StreamError::LastOperationFailed(anyhow::anyhow!(e)))
+        .map_err(|e| StreamError::LastOperationFailed(anyhow::anyhow!(e)))
     }
 
     fn flush(&mut self) -> StreamResult<()> {
@@ -323,7 +323,7 @@ impl OutputStream for StdioOutputStream {
             StdioOutputStream::Stdout => std::io::stdout().flush(),
             StdioOutputStream::Stderr => std::io::stderr().flush(),
         }
-            .map_err(|e| StreamError::LastOperationFailed(anyhow::anyhow!(e)))
+        .map_err(|e| StreamError::LastOperationFailed(anyhow::anyhow!(e)))
     }
 
     fn check_write(&mut self) -> StreamResult<usize> {
