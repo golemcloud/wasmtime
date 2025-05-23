@@ -391,6 +391,7 @@ pub fn add_to_linker_with_options_async<T: WasiView>(
 
 // NB: workaround some rustc inference - a future refactoring may make this
 // obsolete.
+#[allow(dead_code)]
 fn io_type_annotate<T: IoView, F>(val: F) -> F
 where
     F: Fn(&mut T) -> IoImpl<&mut T>,

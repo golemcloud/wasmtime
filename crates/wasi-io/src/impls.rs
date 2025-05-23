@@ -177,7 +177,7 @@ impl<T: IoView> streams::HostOutputStream for IoImpl<T> {
         Ok(bytes as u64)
     }
 
-    fn write(&mut self, stream: Resource<DynOutputStream>, bytes: Vec<u8>) -> StreamResult<()> {
+    async fn write(&mut self, stream: Resource<DynOutputStream>, bytes: Vec<u8>) -> StreamResult<()> {
         self.table().get_mut(&stream)?.write(bytes.into())?;
         Ok(())
     }
@@ -220,12 +220,12 @@ impl<T: IoView> streams::HostOutputStream for IoImpl<T> {
             .await
     }
 
-    fn write_zeroes(&mut self, stream: Resource<DynOutputStream>, len: u64) -> StreamResult<()> {
+    async fn write_zeroes(&mut self, stream: Resource<DynOutputStream>, len: u64) -> StreamResult<()> {
         self.table().get_mut(&stream)?.write_zeroes(len as usize)?;
         Ok(())
     }
 
-    fn flush(&mut self, stream: Resource<DynOutputStream>) -> StreamResult<()> {
+    async fn flush(&mut self, stream: Resource<DynOutputStream>) -> StreamResult<()> {
         self.table().get_mut(&stream)?.flush()?;
         Ok(())
     }
@@ -237,7 +237,7 @@ impl<T: IoView> streams::HostOutputStream for IoImpl<T> {
         Ok(())
     }
 
-    fn splice(
+    async fn splice(
         &mut self,
         dest: Resource<DynOutputStream>,
         src: Resource<DynInputStream>,
@@ -302,7 +302,7 @@ impl<T: IoView> streams::HostInputStream for IoImpl<T> {
         Ok(())
     }
 
-    fn read(&mut self, stream: Resource<DynInputStream>, len: u64) -> StreamResult<Vec<u8>> {
+    async fn read(&mut self, stream: Resource<DynInputStream>, len: u64) -> StreamResult<Vec<u8>> {
         let len = len.try_into().unwrap_or(usize::MAX);
         let bytes = self.table().get_mut(&stream)?.read(len)?;
         debug_assert!(bytes.len() <= len);
@@ -320,7 +320,7 @@ impl<T: IoView> streams::HostInputStream for IoImpl<T> {
         Ok(bytes.into())
     }
 
-    fn skip(&mut self, stream: Resource<DynInputStream>, len: u64) -> StreamResult<u64> {
+    async fn skip(&mut self, stream: Resource<DynInputStream>, len: u64) -> StreamResult<u64> {
         let len = len.try_into().unwrap_or(usize::MAX);
         let written = self.table().get_mut(&stream)?.skip(len)?;
         Ok(written.try_into().expect("usize always fits in u64"))
