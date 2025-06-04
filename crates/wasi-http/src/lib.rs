@@ -248,7 +248,7 @@ pub mod bindings {
         require_store_data_send: true,
         with: {
             // Upstream package dependencies
-            "wasi:io": wasmtime_wasi::bindings::io,
+            "wasi:io": wasmtime_wasi::p2::bindings::io,
 
             // Configure all WIT http resources to be defined types in this
             // crate to use the `ResourceTable` helper methods.
@@ -297,6 +297,7 @@ use wasmtime_wasi::p2::IoImpl;
 /// use wasmtime::component::{ResourceTable, Linker};
 /// use wasmtime_wasi::p2::{IoView, WasiCtx, WasiView};
 /// use wasmtime_wasi_http::{WasiHttpCtx, WasiHttpView};
+/// use wasmtime_wasi::{IoCtx};
 ///
 /// fn main() -> Result<()> {
 ///     let mut config = Config::new();
@@ -314,10 +315,12 @@ use wasmtime_wasi::p2::IoImpl;
 ///     ctx: WasiCtx,
 ///     http_ctx: WasiHttpCtx,
 ///     table: ResourceTable,
+///     io_ctx: IoCtx
 /// }
 ///
 /// impl IoView for MyState {
 ///     fn table(&mut self) -> &mut ResourceTable { &mut self.table }
+///     fn io_ctx(&mut self) -> &mut IoCtx { &mut self.http_ctx.io_ctx }
 /// }
 /// impl WasiHttpView for MyState {
 ///     fn ctx(&mut self) -> &mut WasiHttpCtx { &mut self.http_ctx }

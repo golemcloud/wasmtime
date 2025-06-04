@@ -18,7 +18,7 @@ use std::time::Duration;
 use tokio::net::TcpStream;
 use tokio::time::timeout;
 use wasmtime::component::{Resource, ResourceTable};
-use wasmtime_wasi::{runtime::AbortOnDropJoinHandle, IoCtx, IoImpl, IoView, Pollable};
+use wasmtime_wasi::IoCtx;
 use wasmtime_wasi::p2::{IoImpl, IoView, Pollable};
 use wasmtime_wasi::runtime::AbortOnDropJoinHandle;
 

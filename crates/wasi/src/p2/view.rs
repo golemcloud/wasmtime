@@ -20,14 +20,17 @@ pub use wasmtime_wasi_io::{IoCtx, IoImpl, IoView};
 /// ```
 /// use wasmtime_wasi::ResourceTable;
 /// use wasmtime_wasi::p2::{WasiCtx, WasiView, IoView, WasiCtxBuilder};
+/// use wasmtime_wasi_io::IoCtx;
 ///
 /// struct MyState {
 ///     ctx: WasiCtx,
 ///     table: ResourceTable,
+///     io_ctx: IoCtx
 /// }
 ///
 /// impl IoView for MyState {
 ///     fn table(&mut self) -> &mut ResourceTable { &mut self.table }
+///     fn io_ctx(&mut self) -> &mut IoCtx { &mut self.io_ctx }
 /// }
 /// impl WasiView for MyState {
 ///     fn ctx(&mut self) -> &mut WasiCtx { &mut self.ctx }
