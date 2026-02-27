@@ -38,7 +38,8 @@ const DEFAULT_FIELD_SIZE_LIMIT: usize = 128 * 1024;
 /// Capture the state necessary for use in the wasi-http API implementation.
 #[derive(Debug)]
 pub struct WasiHttpCtx {
-    pub(crate) field_size_limit: usize,
+    /// The maximum size for any fields resources created by this context.
+    pub field_size_limit: usize,
 }
 
 impl WasiHttpCtx {
