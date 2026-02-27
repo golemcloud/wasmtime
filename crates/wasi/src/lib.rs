@@ -35,10 +35,6 @@ pub mod clocks;
 mod ctx;
 mod error;
 pub mod filesystem;
-#[cfg(feature = "p1")]
-pub mod p0;
-#[cfg(feature = "p1")]
-pub mod p1;
 // FIXME: should gate this module on the `p2` feature but that will require more
 // internal refactoring to get that aligned right.
 // #[cfg(feature = "p2")]
@@ -64,3 +60,12 @@ pub use cap_fs_ext::SystemTimeSpec;
 pub use cap_rand::RngCore;
 #[doc(no_inline)]
 pub use wasmtime::component::{ResourceTable, ResourceTableError};
+pub use wasmtime_wasi_io::poll::{
+    dynamic_subscribe, subscribe, DynFuture, DynPollable, DynamicPollable, MakeFuture,
+    OverrideSelf, Pollable,
+};
+pub use wasmtime_wasi_io::streams::{
+    DynInputStream, DynOutputStream, Error as IoError, InputStream, OutputStream, StreamError,
+    StreamResult,
+};
+pub use wasmtime_wasi_io::{IoCtx, IoData, IoView};

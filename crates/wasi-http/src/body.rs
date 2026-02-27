@@ -53,22 +53,34 @@ impl HostIncomingBody {
         self.worker = Some(worker);
     }
 
+    /// Create a new `HostIncomingBody` that always fails with the given error.
+    pub fn failing(error: String) -> HostIncomingBody {
+        HostIncomingBody {
+            body: IncomingBodyState::Failing(error),
+            field_size_limit: 0,
+            worker: None,
+        }
+    }
+
     /// Try taking the stream of this body, if it's available.
-    pub fn take_stream(&mut self) -> Option<HostIncomingBodyStream> {
+    pub fn take_stream(&mut self) -> Option<Box<dyn InputStream>> {
         match &mut self.body {
             IncomingBodyState::Start(_) => {}
             IncomingBodyState::InBodyStream(_) => return None,
+            IncomingBodyState::Failing(error) => {
+                return Some(Box::new(FailingStream(error.clone())));
+            }
         }
         let (tx, rx) = oneshot::channel();
         let body = match mem::replace(&mut self.body, IncomingBodyState::InBodyStream(rx)) {
             IncomingBodyState::Start(b) => b,
-            IncomingBodyState::InBodyStream(_) => unreachable!(),
+            IncomingBodyState::InBodyStream(_) | IncomingBodyState::Failing(_) => unreachable!(),
         };
-        Some(HostIncomingBodyStream {
+        Some(Box::new(HostIncomingBodyStream {
             state: IncomingBodyStreamState::Open { body, tx },
             buffer: Bytes::new(),
             error: None,
-        })
+        }))
     }
 
     /// Convert this body into a `HostFutureTrailers` resource.
@@ -88,6 +100,9 @@ enum IncomingBodyState {
     /// currently owned here. The body will be sent back over this channel when
     /// it's done, however.
     InBodyStream(oneshot::Receiver<StreamEnd>),
+
+    /// The body always fails with the given error message.
+    Failing(String),
 }
 
 /// Small wrapper around [`HyperIncomingBody`] which adds a timeout to every frame.
@@ -273,6 +288,7 @@ impl InputStream for HostIncomingBodyStream {
             }
         }
     }
+    fn as_any(&self) -> &dyn std::any::Any { self }
 }
 
 #[async_trait::async_trait]
@@ -370,6 +386,10 @@ impl Pollable for HostFutureTrailers {
         let hyper_body = match &mut body.body {
             IncomingBodyState::Start(body) => body,
             IncomingBodyState::InBodyStream(_) => unreachable!(),
+            IncomingBodyState::Failing(_) => {
+                *self = HostFutureTrailers::Done(Err(types::ErrorCode::ConnectionTerminated));
+                return;
+            }
         };
         let result = loop {
             match hyper_body.frame().await {
@@ -668,6 +688,27 @@ impl OutputStream for BodyWriteStream {
             Ok(self.write_budget)
         }
     }
+    fn as_any(&self) -> &dyn std::any::Any { self }
+}
+
+/// A stream that always fails with a given error message.
+pub struct FailingStream(pub String);
+
+#[async_trait::async_trait]
+impl InputStream for FailingStream {
+    fn read(&mut self, _size: usize) -> Result<Bytes, StreamError> {
+        Err(StreamError::LastOperationFailed(wasmtime::Error::msg(
+            self.0.clone(),
+        )))
+    }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+#[async_trait::async_trait]
+impl Pollable for FailingStream {
+    async fn ready(&mut self) {}
 }
 
 #[async_trait::async_trait]

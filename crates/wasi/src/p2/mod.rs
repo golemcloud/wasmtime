@@ -82,8 +82,8 @@
 //! ```
 //!
 //! where the [`WasiCtxView`] type comes from [`WasiView::ctx`] for the type
-//! contained within the `Store<T>`. The [`add_to_linker_sync`] and
-//! [`add_to_linker_async`] function then require that `T: WasiView` with
+//! contained within the `Store<T>`. The [`add_to_linker_async`] function
+//! then requires that `T: WasiView` with
 //! [`Linker<T>`](wasmtime::component::Linker).
 //!
 //! To implement the [`WasiView`] trait you will first select a
@@ -111,7 +111,7 @@
 //! }
 //! ```
 //!
-//! # Async and Sync
+//! # Async
 //!
 //! All WASIp2 functions are blocking from WebAssembly's point of view: a
 //! WebAssembly call into these functions returns only when they are complete.
@@ -119,22 +119,12 @@
 //! This module provides an implementation of those functions in the host, where
 //! for some functions, it is appropriate to implement them using async Rust and
 //! the Tokio executor. The host implementation still blocks WebAssembly, but it
-//! does not block the host's thread. Synchronous wrappers are also provided for
-//! all async implementations, which create a private Tokio executor.
+//! does not block the host's thread.
 //!
-//! Users can choose between these modes of implementation using variants
-//! of the add_to_linker functions:
+//! Use [`add_to_linker_async`] to add all WASI interfaces to a linker.
 //!
-//! * For non-async users, use [`add_to_linker_sync`].
-//! * For async users, use [`add_to_linker_async`].
-//!
-//! Note that bindings are generated once for async and once for sync. Most
-//! interfaces do not change, however, so only interfaces with blocking
-//! functions have bindings generated twice. Bindings are organized as:
-//!
-//! * [`bindings`] - default location of all bindings, blocking functions are
-//!   `async`
-//! * [`bindings::sync`] - blocking interfaces have synchronous versions here.
+//! Bindings are organized in the [`bindings`] submodule, where blocking
+//! functions are `async`.
 //!
 //! # Module-specific traits
 //!
@@ -173,7 +163,7 @@
 //! 1. First implement [`WasiView`] for your type which is the
 //!    `T` in `Store<T>`.
 //! 2. Add WASI interfaces to a `wasmtime::component::Linker<T>`. This is either
-//!    done through top-level functions like [`add_to_linker_sync`] or through
+//!    done through top-level functions like [`add_to_linker_async`] or through
 //!    individual `add_to_linker` functions in generated bindings throughout
 //!    this module.
 //! 3. Create a [`WasiCtx`] for each `Store<T>` through [`WasiCtxBuilder`]. Each
@@ -183,7 +173,7 @@
 //!    `Store<T>`.
 //!
 //! For examples see each of [`WasiView`], [`WasiCtx`], [`WasiCtxBuilder`],
-//! [`add_to_linker_sync`], and [`bindings::Command`].
+//! [`add_to_linker_async`], and [`bindings::Command`].
 //!
 //! [`wasmtime::component::bindgen!`]: https://docs.rs/wasmtime/latest/wasmtime/component/macro.bindgen.html
 //! [`tokio`]: https://crates.io/crates/tokio
@@ -239,7 +229,6 @@ mod host;
 mod ip_name_lookup;
 mod network;
 pub mod pipe;
-mod poll;
 mod stdio;
 mod tcp;
 mod udp;
@@ -252,17 +241,20 @@ pub(crate) use tcp::P2TcpStreamingState;
 // These contents of wasmtime-wasi-io are re-exported by this module for compatibility:
 // they were originally defined in this module before being factored out, and many
 // users of this module depend on them at these names.
-pub use wasmtime_wasi_io::poll::{DynFuture, DynPollable, MakeFuture, Pollable, subscribe};
+pub use wasmtime_wasi_io::poll::{
+    dynamic_subscribe, subscribe, DynFuture, DynPollable, DynamicPollable, MakeFuture,
+    OverrideSelf, Pollable,
+};
 pub use wasmtime_wasi_io::streams::{
     DynInputStream, DynOutputStream, Error as IoError, InputStream, OutputStream, StreamError,
     StreamResult,
 };
+pub use wasmtime_wasi_io::{IoCtx, IoData, IoView};
 
 /// Add all WASI interfaces from this crate into the `linker` provided.
 ///
 /// This function will add the `async` variant of all interfaces into the
-/// [`Linker`] provided. For embeddings with async support disabled see
-/// [`add_to_linker_sync`] instead.
+/// [`Linker`] provided.
 ///
 /// This function will add all interfaces implemented by this crate to the
 /// [`Linker`], which corresponds to the `wasi:cli/imports` world supported by
@@ -273,7 +265,7 @@ pub use wasmtime_wasi_io::streams::{
 /// ```
 /// use wasmtime::{Engine, Result, Store, Config};
 /// use wasmtime::component::{ResourceTable, Linker};
-/// use wasmtime_wasi::{WasiCtx, WasiCtxView, WasiView};
+/// use wasmtime_wasi::{WasiCtx, WasiCtxView, WasiView, IoCtx};
 ///
 /// fn main() -> Result<()> {
 ///     let engine = Engine::default();
@@ -291,6 +283,7 @@ pub use wasmtime_wasi_io::streams::{
 ///         MyState {
 ///             ctx: builder.build(),
 ///             table: ResourceTable::new(),
+///             io_ctx: IoCtx::default(),
 ///         },
 ///     );
 ///
@@ -302,11 +295,12 @@ pub use wasmtime_wasi_io::streams::{
 /// struct MyState {
 ///     ctx: WasiCtx,
 ///     table: ResourceTable,
+///     io_ctx: IoCtx,
 /// }
 ///
 /// impl WasiView for MyState {
 ///     fn ctx(&mut self) -> WasiCtxView<'_> {
-///         WasiCtxView { ctx: &mut self.ctx, table: &mut self.table }
+///         WasiCtxView { ctx: &mut self.ctx, table: &mut self.table, io_ctx: &mut self.io_ctx }
 ///     }
 /// }
 /// ```
@@ -330,7 +324,7 @@ pub fn add_to_linker_with_options_async<T: WasiView>(
     Ok(())
 }
 
-/// Shared functionality for [`add_to_linker_async`] and [`add_to_linker_sync`].
+/// Shared functionality for [`add_to_linker_async`].
 fn add_nonblocking_to_linker<'a, T: WasiView, O>(
     linker: &mut Linker<T>,
     options: &'a O,
@@ -375,16 +369,6 @@ pub fn add_to_linker_proxy_interfaces_async<T: WasiView>(
     add_proxy_interfaces_nonblocking(linker)
 }
 
-/// Same as [`add_to_linker_sync`] except that this only adds interfaces
-/// present in the `wasi:http/proxy` world.
-#[doc(hidden)]
-pub fn add_to_linker_proxy_interfaces_sync<T: WasiView>(
-    linker: &mut Linker<T>,
-) -> wasmtime::Result<()> {
-    add_sync_wasi_io(linker)?;
-    add_proxy_interfaces_nonblocking(linker)
-}
-
 fn add_proxy_interfaces_nonblocking<T: WasiView>(linker: &mut Linker<T>) -> wasmtime::Result<()> {
     use crate::p2::bindings::{cli, clocks, random};
 
@@ -398,95 +382,16 @@ fn add_proxy_interfaces_nonblocking<T: WasiView>(linker: &mut Linker<T>) -> wasm
     Ok(())
 }
 
-/// Add all WASI interfaces from this crate into the `linker` provided.
-///
-/// This function will add the synchronous variant of all interfaces into the
-/// [`Linker`] provided. For embeddings with async support enabled see
-/// [`add_to_linker_async`] instead.
-///
-/// This function will add all interfaces implemented by this crate to the
-/// [`Linker`], which corresponds to the `wasi:cli/imports` world supported by
-/// this crate.
-///
-/// # Example
-///
-/// ```
-/// use wasmtime::{Engine, Result, Store, Config};
-/// use wasmtime::component::{ResourceTable, Linker};
-/// use wasmtime_wasi::{WasiCtx, WasiCtxView, WasiView};
-///
-/// fn main() -> Result<()> {
-///     let engine = Engine::default();
-///
-///     let mut linker = Linker::<MyState>::new(&engine);
-///     wasmtime_wasi::p2::add_to_linker_sync(&mut linker)?;
-///     // ... add any further functionality to `linker` if desired ...
-///
-///     let mut builder = WasiCtx::builder();
-///
-///     // ... configure `builder` more to add env vars, args, etc ...
-///
-///     let mut store = Store::new(
-///         &engine,
-///         MyState {
-///             ctx: builder.build(),
-///             table: ResourceTable::new(),
-///         },
-///     );
-///
-///     // ... use `linker` to instantiate within `store` ...
-///
-///     Ok(())
-/// }
-///
-/// struct MyState {
-///     ctx: WasiCtx,
-///     table: ResourceTable,
-/// }
-/// impl WasiView for MyState {
-///     fn ctx(&mut self) -> WasiCtxView<'_> {
-///         WasiCtxView { ctx: &mut self.ctx, table: &mut self.table }
-///     }
-/// }
-/// ```
-pub fn add_to_linker_sync<T: WasiView>(
-    linker: &mut wasmtime::component::Linker<T>,
-) -> wasmtime::Result<()> {
-    let options = bindings::sync::LinkOptions::default();
-    add_to_linker_with_options_sync(linker, &options)
-}
-
-/// Similar to [`add_to_linker_sync`], but with the ability to enable unstable features.
-pub fn add_to_linker_with_options_sync<T: WasiView>(
-    linker: &mut wasmtime::component::Linker<T>,
-    options: &bindings::sync::LinkOptions,
-) -> wasmtime::Result<()> {
-    add_nonblocking_to_linker(linker, options)?;
-    add_sync_wasi_io(linker)?;
-
-    let l = linker;
-    bindings::sync::filesystem::types::add_to_linker::<T, WasiFilesystem>(l, T::filesystem)?;
-    bindings::sync::sockets::tcp::add_to_linker::<T, WasiSockets>(l, T::sockets)?;
-    bindings::sync::sockets::udp::add_to_linker::<T, WasiSockets>(l, T::sockets)?;
-    Ok(())
-}
-
-/// Shared functionality of [`add_to_linker_sync`]` and
-/// [`add_to_linker_proxy_interfaces_sync`].
-fn add_sync_wasi_io<T: WasiView>(
-    linker: &mut wasmtime::component::Linker<T>,
-) -> wasmtime::Result<()> {
-    let l = linker;
-    wasmtime_wasi_io::bindings::wasi::io::error::add_to_linker::<T, HasIo>(l, |t| t.ctx().table)?;
-    bindings::sync::io::poll::add_to_linker::<T, HasIo>(l, |t| t.ctx().table)?;
-    bindings::sync::io::streams::add_to_linker::<T, HasIo>(l, |t| t.ctx().table)?;
-    Ok(())
-}
-
 struct HasIo;
 
 impl HasData for HasIo {
     type Data<'a> = &'a mut ResourceTable;
+}
+
+struct HasIoPoll;
+
+impl HasData for HasIoPoll {
+    type Data<'a> = wasmtime_wasi_io::IoData<'a>;
 }
 
 // FIXME: it's a bit unfortunate that this can't use
@@ -497,7 +402,13 @@ impl HasData for HasIo {
 // to massage this.
 fn add_async_io_to_linker<T: WasiView>(l: &mut Linker<T>) -> wasmtime::Result<()> {
     wasmtime_wasi_io::bindings::wasi::io::error::add_to_linker::<T, HasIo>(l, |t| t.ctx().table)?;
-    wasmtime_wasi_io::bindings::wasi::io::poll::add_to_linker::<T, HasIo>(l, |t| t.ctx().table)?;
+    wasmtime_wasi_io::bindings::wasi::io::poll::add_to_linker::<T, HasIoPoll>(l, |t| {
+        let view = t.ctx();
+        wasmtime_wasi_io::IoData {
+            table: view.table,
+            io_ctx: view.io_ctx,
+        }
+    })?;
     wasmtime_wasi_io::bindings::wasi::io::streams::add_to_linker::<T, HasIo>(l, |t| t.ctx().table)?;
     Ok(())
 }

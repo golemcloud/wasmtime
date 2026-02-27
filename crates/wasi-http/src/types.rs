@@ -274,8 +274,6 @@ impl<T: ?Sized + WasiHttpView> WasiHttpView for Box<T> {
 ///
 /// This type is automatically used when using
 /// [`add_to_linker_async`](crate::add_to_linker_async)
-/// or
-/// [`add_to_linker_sync`](crate::add_to_linker_sync)
 /// and doesn't need to be manually configured.
 #[repr(transparent)]
 pub struct WasiHttpImpl<T>(pub T);
@@ -349,6 +347,7 @@ pub(crate) fn remove_forbidden_headers(view: &mut dyn WasiHttpView, headers: &mu
 }
 
 /// Configuration for an outgoing request.
+#[derive(Debug)]
 pub struct OutgoingRequestConfig {
     /// Whether to use TLS for the request.
     pub use_tls: bool,
@@ -850,6 +849,13 @@ pub enum HostFutureIncomingResponse {
     Ready(wasmtime::Result<Result<IncomingResponse, types::ErrorCode>>),
     /// The response has been consumed.
     Consumed,
+    /// A deferred response that hasn't been sent yet.
+    Deferred {
+        /// The request to send.
+        request: hyper::Request<HyperOutgoingBody>,
+        /// The configuration for the request.
+        config: OutgoingRequestConfig,
+    },
 }
 
 impl HostFutureIncomingResponse {
@@ -863,6 +869,14 @@ impl HostFutureIncomingResponse {
         Self::Ready(result)
     }
 
+    /// Create a new `HostFutureIncomingResponse` that is deferred.
+    pub fn deferred(
+        request: hyper::Request<HyperOutgoingBody>,
+        config: OutgoingRequestConfig,
+    ) -> Self {
+        Self::Deferred { request, config }
+    }
+
     /// Returns `true` if the response is ready.
     pub fn is_ready(&self) -> bool {
         matches!(self, Self::Ready(_))
@@ -872,8 +886,8 @@ impl HostFutureIncomingResponse {
     pub fn unwrap_ready(self) -> wasmtime::Result<Result<IncomingResponse, types::ErrorCode>> {
         match self {
             Self::Ready(res) => res,
-            Self::Pending(_) | Self::Consumed => {
-                panic!("unwrap_ready called on a pending HostFutureIncomingResponse")
+            Self::Pending(_) | Self::Consumed | Self::Deferred { .. } => {
+                panic!("unwrap_ready called on a non-ready HostFutureIncomingResponse")
             }
         }
     }
@@ -885,5 +899,6 @@ impl Pollable for HostFutureIncomingResponse {
         if let Self::Pending(handle) = self {
             *self = Self::Ready(handle.await);
         }
+        // Deferred is always ready - get() will trigger the actual request
     }
 }

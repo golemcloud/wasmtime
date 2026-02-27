@@ -34,13 +34,6 @@
 //! methods such as [`WasiHttpView::send_request`] to customize how outgoing
 //! HTTP requests are handled.
 //!
-//! # Async and Sync
-//!
-//! There are both asynchronous and synchronous bindings in this crate. For
-//! example [`add_to_linker_async`] is for asynchronous embedders and
-//! [`add_to_linker_sync`] is for synchronous embedders. Note that under the
-//! hood both versions are implemented with `async` on top of [`tokio`].
-//!
 //! # Examples
 //!
 //! Usage of this crate is done through a few steps to get everything hooked up:
@@ -228,11 +221,57 @@ pub mod handler;
 pub mod io;
 pub mod types;
 
-pub mod bindings;
+/// Auto-generated bindings for `wasi:http/proxy`.
+pub mod bindings {
+    #[expect(missing_docs, reason = "bindgen-generated code")]
+    mod generated {
+        use crate::body;
+        use crate::types;
+
+        wasmtime::component::bindgen!({
+            path: "wit",
+            world: "wasi:http/proxy",
+            imports: {
+                "wasi:http/outgoing-handler.handle": async | tracing | trappable,
+                "wasi:http/types.[method]future-incoming-response.get": async | tracing | trappable,
+                "wasi:http/types.[method]future-trailers.get": async | tracing | trappable,
+                "wasi:http/types.[static]incoming-body.finish": async | tracing | trappable,
+                "wasi:http/types.[drop]incoming-body": async | tracing | trappable,
+                "wasi:http/types.[drop]incoming-response": async | tracing | trappable,
+                "wasi:http/types.[drop]future-incoming-response": async | tracing | trappable,
+                default: tracing | trappable,
+            },
+            exports: { default: async },
+            require_store_data_send: true,
+            with: {
+                "wasi:io": wasmtime_wasi::p2::bindings::io,
+                "wasi:http/types.outgoing-body": body::HostOutgoingBody,
+                "wasi:http/types.future-incoming-response": types::HostFutureIncomingResponse,
+                "wasi:http/types.outgoing-response": types::HostOutgoingResponse,
+                "wasi:http/types.future-trailers": body::HostFutureTrailers,
+                "wasi:http/types.incoming-body": body::HostIncomingBody,
+                "wasi:http/types.incoming-response": types::HostIncomingResponse,
+                "wasi:http/types.response-outparam": types::HostResponseOutparam,
+                "wasi:http/types.outgoing-request": types::HostOutgoingRequest,
+                "wasi:http/types.incoming-request": types::HostIncomingRequest,
+                "wasi:http/types.fields": types::HostFields,
+                "wasi:http/types.request-options": types::HostRequestOptions,
+            },
+            trappable_error_type: {
+                "wasi:http/types.error-code" => crate::HttpError,
+            },
+        });
+    }
+
+    pub use self::generated::wasi::*;
+    pub use self::generated::exports;
+    pub use self::generated::{LinkOptions, Proxy, ProxyIndices, ProxyPre};
+}
 
 #[cfg(feature = "p3")]
 pub mod p3;
 
+pub use crate::types_impl::get_fields;
 pub use crate::error::{
     HttpError, HttpResult, http_request_error, hyper_request_error, hyper_response_error,
 };
@@ -242,13 +281,12 @@ pub use crate::types::{
     WasiHttpImpl, WasiHttpView,
 };
 use http::header::CONTENT_LENGTH;
-use wasmtime::component::{HasData, Linker};
+use wasmtime::component::HasData;
 
 /// Add all of the `wasi:http/proxy` world's interfaces to a [`wasmtime::component::Linker`].
 ///
 /// This function will add the `async` variant of all interfaces into the
-/// `Linker` provided. For embeddings with async support disabled see
-/// [`add_to_linker_sync`] instead.
+/// `Linker` provided.
 ///
 /// # Example
 ///
@@ -287,7 +325,7 @@ use wasmtime::component::{HasData, Linker};
 /// ```
 pub fn add_to_linker_async<T>(l: &mut wasmtime::component::Linker<T>) -> wasmtime::Result<()>
 where
-    T: WasiHttpView + wasmtime_wasi::WasiView + 'static,
+    T: WasiHttpView + wasmtime_wasi::WasiView + Send + 'static,
 {
     wasmtime_wasi::p2::add_to_linker_proxy_interfaces_async(l)?;
     add_only_http_to_linker_async(l)
@@ -302,7 +340,7 @@ pub fn add_only_http_to_linker_async<T>(
     l: &mut wasmtime::component::Linker<T>,
 ) -> wasmtime::Result<()>
 where
-    T: WasiHttpView + 'static,
+    T: WasiHttpView + Send + 'static,
 {
     let options = crate::bindings::LinkOptions::default(); // FIXME: Thread through to the CLI options.
     crate::bindings::http::outgoing_handler::add_to_linker::<_, WasiHttp<T>>(l, |x| {
@@ -319,74 +357,6 @@ struct WasiHttp<T>(T);
 
 impl<T: 'static> HasData for WasiHttp<T> {
     type Data<'a> = WasiHttpImpl<&'a mut T>;
-}
-
-/// Add all of the `wasi:http/proxy` world's interfaces to a [`wasmtime::component::Linker`].
-///
-/// This function will add the `sync` variant of all interfaces into the
-/// `Linker` provided. For embeddings with async support see
-/// [`add_to_linker_async`] instead.
-///
-/// # Example
-///
-/// ```
-/// use wasmtime::{Engine, Result, Config};
-/// use wasmtime::component::{ResourceTable, Linker};
-/// use wasmtime_wasi::{WasiCtx, WasiCtxView, WasiView};
-/// use wasmtime_wasi_http::{WasiHttpCtx, WasiHttpView};
-///
-/// fn main() -> Result<()> {
-///     let config = Config::default();
-///     let engine = Engine::new(&config)?;
-///
-///     let mut linker = Linker::<MyState>::new(&engine);
-///     wasmtime_wasi_http::add_to_linker_sync(&mut linker)?;
-///     // ... add any further functionality to `linker` if desired ...
-///
-///     Ok(())
-/// }
-///
-/// struct MyState {
-///     ctx: WasiCtx,
-///     http_ctx: WasiHttpCtx,
-///     table: ResourceTable,
-/// }
-/// impl WasiHttpView for MyState {
-///     fn ctx(&mut self) -> &mut WasiHttpCtx { &mut self.http_ctx }
-///     fn table(&mut self) -> &mut ResourceTable { &mut self.table }
-/// }
-/// impl WasiView for MyState {
-///     fn ctx(&mut self) -> WasiCtxView<'_> {
-///         WasiCtxView { ctx: &mut self.ctx, table: &mut self.table }
-///     }
-/// }
-/// ```
-pub fn add_to_linker_sync<T>(l: &mut Linker<T>) -> wasmtime::Result<()>
-where
-    T: WasiHttpView + wasmtime_wasi::WasiView + 'static,
-{
-    wasmtime_wasi::p2::add_to_linker_proxy_interfaces_sync(l)?;
-    add_only_http_to_linker_sync(l)
-}
-
-/// A slimmed down version of [`add_to_linker_sync`] which only adds
-/// `wasi:http` interfaces to the linker.
-///
-/// This is useful when using [`wasmtime_wasi::p2::add_to_linker_sync`] for
-/// example to avoid re-adding the same interfaces twice.
-pub fn add_only_http_to_linker_sync<T>(l: &mut Linker<T>) -> wasmtime::Result<()>
-where
-    T: WasiHttpView + 'static,
-{
-    let options = crate::bindings::LinkOptions::default(); // FIXME: Thread through to the CLI options.
-    crate::bindings::sync::http::outgoing_handler::add_to_linker::<_, WasiHttp<T>>(l, |x| {
-        WasiHttpImpl(x)
-    })?;
-    crate::bindings::sync::http::types::add_to_linker::<_, WasiHttp<T>>(l, &options.into(), |x| {
-        WasiHttpImpl(x)
-    })?;
-
-    Ok(())
 }
 
 /// Extract the `Content-Length` header value from a [`http::HeaderMap`], returning `None` if it's not

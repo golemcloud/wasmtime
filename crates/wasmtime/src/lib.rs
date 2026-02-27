@@ -526,6 +526,9 @@ pub use wasmtime_environ::anyhow;
 
 pub use self::error::{Error, Result, bail, ensure, format_err};
 
+/// The version of the Wasmtime crate.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
 /// A re-exported instance of Wasmtime's `wasmparser` dependency.
 ///
 /// This may be useful for embedders that also use `wasmparser`

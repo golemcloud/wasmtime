@@ -1,5 +1,6 @@
 use crate::WasiCtx;
 use wasmtime::component::ResourceTable;
+use wasmtime_wasi_io::IoCtx;
 
 /// A trait which provides access to the [`WasiCtx`] inside the embedder's `T`
 /// of [`Store<T>`][`Store`].
@@ -19,6 +20,7 @@ use wasmtime::component::ResourceTable;
 /// struct MyState {
 ///     ctx: WasiCtx,
 ///     table: ResourceTable,
+///     io_ctx: wasmtime_wasi_io::IoCtx,
 /// }
 ///
 /// impl WasiView for MyState {
@@ -26,6 +28,7 @@ use wasmtime::component::ResourceTable;
 ///         WasiCtxView{
 ///             ctx: &mut self.ctx,
 ///             table: &mut self.table,
+///             io_ctx: &mut self.io_ctx,
 ///         }
 ///     }
 /// }
@@ -46,11 +49,13 @@ pub struct WasiCtxView<'a> {
     pub ctx: &'a mut WasiCtx,
     /// Resources, such as files/streams, that the guest is using.
     pub table: &'a mut ResourceTable,
+    /// I/O context for suspend support.
+    pub io_ctx: &'a mut IoCtx,
 }
 
 impl<T: WasiView> crate::cli::WasiCliView for T {
     fn cli(&mut self) -> crate::cli::WasiCliCtxView<'_> {
-        let WasiCtxView { ctx, table } = self.ctx();
+        let WasiCtxView { ctx, table, io_ctx: _ } = self.ctx();
         crate::cli::WasiCliCtxView {
             ctx: &mut ctx.cli,
             table,
@@ -60,7 +65,7 @@ impl<T: WasiView> crate::cli::WasiCliView for T {
 
 impl<T: WasiView> crate::clocks::WasiClocksView for T {
     fn clocks(&mut self) -> crate::clocks::WasiClocksCtxView<'_> {
-        let WasiCtxView { ctx, table } = self.ctx();
+        let WasiCtxView { ctx, table, io_ctx: _ } = self.ctx();
         crate::clocks::WasiClocksCtxView {
             ctx: &mut ctx.clocks,
             table,
@@ -70,7 +75,7 @@ impl<T: WasiView> crate::clocks::WasiClocksView for T {
 
 impl<T: WasiView> crate::filesystem::WasiFilesystemView for T {
     fn filesystem(&mut self) -> crate::filesystem::WasiFilesystemCtxView<'_> {
-        let WasiCtxView { ctx, table } = self.ctx();
+        let WasiCtxView { ctx, table, io_ctx: _ } = self.ctx();
         crate::filesystem::WasiFilesystemCtxView {
             ctx: &mut ctx.filesystem,
             table,
@@ -86,7 +91,7 @@ impl<T: WasiView> crate::random::WasiRandomView for T {
 
 impl<T: WasiView> crate::sockets::WasiSocketsView for T {
     fn sockets(&mut self) -> crate::sockets::WasiSocketsCtxView<'_> {
-        let WasiCtxView { ctx, table } = self.ctx();
+        let WasiCtxView { ctx, table, io_ctx: _ } = self.ctx();
         crate::sockets::WasiSocketsCtxView {
             ctx: &mut ctx.sockets,
             table,

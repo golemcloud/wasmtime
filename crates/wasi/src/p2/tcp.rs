@@ -113,6 +113,7 @@ impl InputStream for TcpReadStream {
     fn read(&mut self, size: usize) -> Result<bytes::Bytes, StreamError> {
         try_lock_for_stream(&self.0)?.read(size)
     }
+    fn as_any(&self) -> &dyn std::any::Any { self }
 }
 
 #[async_trait::async_trait]
@@ -331,6 +332,7 @@ impl OutputStream for TcpWriteStream {
     async fn cancel(&mut self) {
         self.0.lock().await.cancel().await
     }
+    fn as_any(&self) -> &dyn std::any::Any { self }
 }
 
 #[async_trait::async_trait]

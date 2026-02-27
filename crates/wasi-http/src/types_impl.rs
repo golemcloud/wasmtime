@@ -17,7 +17,7 @@ use wasmtime_wasi::p2::{DynInputStream, DynOutputStream, DynPollable};
 
 impl<T> crate::bindings::http::types::Host for WasiHttpImpl<T>
 where
-    T: WasiHttpView,
+    T: WasiHttpView + Send,
 {
     fn convert_error_code(&mut self, err: crate::HttpError) -> wasmtime::Result<types::ErrorCode> {
         err.downcast()
@@ -48,7 +48,8 @@ fn move_fields(
     }
 }
 
-fn get_fields<'a>(
+/// Get the fields associated with a fields resource.
+pub fn get_fields<'a>(
     table: &'a mut ResourceTable,
     id: &Resource<HostFields>,
 ) -> wasmtime::Result<&'a FieldMap> {
@@ -79,7 +80,7 @@ fn get_fields_mut<'a>(
 
 impl<T> crate::bindings::http::types::HostFields for WasiHttpImpl<T>
 where
-    T: WasiHttpView,
+    T: WasiHttpView + Send,
 {
     fn new(&mut self) -> wasmtime::Result<Resource<HostFields>> {
         let limit = self.ctx().field_size_limit;
@@ -288,7 +289,7 @@ where
 
 impl<T> crate::bindings::http::types::HostIncomingRequest for WasiHttpImpl<T>
 where
-    T: WasiHttpView,
+    T: WasiHttpView + Send,
 {
     fn method(&mut self, id: Resource<HostIncomingRequest>) -> wasmtime::Result<Method> {
         let method = self.table().get(&id)?.method.clone();
@@ -357,7 +358,7 @@ where
 
 impl<T> crate::bindings::http::types::HostOutgoingRequest for WasiHttpImpl<T>
 where
-    T: WasiHttpView,
+    T: WasiHttpView + Send,
 {
     fn new(
         &mut self,
@@ -544,7 +545,7 @@ where
 
 impl<T> crate::bindings::http::types::HostResponseOutparam for WasiHttpImpl<T>
 where
-    T: WasiHttpView,
+    T: WasiHttpView + Send,
 {
     fn drop(&mut self, id: Resource<HostResponseOutparam>) -> wasmtime::Result<()> {
         let _ = self.table().delete(id)?;
@@ -581,9 +582,9 @@ where
 
 impl<T> crate::bindings::http::types::HostIncomingResponse for WasiHttpImpl<T>
 where
-    T: WasiHttpView,
+    T: WasiHttpView + Send,
 {
-    fn drop(&mut self, response: Resource<HostIncomingResponse>) -> wasmtime::Result<()> {
+    async fn drop(&mut self, response: Resource<HostIncomingResponse>) -> wasmtime::Result<()> {
         let _ = self
             .table()
             .delete(response)
@@ -645,7 +646,7 @@ where
 
 impl<T> crate::bindings::http::types::HostFutureTrailers for WasiHttpImpl<T>
 where
-    T: WasiHttpView,
+    T: WasiHttpView + Send,
 {
     fn drop(&mut self, id: Resource<HostFutureTrailers>) -> wasmtime::Result<()> {
         let _ = self
@@ -659,10 +660,10 @@ where
         &mut self,
         index: Resource<HostFutureTrailers>,
     ) -> wasmtime::Result<Resource<DynPollable>> {
-        wasmtime_wasi::p2::subscribe(self.table(), index)
+        wasmtime_wasi::p2::subscribe(self.table(), index, None)
     }
 
-    fn get(
+    async fn get(
         &mut self,
         id: Resource<HostFutureTrailers>,
     ) -> wasmtime::Result<Option<Result<Result<Option<Resource<Trailers>>, types::ErrorCode>, ()>>>
@@ -695,7 +696,7 @@ where
 
 impl<T> crate::bindings::http::types::HostIncomingBody for WasiHttpImpl<T>
 where
-    T: WasiHttpView,
+    T: WasiHttpView + Send,
 {
     fn stream(
         &mut self,
@@ -704,7 +705,7 @@ where
         let body = self.table().get_mut(&id)?;
 
         if let Some(stream) = body.take_stream() {
-            let stream: DynInputStream = Box::new(stream);
+            let stream: DynInputStream = stream;
             let stream = self.table().push_child(stream, &id)?;
             return Ok(Ok(stream));
         }
@@ -712,7 +713,7 @@ where
         Ok(Err(()))
     }
 
-    fn finish(
+    async fn finish(
         &mut self,
         id: Resource<HostIncomingBody>,
     ) -> wasmtime::Result<Resource<HostFutureTrailers>> {
@@ -721,7 +722,7 @@ where
         Ok(trailers)
     }
 
-    fn drop(&mut self, id: Resource<HostIncomingBody>) -> wasmtime::Result<()> {
+    async fn drop(&mut self, id: Resource<HostIncomingBody>) -> wasmtime::Result<()> {
         let _ = self.table().delete(id)?;
         Ok(())
     }
@@ -729,7 +730,7 @@ where
 
 impl<T> crate::bindings::http::types::HostOutgoingResponse for WasiHttpImpl<T>
 where
-    T: WasiHttpView,
+    T: WasiHttpView + Send,
 {
     fn new(
         &mut self,
@@ -824,14 +825,14 @@ where
 
 impl<T> crate::bindings::http::types::HostFutureIncomingResponse for WasiHttpImpl<T>
 where
-    T: WasiHttpView,
+    T: WasiHttpView + Send,
 {
-    fn drop(&mut self, id: Resource<HostFutureIncomingResponse>) -> wasmtime::Result<()> {
+    async fn drop(&mut self, id: Resource<HostFutureIncomingResponse>) -> wasmtime::Result<()> {
         let _ = self.table().delete(id)?;
         Ok(())
     }
 
-    fn get(
+    async fn get(
         &mut self,
         id: Resource<HostFutureIncomingResponse>,
     ) -> wasmtime::Result<
@@ -844,6 +845,15 @@ where
             HostFutureIncomingResponse::Pending(_) => return Ok(None),
             HostFutureIncomingResponse::Consumed => return Ok(Some(Err(()))),
             HostFutureIncomingResponse::Ready(_) => {}
+            HostFutureIncomingResponse::Deferred { .. } => {
+                // Deferred: the request hasn't been sent yet. Trigger it now.
+                let deferred = std::mem::replace(resp, HostFutureIncomingResponse::Consumed);
+                if let HostFutureIncomingResponse::Deferred { request, config } = deferred {
+                    let future = self.send_request(request, config)?;
+                    *self.table().get_mut(&id)? = future;
+                }
+                return Ok(None);
+            }
         }
 
         let resp =
@@ -883,13 +893,13 @@ where
         &mut self,
         id: Resource<HostFutureIncomingResponse>,
     ) -> wasmtime::Result<Resource<DynPollable>> {
-        wasmtime_wasi::p2::subscribe(self.table(), id)
+        wasmtime_wasi::p2::subscribe(self.table(), id, None)
     }
 }
 
 impl<T> crate::bindings::http::types::HostOutgoingBody for WasiHttpImpl<T>
 where
-    T: WasiHttpView,
+    T: WasiHttpView + Send,
 {
     fn write(
         &mut self,
@@ -929,7 +939,7 @@ where
 
 impl<T> crate::bindings::http::types::HostRequestOptions for WasiHttpImpl<T>
 where
-    T: WasiHttpView,
+    T: WasiHttpView + Send,
 {
     fn new(&mut self) -> wasmtime::Result<Resource<types::RequestOptions>> {
         let id = self.table().push(types::RequestOptions::default())?;
