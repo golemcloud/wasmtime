@@ -56,7 +56,7 @@ impl HostIncomingBody {
     /// Create a new `HostIncomingBody` that always fails with the given error.
     pub fn failing(error: String) -> HostIncomingBody {
         HostIncomingBody {
-            body: IncomingBodyState::Failing(error),
+            body: IncomingBodyState::Failing(Arc::from(error)),
             field_size_limit: 0,
             worker: None,
         }
@@ -68,7 +68,7 @@ impl HostIncomingBody {
             IncomingBodyState::Start(_) => {}
             IncomingBodyState::InBodyStream(_) => return None,
             IncomingBodyState::Failing(error) => {
-                return Some(Box::new(FailingStream(error.clone())));
+                return Some(Box::new(FailingStream(Arc::clone(error))));
             }
         }
         let (tx, rx) = oneshot::channel();
@@ -102,7 +102,7 @@ enum IncomingBodyState {
     InBodyStream(oneshot::Receiver<StreamEnd>),
 
     /// The body always fails with the given error message.
-    Failing(String),
+    Failing(Arc<str>),
 }
 
 /// Small wrapper around [`HyperIncomingBody`] which adds a timeout to every frame.
@@ -692,13 +692,13 @@ impl OutputStream for BodyWriteStream {
 }
 
 /// A stream that always fails with a given error message.
-pub struct FailingStream(pub String);
+pub struct FailingStream(pub Arc<str>);
 
 #[async_trait::async_trait]
 impl InputStream for FailingStream {
     fn read(&mut self, _size: usize) -> Result<Bytes, StreamError> {
         Err(StreamError::LastOperationFailed(wasmtime::Error::msg(
-            self.0.clone(),
+            Arc::clone(&self.0),
         )))
     }
     fn as_any(&self) -> &dyn std::any::Any {

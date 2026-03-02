@@ -13,12 +13,14 @@ use std::time::Instant;
 use wasmtime::component::{Resource, ResourceTable};
 use wasmtime::{Result, format_err};
 
+const MAX_POLLABLE_OVERRIDE_CHAIN: usize = 64;
+
 fn get_pollable_following_overrides<'a>(
     table: &'a ResourceTable,
     pollable: &Resource<DynPollable>,
 ) -> Result<&'a DynPollable> {
     let mut pollable = table.get(pollable)?;
-    loop {
+    for _ in 0..MAX_POLLABLE_OVERRIDE_CHAIN {
         if let Some(override_self) = &pollable.override_self {
             let entry = table.get_any(pollable.index)?;
             let pollable_override = override_self(entry);
@@ -28,13 +30,15 @@ fn get_pollable_following_overrides<'a>(
                     .downcast_ref()
                     .ok_or_else(|| format_err!("Pollable override does not point to a Pollable"))?;
             } else {
-                break;
+                return Ok(pollable);
             }
         } else {
-            break;
+            return Ok(pollable);
         }
     }
-    Ok(pollable)
+    Err(format_err!(
+        "Pollable override chain exceeded maximum depth of {MAX_POLLABLE_OVERRIDE_CHAIN}"
+    ))
 }
 
 impl poll::Host for IoData<'_> {
