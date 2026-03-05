@@ -224,11 +224,13 @@ impl HostIncomingBodyStream {
                 self.state = IncomingBodyStreamState::Closed;
             }
 
-            // No more frames are going to be received again, so drop the `body`
-            // and the `tx` channel we'd send the body back onto because it's
-            // not needed as frames are done.
+            // No more frames are going to be received again, so send an
+            // explicit EOF (no trailers) and close the stream.
             None => {
-                self.state = IncomingBodyStreamState::Closed;
+                let prev = mem::replace(&mut self.state, IncomingBodyStreamState::Closed);
+                if let IncomingBodyStreamState::Open { body: _, tx } = prev {
+                    let _ = tx.send(StreamEnd::Trailers(None));
+                }
             }
         }
     }
