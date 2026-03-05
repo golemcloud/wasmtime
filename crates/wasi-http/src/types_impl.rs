@@ -880,7 +880,7 @@ where
                 let mut body =
                     HostIncomingBody::new(body, resp.between_bytes_timeout, field_size_limit);
                 if let Some(worker) = resp.worker {
-                    body.retain_worker(worker);
+                    body.retain_worker(worker, resp.worker_error_receiver);
                 }
                 body
             }),

@@ -12,6 +12,8 @@ use hyper::body::Body;
 use std::any::Any;
 use std::fmt;
 use std::time::Duration;
+use std::sync::Arc;
+use tokio::sync::watch;
 use wasmtime::component::{Resource, ResourceTable};
 use wasmtime::{Result, bail};
 use wasmtime_wasi::p2::Pollable;
@@ -418,7 +420,7 @@ pub async fn default_send_request_handler(
             }
         })?;
 
-    let (mut sender, worker) = if use_tls {
+    let (mut sender, worker, worker_err_rx) = if use_tls {
         use rustls::pki_types::ServerName;
 
         // derived from https://github.com/rustls/rustls/blob/main/examples/src/bin/simpleclient.rs
@@ -451,16 +453,15 @@ pub async fn default_send_request_handler(
         .map_err(|_| types::ErrorCode::ConnectionTimeout)?
         .map_err(hyper_request_error)?;
 
+        let (err_tx, err_rx) = watch::channel(None);
         let worker = wasmtime_wasi::runtime::spawn(async move {
-            match conn.await {
-                Ok(()) => {}
-                // TODO: shouldn't throw away this error and ideally should
-                // surface somewhere.
-                Err(e) => tracing::warn!("dropping error {e}"),
+            if let Err(e) = conn.await {
+                tracing::debug!("hyper connection worker error: {e:?}");
+                let _ = err_tx.send(Some(Arc::new(hyper_request_error(e))));
             }
         });
 
-        (sender, worker)
+        (sender, worker, err_rx)
     } else {
         let tcp_stream = TokioIo::new(tcp_stream);
         let (sender, conn) = timeout(
@@ -472,15 +473,15 @@ pub async fn default_send_request_handler(
         .map_err(|_| types::ErrorCode::ConnectionTimeout)?
         .map_err(hyper_request_error)?;
 
+        let (err_tx, err_rx) = watch::channel(None);
         let worker = wasmtime_wasi::runtime::spawn(async move {
-            match conn.await {
-                Ok(()) => {}
-                // TODO: same as above, shouldn't throw this error away.
-                Err(e) => tracing::warn!("dropping error {e}"),
+            if let Err(e) = conn.await {
+                tracing::debug!("hyper connection worker error: {e:?}");
+                let _ = err_tx.send(Some(Arc::new(hyper_request_error(e))));
             }
         });
 
-        (sender, worker)
+        (sender, worker, err_rx)
     };
 
     // at this point, the request contains the scheme and the authority, but
@@ -507,6 +508,7 @@ pub async fn default_send_request_handler(
         resp,
         worker: Some(worker),
         between_bytes_timeout,
+        worker_error_receiver: Some(worker_err_rx),
     })
 }
 
@@ -828,6 +830,13 @@ impl AsRef<HeaderMap> for FieldMap {
 pub type FutureIncomingResponseHandle =
     AbortOnDropJoinHandle<wasmtime::Result<Result<IncomingResponse, types::ErrorCode>>>;
 
+/// A shared receiver for connection worker errors.
+///
+/// The connection worker task sets this if the hyper connection driver
+/// encounters an error. The body stream checks it while reading to
+/// surface connection-level failures to the guest.
+pub type ConnWorkerErrorReceiver = watch::Receiver<Option<Arc<types::ErrorCode>>>;
+
 /// A response that is in the process of being received.
 #[derive(Debug)]
 pub struct IncomingResponse {
@@ -837,6 +846,8 @@ pub struct IncomingResponse {
     pub worker: Option<AbortOnDropJoinHandle<()>>,
     /// The timeout between chunks of the response.
     pub between_bytes_timeout: std::time::Duration,
+    /// Receives connection worker errors, if any.
+    pub worker_error_receiver: Option<ConnWorkerErrorReceiver>,
 }
 
 /// The concrete type behind a `wasi:http/types.future-incoming-response` resource.

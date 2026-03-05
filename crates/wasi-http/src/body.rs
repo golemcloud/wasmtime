@@ -1,7 +1,7 @@
 //! Implementation of the `wasi:http/types` interface's various body types.
 
 use crate::bindings::http::types;
-use crate::types::FieldMap;
+use crate::types::{ConnWorkerErrorReceiver, FieldMap};
 use bytes::Bytes;
 use http_body::{Body, Frame};
 use http_body_util::BodyExt;
@@ -30,6 +30,8 @@ pub struct HostIncomingBody {
     /// This ensures that if the parent of this body is dropped before the body
     /// then the backing data behind this worker is kept alive.
     worker: Option<AbortOnDropJoinHandle<()>>,
+    /// Receives errors from the connection worker task, if any.
+    worker_error_receiver: Option<ConnWorkerErrorReceiver>,
 }
 
 impl HostIncomingBody {
@@ -39,18 +41,33 @@ impl HostIncomingBody {
         between_bytes_timeout: Duration,
         field_size_limit: usize,
     ) -> HostIncomingBody {
-        let body = BodyWithTimeout::new(body, between_bytes_timeout);
+        let body = BodyWithTimeout::new(body, between_bytes_timeout, None);
         HostIncomingBody {
             body: IncomingBodyState::Start(body),
             field_size_limit,
             worker: None,
+            worker_error_receiver: None,
         }
     }
 
     /// Retain a worker task that needs to be kept alive while this body is being read.
-    pub fn retain_worker(&mut self, worker: AbortOnDropJoinHandle<()>) {
+    ///
+    /// If a `worker_error_receiver` is provided, connection worker errors will
+    /// be surfaced through the body stream during reads.
+    pub fn retain_worker(
+        &mut self,
+        worker: AbortOnDropJoinHandle<()>,
+        worker_error_receiver: Option<ConnWorkerErrorReceiver>,
+    ) {
         assert!(self.worker.is_none());
         self.worker = Some(worker);
+        if let Some(rx) = worker_error_receiver {
+            self.worker_error_receiver = Some(rx.clone());
+            // Also propagate to the body if it hasn't been taken yet
+            if let IncomingBodyState::Start(body) = &mut self.body {
+                body.worker_error_receiver = Some(rx);
+            }
+        }
     }
 
     /// Create a new `HostIncomingBody` that always fails with the given error.
@@ -59,6 +76,7 @@ impl HostIncomingBody {
             body: IncomingBodyState::Failing(Arc::from(error)),
             field_size_limit: 0,
             worker: None,
+            worker_error_receiver: None,
         }
     }
 
@@ -118,10 +136,16 @@ struct BodyWithTimeout {
     /// Maximal duration between when a frame is first requested and when it's
     /// allowed to arrive.
     between_bytes_timeout: Duration,
+    /// Receives errors from the connection worker task.
+    worker_error_receiver: Option<ConnWorkerErrorReceiver>,
 }
 
 impl BodyWithTimeout {
-    fn new(inner: HyperIncomingBody, between_bytes_timeout: Duration) -> BodyWithTimeout {
+    fn new(
+        inner: HyperIncomingBody,
+        between_bytes_timeout: Duration,
+        worker_error_receiver: Option<ConnWorkerErrorReceiver>,
+    ) -> BodyWithTimeout {
         BodyWithTimeout {
             inner,
             between_bytes_timeout,
@@ -129,6 +153,7 @@ impl BodyWithTimeout {
             timeout: Box::pin(wasmtime_wasi::runtime::with_ambient_tokio_runtime(|| {
                 tokio::time::sleep(Duration::new(0, 0))
             })),
+            worker_error_receiver,
         }
     }
 }
@@ -163,6 +188,25 @@ impl Body for BodyWithTimeout {
         // arrives then the sleep timer will be reset on the next frame.
         let result = Pin::new(&mut me.inner).poll_frame(cx);
         me.reset_sleep = result.is_ready();
+
+        // At end-of-stream (EOF or trailers), check if the connection worker
+        // reported an error. This surfaces connection-level failures that
+        // might not otherwise propagate through the body stream (e.g. the
+        // connection was reset after all data frames were sent but before
+        // a clean shutdown).
+        let is_end_of_stream = match &result {
+            Poll::Ready(None) => true,
+            Poll::Ready(Some(Ok(frame))) if !frame.is_data() => true,
+            _ => false,
+        };
+        if is_end_of_stream {
+            if let Some(rx) = me.worker_error_receiver.take() {
+                if let Some(err) = rx.borrow().as_ref() {
+                    return Poll::Ready(Some(Err(err.as_ref().clone())));
+                }
+            }
+        }
+
         result
     }
 }
