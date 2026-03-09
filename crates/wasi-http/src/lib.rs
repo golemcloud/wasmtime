@@ -280,6 +280,9 @@ pub use crate::types::{
     DEFAULT_OUTGOING_BODY_BUFFER_CHUNKS, DEFAULT_OUTGOING_BODY_CHUNK_SIZE, WasiHttpCtx,
     WasiHttpImpl, WasiHttpView,
 };
+#[cfg(feature = "default-send-request")]
+#[doc(inline)]
+pub use crate::types::{HttpConnectionPool, HttpConnectionPoolConfig};
 use http::header::CONTENT_LENGTH;
 use wasmtime::component::HasData;
 

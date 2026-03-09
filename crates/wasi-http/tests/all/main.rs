@@ -9,6 +9,8 @@ macro_rules! assert_test_exists {
 
 mod http_server;
 mod p2;
+#[cfg(feature = "default-send-request")]
+mod pool;
 #[cfg(feature = "p3")]
 mod p3;
 

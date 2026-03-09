@@ -32,6 +32,10 @@ pub struct HostIncomingBody {
     worker: Option<AbortOnDropJoinHandle<()>>,
     /// Receives errors from the connection worker task, if any.
     worker_error_receiver: Option<ConnWorkerErrorReceiver>,
+    /// Connection concurrency permits held while this body is being read.
+    /// Released when the body is dropped, allowing queued requests to proceed.
+    #[cfg(feature = "default-send-request")]
+    connection_permits: Option<crate::types::ConnectionPermits>,
 }
 
 impl HostIncomingBody {
@@ -47,6 +51,8 @@ impl HostIncomingBody {
             field_size_limit,
             worker: None,
             worker_error_receiver: None,
+            #[cfg(feature = "default-send-request")]
+            connection_permits: None,
         }
     }
 
@@ -70,6 +76,13 @@ impl HostIncomingBody {
         }
     }
 
+    /// Retain connection concurrency permits that should be held while this body
+    /// is being read. The permits are released when the body is dropped.
+    #[cfg(feature = "default-send-request")]
+    pub fn retain_connection_permits(&mut self, permits: Option<crate::types::ConnectionPermits>) {
+        self.connection_permits = permits;
+    }
+
     /// Create a new `HostIncomingBody` that always fails with the given error.
     pub fn failing(error: String) -> HostIncomingBody {
         HostIncomingBody {
@@ -77,6 +90,8 @@ impl HostIncomingBody {
             field_size_limit: 0,
             worker: None,
             worker_error_receiver: None,
+            #[cfg(feature = "default-send-request")]
+            connection_permits: None,
         }
     }
 

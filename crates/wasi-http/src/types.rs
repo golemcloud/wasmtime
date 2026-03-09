@@ -23,7 +23,10 @@ use wasmtime_wasi::runtime::AbortOnDropJoinHandle;
 use {
     crate::io::TokioIo,
     crate::{error::dns_error, hyper_request_error},
+    std::collections::HashMap,
+    std::sync::Weak,
     tokio::net::TcpStream,
+    tokio::sync::{OwnedSemaphorePermit, Semaphore},
     tokio::time::timeout,
 };
 
@@ -42,6 +45,12 @@ const DEFAULT_FIELD_SIZE_LIMIT: usize = 128 * 1024;
 pub struct WasiHttpCtx {
     /// The maximum size for any fields resources created by this context.
     pub field_size_limit: usize,
+    /// Optional HTTP connection pool for reusing outgoing connections.
+    ///
+    /// When `Some`, `default_send_request` will use pooled connections
+    /// instead of creating a new TCP+TLS connection per request.
+    #[cfg(feature = "default-send-request")]
+    pub connection_pool: Option<HttpConnectionPool>,
 }
 
 impl WasiHttpCtx {
@@ -49,6 +58,8 @@ impl WasiHttpCtx {
     pub fn new() -> Self {
         Self {
             field_size_limit: DEFAULT_FIELD_SIZE_LIMIT,
+            #[cfg(feature = "default-send-request")]
+            connection_pool: None,
         }
     }
 
@@ -61,6 +72,150 @@ impl WasiHttpCtx {
     /// names/values/etc.
     pub fn set_field_size_limit(&mut self, limit: usize) {
         self.field_size_limit = limit;
+    }
+}
+
+/// Configuration for the HTTP connection pool.
+#[cfg(feature = "default-send-request")]
+#[derive(Clone, Debug)]
+pub struct HttpConnectionPoolConfig {
+    /// Maximum number of idle connections per host. Default: 8.
+    pub max_idle_per_host: usize,
+    /// How long idle connections remain in the pool before being closed. Default: 90 seconds.
+    pub idle_timeout: Duration,
+    /// Timeout for establishing new TCP connections. Default: 30 seconds.
+    ///
+    /// This is a global setting applied to all connections created by the pool.
+    /// Per-request `connect_timeout` from `OutgoingRequestConfig` is not applied
+    /// when using the pool.
+    pub connect_timeout: Duration,
+    /// Maximum number of concurrent in-flight connections per host. Default: 20.
+    ///
+    /// When this limit is reached, new requests to the same host will wait
+    /// for an existing request to complete before proceeding. This prevents
+    /// overwhelming targets (e.g. Cloudflare) with too many simultaneous
+    /// TCP/TLS handshakes.
+    pub max_connections_per_host: usize,
+    /// Maximum total number of concurrent in-flight connections across all hosts. Default: 200.
+    ///
+    /// This prevents exhausting OS resources (file descriptors, ports, memory)
+    /// when connecting to many different hosts simultaneously.
+    pub max_total_connections: usize,
+    /// Maximum number of distinct host entries tracked in the per-host semaphore map. Default: 1024.
+    ///
+    /// When this limit is exceeded, stale entries (hosts with no active connections)
+    /// are opportunistically cleaned up.
+    pub max_host_entries: usize,
+}
+
+#[cfg(feature = "default-send-request")]
+impl Default for HttpConnectionPoolConfig {
+    fn default() -> Self {
+        Self {
+            max_idle_per_host: 8,
+            idle_timeout: Duration::from_secs(90),
+            connect_timeout: Duration::from_secs(30),
+            max_connections_per_host: 20,
+            max_total_connections: 200,
+            max_host_entries: 1024,
+        }
+    }
+}
+
+/// A shared HTTP connection pool backed by `hyper-util`'s legacy client.
+///
+/// This pool reuses TCP and TLS connections across requests to the same host,
+/// reducing connection establishment overhead. It is `Clone`-able and can be
+/// shared across multiple workers or contexts.
+///
+/// In addition to connection reuse, the pool enforces concurrency limits:
+/// - A per-host limit prevents overwhelming individual targets with too many
+///   simultaneous connections (e.g. triggering Cloudflare rate limiting).
+/// - A global limit prevents exhausting OS resources (file descriptors, ports).
+#[cfg(feature = "default-send-request")]
+#[derive(Clone)]
+pub struct HttpConnectionPool {
+    client: hyper_util::client::legacy::Client<
+        hyper_rustls::HttpsConnector<hyper_util::client::legacy::connect::HttpConnector>,
+        HyperOutgoingBody,
+    >,
+    global_semaphore: Arc<Semaphore>,
+    host_semaphores: Arc<tokio::sync::Mutex<HashMap<String, Weak<Semaphore>>>>,
+    max_connections_per_host: usize,
+    max_host_entries: usize,
+}
+
+#[cfg(feature = "default-send-request")]
+impl fmt::Debug for HttpConnectionPool {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("HttpConnectionPool").finish_non_exhaustive()
+    }
+}
+
+#[cfg(feature = "default-send-request")]
+impl HttpConnectionPool {
+    /// Create a new connection pool with the given configuration.
+    pub fn new(config: HttpConnectionPoolConfig) -> Self {
+        let root_cert_store = rustls::RootCertStore {
+            roots: webpki_roots::TLS_SERVER_ROOTS.into(),
+        };
+        let mut tls_config = rustls::ClientConfig::builder()
+            .with_root_certificates(root_cert_store)
+            .with_no_client_auth();
+        tls_config.alpn_protocols = vec![b"http/1.1".to_vec()];
+
+        let mut http_connector = hyper_util::client::legacy::connect::HttpConnector::new();
+        http_connector.enforce_http(false);
+        http_connector.set_connect_timeout(Some(config.connect_timeout));
+
+        // Construct the HttpsConnector directly via From<(H, C)> instead of
+        // using HttpsConnectorBuilder. The builder's enable_http1() leaves
+        // alpn_protocols empty, which causes HandshakeFailure with servers that
+        // require ALPN. The builder also asserts alpn_protocols is empty on
+        // input, so we cannot pre-set it. The From impl is equivalent to
+        // .https_or_http().wrap_connector() (force_https=false) but lets us
+        // keep the ALPN we configured above.
+        let https: hyper_rustls::HttpsConnector<_> =
+            (http_connector, tls_config).into();
+
+        let client = hyper_util::client::legacy::Client::builder(
+            hyper_util::rt::TokioExecutor::new(),
+        )
+        .pool_idle_timeout(config.idle_timeout)
+        .pool_max_idle_per_host(config.max_idle_per_host)
+        .build(https);
+
+        Self {
+            client,
+            global_semaphore: Arc::new(Semaphore::new(config.max_total_connections)),
+            host_semaphores: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            max_connections_per_host: config.max_connections_per_host,
+            max_host_entries: config.max_host_entries,
+        }
+    }
+
+    /// Get or create a semaphore for the given host key.
+    ///
+    /// Uses `Weak` references so that semaphores are naturally cleaned up when
+    /// all permits are released and no one holds an `Arc` to the semaphore.
+    async fn host_semaphore(&self, key: &str) -> Arc<Semaphore> {
+        let mut map = self.host_semaphores.lock().await;
+
+        if let Some(weak) = map.get(key) {
+            if let Some(strong) = weak.upgrade() {
+                return strong;
+            }
+        }
+
+        let sem = Arc::new(Semaphore::new(self.max_connections_per_host));
+        map.insert(key.to_string(), Arc::downgrade(&sem));
+
+        // Opportunistic cleanup when the map grows too large
+        if map.len() > self.max_host_entries {
+            map.retain(|_, w| w.strong_count() > 0);
+        }
+
+        sem
     }
 }
 
@@ -155,7 +310,7 @@ pub trait WasiHttpView {
         request: hyper::Request<HyperOutgoingBody>,
         config: OutgoingRequestConfig,
     ) -> crate::HttpResult<HostFutureIncomingResponse> {
-        Ok(default_send_request(request, config))
+        Ok(default_send_request_with_pool(request, config, self.connection_pool().cloned()))
     }
 
     /// Send an outgoing request.
@@ -182,6 +337,24 @@ pub trait WasiHttpView {
     /// Default: 1024 * 1024.
     fn outgoing_body_chunk_size(&mut self) -> usize {
         DEFAULT_OUTGOING_BODY_CHUNK_SIZE
+    }
+
+    /// Returns the connection pool for outgoing requests, if configured.
+    ///
+    /// When a pool is returned, `default_send_request` will reuse connections
+    /// instead of opening a new TCP+TLS connection per request.
+    ///
+    /// The default returns `None` (no pooling). Implementors who set a pool on
+    /// [`WasiHttpCtx::connection_pool`] should override this to return it, e.g.:
+    ///
+    /// ```ignore
+    /// fn connection_pool(&self) -> Option<&HttpConnectionPool> {
+    ///     self.http_ctx.connection_pool.as_ref()
+    /// }
+    /// ```
+    #[cfg(feature = "default-send-request")]
+    fn connection_pool(&self) -> Option<&HttpConnectionPool> {
+        None
     }
 }
 
@@ -227,6 +400,11 @@ impl<T: ?Sized + WasiHttpView> WasiHttpView for &mut T {
     fn outgoing_body_chunk_size(&mut self) -> usize {
         T::outgoing_body_chunk_size(self)
     }
+
+    #[cfg(feature = "default-send-request")]
+    fn connection_pool(&self) -> Option<&HttpConnectionPool> {
+        T::connection_pool(self)
+    }
 }
 
 impl<T: ?Sized + WasiHttpView> WasiHttpView for Box<T> {
@@ -265,6 +443,11 @@ impl<T: ?Sized + WasiHttpView> WasiHttpView for Box<T> {
 
     fn outgoing_body_chunk_size(&mut self) -> usize {
         T::outgoing_body_chunk_size(self)
+    }
+
+    #[cfg(feature = "default-send-request")]
+    fn connection_pool(&self) -> Option<&HttpConnectionPool> {
+        T::connection_pool(self)
     }
 }
 
@@ -365,16 +548,80 @@ pub struct OutgoingRequestConfig {
 /// The default implementation of how an outgoing request is sent.
 ///
 /// This implementation is used by the `wasi:http/outgoing-handler` interface
-/// default implementation.
+/// default implementation. Creates a new TCP+TLS connection per request
+/// without connection pooling.
 #[cfg(feature = "default-send-request")]
 pub fn default_send_request(
     request: hyper::Request<HyperOutgoingBody>,
     config: OutgoingRequestConfig,
 ) -> HostFutureIncomingResponse {
+    default_send_request_with_pool(request, config, None)
+}
+
+/// Like [`default_send_request`], but optionally uses a connection pool.
+///
+/// When `connection_pool` is `Some`, connections are reused across requests
+/// to the same host. When `None`, falls back to creating a new connection
+/// per request.
+#[cfg(feature = "default-send-request")]
+pub fn default_send_request_with_pool(
+    request: hyper::Request<HyperOutgoingBody>,
+    config: OutgoingRequestConfig,
+    connection_pool: Option<HttpConnectionPool>,
+) -> HostFutureIncomingResponse {
     let handle = wasmtime_wasi::runtime::spawn(async move {
-        Ok(default_send_request_handler(request, config).await)
+        if let Some(pool) = connection_pool {
+            Ok(pooled_send_request_handler(request, config, pool).await)
+        } else {
+            Ok(default_send_request_handler(request, config).await)
+        }
     });
     HostFutureIncomingResponse::pending(handle)
+}
+
+/// Maximum depth to walk error source chains to avoid pathological cycles.
+#[cfg(feature = "default-send-request")]
+const MAX_ERROR_CHAIN_DEPTH: usize = 32;
+
+/// Walk the error source chain to find a `rustls::Error`, if one exists.
+#[cfg(feature = "default-send-request")]
+fn find_rustls_error<'a>(err: &'a (dyn std::error::Error + 'static)) -> Option<&'a rustls::Error> {
+    let mut cur: &(dyn std::error::Error + 'static) = err;
+    for _ in 0..MAX_ERROR_CHAIN_DEPTH {
+        if let Some(r) = cur.downcast_ref::<rustls::Error>() {
+            return Some(r);
+        }
+        cur = cur.source()?;
+    }
+    None
+}
+
+/// Walk the error source chain to find a `std::io::Error`, if one exists.
+#[cfg(feature = "default-send-request")]
+fn find_io_error<'a>(err: &'a (dyn std::error::Error + 'static)) -> Option<&'a std::io::Error> {
+    let mut cur: &(dyn std::error::Error + 'static) = err;
+    for _ in 0..MAX_ERROR_CHAIN_DEPTH {
+        if let Some(io_err) = cur.downcast_ref::<std::io::Error>() {
+            return Some(io_err);
+        }
+        cur = cur.source()?;
+    }
+    None
+}
+
+/// Walk the error source chain to find a `tokio::time::error::Elapsed`, if one exists.
+#[cfg(feature = "default-send-request")]
+fn find_elapsed_error<'a>(
+    err: &'a (dyn std::error::Error + 'static),
+) -> Option<&'a tokio::time::error::Elapsed> {
+    let mut cur: &(dyn std::error::Error + 'static) = err;
+    for _ in 0..MAX_ERROR_CHAIN_DEPTH {
+        if let Some(elapsed) = cur.downcast_ref::<tokio::time::error::Elapsed>() {
+            return Some(elapsed);
+        }
+        cur = cur.source()?;
+    }
+    None
 }
 
 /// The underlying implementation of how an outgoing request is sent. This should likely be spawned
@@ -440,6 +687,44 @@ pub async fn default_send_request_handler(
             })?
             .to_owned();
         let stream = connector.connect(domain, tcp_stream).await.map_err(|e| {
+            // Check the io::Error kind directly first
+            match e.kind() {
+                std::io::ErrorKind::ConnectionRefused => {
+                    tracing::warn!("tls connection refused: {e:?}");
+                    return types::ErrorCode::ConnectionRefused;
+                }
+                std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::ConnectionAborted
+                | std::io::ErrorKind::BrokenPipe
+                | std::io::ErrorKind::UnexpectedEof => {
+                    tracing::warn!("tls connection terminated: {e:?}");
+                    return types::ErrorCode::ConnectionTerminated;
+                }
+                std::io::ErrorKind::TimedOut => {
+                    tracing::warn!("tls connection timed out: {e:?}");
+                    return types::ErrorCode::ConnectionTimeout;
+                }
+                _ => {}
+            }
+            // Walk the error chain to find a rustls-specific error
+            if let Some(rustls_err) = find_rustls_error(&e) {
+                match rustls_err {
+                    rustls::Error::InvalidCertificate(_) => {
+                        tracing::warn!("tls certificate error: {e:?}");
+                        return types::ErrorCode::TlsCertificateError;
+                    }
+                    rustls::Error::AlertReceived(alert) => {
+                        tracing::warn!("tls alert received: {e:?}");
+                        return types::ErrorCode::TlsAlertReceived(
+                            crate::bindings::http::types::TlsAlertReceivedPayload {
+                                alert_id: Some(alert.get_u8()),
+                                alert_message: Some(format!("{alert:?}")),
+                            },
+                        );
+                    }
+                    _ => {}
+                }
+            }
             tracing::warn!("tls protocol error: {e:?}");
             types::ErrorCode::TlsProtocolError
         })?;
@@ -509,6 +794,204 @@ pub async fn default_send_request_handler(
         worker: Some(worker),
         between_bytes_timeout,
         worker_error_receiver: Some(worker_err_rx),
+        #[cfg(feature = "default-send-request")]
+        connection_permits: None,
+    })
+}
+
+/// Construct a normalized host key for per-host semaphore lookup.
+///
+/// The key is `"{scheme}://{host}:{port}"` with:
+/// - Scheme canonicalized to lowercase `"http"` or `"https"`
+/// - Host lowercased (DNS names are case-insensitive)
+/// - Default ports (80 for HTTP, 443 for HTTPS) filled in
+///
+/// This ensures that `Example.com`, `example.com:443`, and `HTTPS://example.com`
+/// all map to the same semaphore.
+#[cfg(feature = "default-send-request")]
+fn make_host_key(scheme: &str, authority: &http::uri::Authority) -> String {
+    let scheme = if scheme.eq_ignore_ascii_case("https") { "https" } else { "http" };
+    let host = authority.host().to_ascii_lowercase();
+    let port = authority.port_u16().unwrap_or(if scheme == "https" { 443 } else { 80 });
+    format!("{scheme}://{host}:{port}")
+}
+
+/// Send a request using a pooled connection via `hyper-util`'s legacy client.
+///
+/// The client handles TCP connection, TLS handshake, connection pooling,
+/// keep-alive, and connection health checks automatically.
+///
+/// Concurrency is limited by acquiring per-host and global semaphore permits
+/// before sending the request. Permits are held until the response (including
+/// body) is dropped.
+#[cfg(feature = "default-send-request")]
+async fn pooled_send_request_handler(
+    request: hyper::Request<HyperOutgoingBody>,
+    config: OutgoingRequestConfig,
+    pool: HttpConnectionPool,
+) -> Result<IncomingResponse, types::ErrorCode> {
+    // Validate that the request URI is absolute (has scheme + authority).
+    // The pooled connector requires an absolute URI to determine host and TLS.
+    let scheme = request
+        .uri()
+        .scheme_str()
+        .ok_or(types::ErrorCode::HttpRequestUriInvalid)?;
+    let authority = request
+        .uri()
+        .authority()
+        .ok_or(types::ErrorCode::HttpRequestUriInvalid)?
+        .clone();
+    let scheme_is_http = scheme.eq_ignore_ascii_case("http");
+    let scheme_is_https = scheme.eq_ignore_ascii_case("https");
+    if !scheme_is_http && !scheme_is_https {
+        return Err(types::ErrorCode::HttpProtocolError);
+    }
+    // Validate that use_tls matches the URI scheme. The pooled connector uses the
+    // URI scheme to decide whether to use TLS, so a mismatch would lead to silent
+    // behavioral divergence from the non-pooled path.
+    let scheme_is_tls = scheme_is_https;
+    if config.use_tls != scheme_is_tls {
+        tracing::warn!(
+            "pooled request use_tls={} but URI scheme is {scheme:?}",
+            config.use_tls
+        );
+        return Err(types::ErrorCode::HttpProtocolError);
+    }
+
+    let between_bytes_timeout = config.between_bytes_timeout;
+    let first_byte_timeout = config.first_byte_timeout;
+
+    // Use a single deadline for both semaphore acquisitions so the total wait
+    // never exceeds connect_timeout (rather than 2× connect_timeout).
+    let acquire_deadline = tokio::time::Instant::now() + config.connect_timeout;
+
+    // Acquire concurrency permits: per-host first, then global.
+    // Per-host first avoids global permit hoarding where a burst to one host
+    // grabs all global permits while waiting on per-host, starving other hosts.
+    let host_key = make_host_key(scheme, &authority);
+    let host_sem = pool.host_semaphore(&host_key).await;
+
+    tracing::debug!(
+        host_key = %host_key,
+        "pooled: acquiring per-host permit"
+    );
+    let host_permit = tokio::time::timeout_at(acquire_deadline, host_sem.acquire_owned())
+        .await
+        .map_err(|_| {
+            tracing::warn!(host_key = %host_key, "pooled: timed out waiting for per-host permit");
+            types::ErrorCode::ConnectionTimeout
+        })?
+        .map_err(|_| {
+            tracing::warn!(host_key = %host_key, "pooled: per-host semaphore closed");
+            types::ErrorCode::ConnectionTimeout
+        })?;
+
+    tracing::debug!("pooled: acquiring global permit");
+    let global_permit = tokio::time::timeout_at(acquire_deadline, pool.global_semaphore.clone().acquire_owned())
+        .await
+        .map_err(|_| {
+            tracing::warn!("pooled: timed out waiting for global permit");
+            types::ErrorCode::ConnectionTimeout
+        })?
+        .map_err(|_| {
+            tracing::warn!("pooled: global semaphore closed");
+            types::ErrorCode::ConnectionTimeout
+        })?;
+
+    let uri = request.uri().clone();
+    tracing::debug!(
+        %uri,
+        use_tls = config.use_tls,
+        "pooled: sending request"
+    );
+
+    let resp = timeout(first_byte_timeout, pool.client.request(request))
+        .await
+        .map_err(|_| types::ErrorCode::ConnectionReadTimeout)?
+        .map_err(|e| {
+            // hyper_util::client::legacy::Error wraps hyper errors and
+            // connector errors. Try to extract a more specific ErrorCode.
+            if e.is_connect() {
+                // Connection-phase error: could be DNS, TCP, or TLS.
+                // Walk the full error chain since hyper-util wraps errors
+                // in multiple layers.
+                if let Some(io_err) = find_io_error(&e) {
+                    match io_err.kind() {
+                        std::io::ErrorKind::ConnectionRefused => {
+                            tracing::warn!("pooled connection refused: {e:?}");
+                            return types::ErrorCode::ConnectionRefused;
+                        }
+                        std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::ConnectionAborted
+                        | std::io::ErrorKind::BrokenPipe
+                        | std::io::ErrorKind::UnexpectedEof => {
+                            tracing::warn!("pooled connection terminated: {e:?}");
+                            return types::ErrorCode::ConnectionTerminated;
+                        }
+                        std::io::ErrorKind::TimedOut => {
+                            tracing::warn!("pooled connection timed out: {e:?}");
+                            return types::ErrorCode::ConnectionTimeout;
+                        }
+                        _ => {}
+                    }
+                    // Check for DNS-related errors (matches non-pooled path logic)
+                    if io_err.kind() == std::io::ErrorKind::AddrNotAvailable
+                        || io_err
+                            .to_string()
+                            .starts_with("failed to lookup address information")
+                    {
+                        tracing::warn!("pooled dns error: {e:?}");
+                        return crate::error::dns_error(
+                            "address not available".to_string(),
+                            0,
+                        );
+                    }
+                }
+                // Check for tokio timeout errors that may be wrapped
+                // in the hyper-util error chain (e.g. pool connect timeout).
+                if find_elapsed_error(&e).is_some() {
+                    tracing::warn!("pooled connection timed out (elapsed): {e:?}");
+                    return types::ErrorCode::ConnectionTimeout;
+                }
+                if let Some(rustls_err) = find_rustls_error(&e) {
+                    match rustls_err {
+                        rustls::Error::InvalidCertificate(_) => {
+                            tracing::warn!("pooled tls certificate error: {e:?}");
+                            return types::ErrorCode::TlsCertificateError;
+                        }
+                        rustls::Error::AlertReceived(alert) => {
+                            tracing::warn!("pooled tls alert received: {e:?}");
+                            return types::ErrorCode::TlsAlertReceived(
+                                crate::bindings::http::types::TlsAlertReceivedPayload {
+                                    alert_id: Some(alert.get_u8()),
+                                    alert_message: Some(format!("{alert:?}")),
+                                },
+                            );
+                        }
+                        _ => {
+                            tracing::warn!("pooled tls protocol error: {e:?}");
+                            return types::ErrorCode::TlsProtocolError;
+                        }
+                    }
+                }
+                tracing::warn!(%uri, "pooled connection error: {e:?}");
+                types::ErrorCode::DestinationUnavailable
+            } else {
+                tracing::warn!("pooled request error: {e:?}");
+                types::ErrorCode::HttpProtocolError
+            }
+        })?
+        .map(|body| body.map_err(hyper_request_error).boxed_unsync());
+
+    Ok(IncomingResponse {
+        resp,
+        worker: None,
+        between_bytes_timeout,
+        worker_error_receiver: None,
+        connection_permits: Some(ConnectionPermits {
+            _host: host_permit,
+            _global: global_permit,
+        }),
     })
 }
 
@@ -837,6 +1320,24 @@ pub type FutureIncomingResponseHandle =
 /// surface connection-level failures to the guest.
 pub type ConnWorkerErrorReceiver = watch::Receiver<Option<Arc<types::ErrorCode>>>;
 
+/// Holds semaphore permits for connection concurrency limiting.
+///
+/// When this struct is dropped, the permits are released, allowing
+/// queued requests to proceed. The permits are acquired per-host first,
+/// then globally, to avoid global permit hoarding.
+#[cfg(feature = "default-send-request")]
+pub struct ConnectionPermits {
+    _host: OwnedSemaphorePermit,
+    _global: OwnedSemaphorePermit,
+}
+
+#[cfg(feature = "default-send-request")]
+impl fmt::Debug for ConnectionPermits {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ConnectionPermits").finish_non_exhaustive()
+    }
+}
+
 /// A response that is in the process of being received.
 #[derive(Debug)]
 pub struct IncomingResponse {
@@ -848,6 +1349,10 @@ pub struct IncomingResponse {
     pub between_bytes_timeout: std::time::Duration,
     /// Receives connection worker errors, if any.
     pub worker_error_receiver: Option<ConnWorkerErrorReceiver>,
+    /// Connection concurrency permits. Released when the response is dropped,
+    /// allowing queued requests to proceed.
+    #[cfg(feature = "default-send-request")]
+    pub connection_permits: Option<ConnectionPermits>,
 }
 
 /// The concrete type behind a `wasi:http/types.future-incoming-response` resource.

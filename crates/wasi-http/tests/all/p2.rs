@@ -13,7 +13,7 @@ use wasmtime::{
     error::Context as _,
     format_err,
 };
-use wasmtime_wasi::{WasiCtx, WasiCtxView, WasiView, p2::pipe::MemoryOutputPipe};
+use wasmtime_wasi::{IoCtx, WasiCtx, WasiCtxView, WasiView, p2::pipe::MemoryOutputPipe};
 use wasmtime_wasi_http::{
     HttpResult, WasiHttpCtx, WasiHttpView,
     bindings::http::types::{ErrorCode, Scheme},
@@ -31,6 +31,7 @@ type RequestSender = Arc<
 struct Ctx {
     table: ResourceTable,
     wasi: WasiCtx,
+    io_ctx: IoCtx,
     http: WasiHttpCtx,
     stdout: MemoryOutputPipe,
     stderr: MemoryOutputPipe,
@@ -43,6 +44,7 @@ impl WasiView for Ctx {
         WasiCtxView {
             ctx: &mut self.wasi,
             table: &mut self.table,
+            io_ctx: &mut self.io_ctx,
         }
     }
 }
@@ -89,9 +91,11 @@ fn store(engine: &Engine, server: &Server) -> Store<Ctx> {
     builder.stdout(stdout.clone());
     builder.stderr(stderr.clone());
     builder.env("HTTP_SERVER", &server.addr());
+    let (wasi, io_ctx) = builder.build();
     let ctx = Ctx {
         table: ResourceTable::new(),
-        wasi: builder.build(),
+        wasi,
+        io_ctx,
         http: WasiHttpCtx::new(),
         stderr,
         stdout,
@@ -116,7 +120,7 @@ impl Drop for Ctx {
 }
 
 mod async_;
-mod sync;
+// Note: sync tests are removed because this fork does not have p2 sync APIs.
 
 async fn run_wasi_http(
     component_filename: &str,
@@ -141,7 +145,7 @@ async fn run_wasi_http(
     let mut builder = WasiCtx::builder();
     builder.stdout(stdout.clone());
     builder.stderr(stderr.clone());
-    let wasi = builder.build();
+    let (wasi, io_ctx) = builder.build();
     let mut http = WasiHttpCtx::new();
     if let Some(limit) = field_size_limit {
         http.set_field_size_limit(limit);
@@ -149,6 +153,7 @@ async fn run_wasi_http(
     let ctx = Ctx {
         table,
         wasi,
+        io_ctx,
         http,
         stderr,
         stdout,
@@ -303,6 +308,7 @@ async fn do_wasi_http_hash_all(override_send_request: bool) -> Result<()> {
                         }),
                         worker: None,
                         between_bytes_timeout,
+                        worker_error_receiver: None,
                     })
                 });
                 HostFutureIncomingResponse::ready(response)

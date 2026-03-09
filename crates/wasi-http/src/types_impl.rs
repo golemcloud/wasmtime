@@ -882,6 +882,8 @@ where
                 if let Some(worker) = resp.worker {
                     body.retain_worker(worker, resp.worker_error_receiver);
                 }
+                #[cfg(feature = "default-send-request")]
+                body.retain_connection_permits(resp.connection_permits);
                 body
             }),
         })?;
