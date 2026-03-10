@@ -174,7 +174,7 @@ impl streams::HostOutputStream for ResourceTable {
         Ok(())
     }
 
-    fn check_write(&mut self, stream: Resource<DynOutputStream>) -> StreamResult<u64> {
+    async fn check_write(&mut self, stream: Resource<DynOutputStream>) -> StreamResult<u64> {
         let bytes = self.get_mut(&stream)?.check_write()?;
         Ok(bytes as u64)
     }

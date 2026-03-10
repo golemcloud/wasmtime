@@ -35,7 +35,7 @@ The key themes are:
 | **Suspend support** | The `wasi:io/poll` implementation must be able to signal the host that a worker should be **suspended** instead of blocking, when all polled resources support it and the wait would exceed a configurable threshold. |
 | **Async host functions** | Many previously-synchronous WASI host functions are converted to `async` so the durable executor can **intercept and replay** them. If upstream makes additional functions async in a newer version, that is fine — Golem will adapt. But any function that our fork makes async **must remain async** in the new fork. |
 | **Stream downcasting** | `InputStream` and `OutputStream` gain `Any` supertrait and `as_any()` so Golem can inspect the **concrete type** of a stream at runtime to make durability decisions. |
-| **Durable HTTP** | HTTP outgoing requests can be **deferred** and failing response bodies can be constructed, enabling Golem's durable HTTP connection support. |
+| **Durable HTTP** | HTTP outgoing requests can be **deferred** and failing response bodies can be constructed, enabling Golem's durable HTTP connection support. Connection pooling with per-host and global concurrency limits is available. Connection worker errors are propagated to the body stream. Error classification maps TLS and connection failures to specific WASI `ErrorCode` variants. |
 | **Filesystem path tracking** | `File` / `Dir` descriptors store the host filesystem path so the durable executor can persist and restore file system state. |
 
 ---
@@ -107,6 +107,11 @@ must be reflected in Golem):
 | `HostIncomingBody::failing(error)` | `wasmtime-wasi-http` | Reconstructing failed HTTP bodies during replay |
 | `HostIncomingBody::take_stream() -> Option<Box<dyn InputStream>>` | `wasmtime-wasi-http` | HTTP body stream handling |
 | `get_fields()` (pub) | `wasmtime-wasi-http` | Trailer serialization for oplog |
+| `HttpConnectionPool`, `HttpConnectionPoolConfig` | `wasmtime-wasi-http` | Connection pooling with concurrency limits |
+| `default_send_request_with_pool()` | `wasmtime-wasi-http` | Pooled HTTP request dispatch |
+| `WasiHttpView::connection_pool()` | `wasmtime-wasi-http` | Pool access from host view trait |
+| `WasiHttpCtx::connection_pool` (pub field) | `wasmtime-wasi-http` | Pool storage on HTTP context |
+| `IncomingResponse::worker_error_receiver` | `wasmtime-wasi-http` | Connection worker error propagation |
 | `File { pub path: PathBuf }`, `Dir { pub path: PathBuf }` | `wasmtime-wasi` | Durable `stat`, read-only enforcement |
 | `ReaddirIterator::new()` (pub) | `wasmtime-wasi` | Deterministic directory listing |
 | `ResourceTable::get_any()` (immutable) | `wasmtime` | Override-following logic (internal) |
@@ -225,7 +230,8 @@ a dynamic override mechanism is added:
 
 - **Override-following logic** (`crates/wasi-io/src/impls.rs`): A new function
   `get_pollable_following_overrides()` follows the chain of overrides until it finds
-  a pollable without one. Called in `poll()`, `block()`, and `ready()`.
+  a pollable without one (with a `MAX_POLLABLE_OVERRIDE_CHAIN` depth limit of 64 to
+  guard against infinite loops). Called in `poll()`, `block()`, and `ready()`.
 
 - **`ResourceTable::get_any()`** (`crates/wasmtime/src/runtime/component/resource_table.rs`):
   New immutable accessor (counterpart to existing `get_any_mut()`) needed by the
@@ -350,6 +356,7 @@ The `bindgen!` macro invocations are modified to mark more imports as async:
 ```
 [method]input-stream.read
 [method]input-stream.skip
+[method]output-stream.check-write
 [method]output-stream.flush
 [method]output-stream.write
 [method]output-stream.write-zeroes
@@ -403,7 +410,7 @@ The corresponding host implementations change from `fn` to `async fn`:
 - `resolve_addresses()`
 
 #### IO streams (`crates/wasi-io/src/impls.rs`):
-- `HostOutputStream`: `write()`, `write_zeroes()`, `flush()`, `splice()`
+- `HostOutputStream`: `check_write()`, `write()`, `write_zeroes()`, `flush()`, `splice()`
 - `HostInputStream`: `read()`, `skip()`
 
 #### Sync IO wrappers (`crates/wasi/src/p2/host/io.rs`):
@@ -505,13 +512,143 @@ executor to defer request execution until the response is actually needed.
 - `HostFutureTrailers::ready()` handles the `Failing` state by producing
   `ErrorCode::ConnectionTerminated`.
 
-### 7.4 Exposed HTTP internals
+### 7.4 HTTP connection pooling
+
+**Files:** `crates/wasi-http/src/types.rs`, `crates/wasi-http/src/lib.rs`, `crates/wasi-http/Cargo.toml`
+
+A new connection pooling layer for outgoing HTTP requests, backed by `hyper-util`'s
+`Client` with keep-alive and `hyper-rustls` for TLS:
+
+- **`HttpConnectionPoolConfig`** — configuration struct:
+  ```rust
+  pub struct HttpConnectionPoolConfig {
+      pub max_idle_per_host: usize,   // default: 32
+      pub idle_timeout: Duration,      // default: 90s
+      pub connect_timeout: Duration,   // default: 30s
+  }
+  ```
+
+- **`HttpConnectionPool`** — `Clone`-able pool (Arc-based internally):
+  ```rust
+  pub struct HttpConnectionPool {
+      client: Client<..., HyperOutgoingBody>,
+      global_semaphore: Arc<Semaphore>,
+      max_connections_per_host: usize,
+      // per-host semaphores, host entry limits...
+  }
+  ```
+
+  With per-host (`max_connections_per_host`, default 16) and global
+  (`max_total_connections`, default 128) concurrency limiting via Tokio semaphores.
+  Per-host semaphores are acquired first, then global, to avoid global permit
+  hoarding.
+
+- **`WasiHttpView::connection_pool()`** — new trait method (gated on
+  `default-send-request` feature):
+  ```rust
+  fn connection_pool(&self) -> Option<&HttpConnectionPool> { None }
+  ```
+
+- **`WasiHttpCtx::connection_pool`** — optional field on the HTTP context:
+  ```rust
+  pub struct WasiHttpCtx {
+      // ... existing fields ...
+      pub connection_pool: Option<HttpConnectionPool>,
+  }
+  ```
+
+- **`default_send_request_with_pool()`** — new function that dispatches to either
+  `pooled_send_request_handler()` or `default_send_request_handler()` depending on
+  whether a pool is provided. The `WasiHttpView::send_request()` default
+  implementation now calls `default_send_request_with_pool()`.
+
+- **`ConnectionPermits`** struct — holds `OwnedSemaphorePermit` for host and global
+  semaphores. Carried through `IncomingResponse` → `HostIncomingBody` and released
+  when the response body is fully consumed/dropped.
+
+- **New dependencies** (optional, gated on `default-send-request`):
+  `hyper-util` (client-legacy, http1, tokio) and `hyper-rustls` (http1, webpki-roots).
+
+### 7.5 Improved HTTP error classification
+
+**File:** `crates/wasi-http/src/types.rs`
+
+Both the non-pooled (`default_send_request_handler`) and pooled
+(`pooled_send_request_handler`) paths now map connection and TLS errors to specific
+WASI `ErrorCode` variants instead of the previous catch-all `TlsProtocolError`:
+
+| Error condition | `ErrorCode` variant |
+|---|---|
+| `ConnectionRefused` | `ConnectionRefused` |
+| `ConnectionReset` / `ConnectionAborted` / `BrokenPipe` / `UnexpectedEof` | `ConnectionTerminated` |
+| `TimedOut` | `ConnectionTimeout` |
+| `rustls::Error::InvalidCertificate` | `TlsCertificateError` |
+| `rustls::Error::AlertReceived(alert)` | `TlsAlertReceived { alert_id, alert_message }` |
+| DNS failure (pooled path) | `DnsError` or `DestinationUnavailable` |
+
+Helper functions `find_rustls_error()`, `find_io_error()`, and `find_elapsed_error()`
+walk the error source chain (with a `MAX_ERROR_CHAIN_DEPTH` guard of 32) to extract
+typed errors from hyper/hyper-util's nested error wrappers.
+
+### 7.6 Connection worker error propagation
+
+**Files:** `crates/wasi-http/src/types.rs`, `crates/wasi-http/src/body.rs`
+
+Connection worker errors are no longer silently discarded (fixing the upstream TODO).
+Instead:
+
+- A `watch::channel<Option<Arc<types::ErrorCode>>>` is created alongside the
+  connection worker task. If the hyper connection driver fails, the error is sent
+  through the channel.
+- `IncomingResponse` gains a `worker_error_receiver: Option<ConnWorkerErrorReceiver>`
+  field.
+- `HostIncomingBody::retain_worker()` accepts an optional
+  `ConnWorkerErrorReceiver` and propagates it to the `BodyWithTimeout`.
+- `BodyWithTimeout::poll_frame()` checks the error receiver at end-of-stream (EOF
+  or trailers). If the connection worker reported an error, it surfaces it as a
+  body frame error instead of silently succeeding.
+
+### 7.7 Exposed HTTP internals
 
 - `get_fields()` in `crates/wasi-http/src/types_impl.rs` made `pub` and re-exported
   from `crates/wasi-http/src/lib.rs` as `pub use crate::types_impl::get_fields;`.
 - `OutgoingRequestConfig` (`crates/wasi-http/src/types.rs`) gains `#[derive(Debug)]`.
+- `WasiHttpCtx::field_size_limit` made `pub` (was accessed only through setter).
 
-### 7.5 How Golem uses HTTP durability
+### 7.8 HTTP request validation fixes
+
+**File:** `crates/wasi-http/src/http_impl.rs`
+
+- **`request-options` error propagation**: Invalid `RequestOptions` resource handles
+  are no longer silently ignored. Changed from
+  `options.and_then(|opts| self.table().get(&opts).ok())` to
+  `options.map(|opts| self.table().get(&opts)).transpose()?`, which correctly traps
+  on invalid/dead resources per component-model semantics.
+
+- **Empty authority rejection**: Requests with a missing or empty authority are now
+  rejected with `ErrorCode::HttpRequestUriInvalid` instead of producing an invalid
+  URI with an empty authority string.
+
+### 7.9 Body stream EOF signaling fix
+
+**File:** `crates/wasi-http/src/body.rs`
+
+When a body stream reaches EOF without trailers, the `tx` oneshot sender now
+explicitly sends `StreamEnd::Trailers(None)` instead of being silently dropped.
+This makes the intent clear and avoids relying on the implicit `Err` from a dropped
+`oneshot::Sender`.
+
+### 7.10 `OutgoingBody::finish` table-delete ordering fix
+
+**File:** `crates/wasi-http/src/types_impl.rs`
+
+The ordering of operations in `OutgoingBody::finish()` was fixed: trailers are now
+moved/computed before the body is deleted from the resource table. Previously, the
+body was deleted first, meaning if `move_fields()` failed, the body would be dropped
+without calling `finish()` or `abort()`, potentially hanging the underlying body
+future.
+
+### 7.11 How Golem uses HTTP durability
 
 Golem's durable HTTP layer lives in `golem-worker-executor/src/durable_host/http/`.
 The full lifecycle:
@@ -739,7 +876,12 @@ major feature group to catch issues early.
     regenerated bindings are consistent.
 12. **wasi-http durability** — Inline bindings (async-only), add `Deferred` variant,
     `failing()` body, `FailingStream`, boxed `take_stream()`, `get_fields` pub, `Debug`
-    on `OutgoingRequestConfig`.
+    on `OutgoingRequestConfig`. Add connection pooling (`HttpConnectionPool`,
+    `HttpConnectionPoolConfig`, `default_send_request_with_pool()`, `connection_pool()`
+    trait method, `hyper-util`/`hyper-rustls` dependencies). Add error classification
+    (TLS/connection error mapping), worker error propagation (`watch` channel),
+    request validation fixes (authority, options), body EOF signaling fix, and
+    `OutgoingBody::finish` ordering fix.
 13. **Filesystem path tracking** — Add `path: PathBuf` to `File`/`Dir`, propagate
     through constructors, `preopened_dir()`, and `open_at`.
 14. **Misc** — `VERSION` constant, re-exports in `wasmtime-wasi`, `ReaddirIterator` pub.
@@ -802,11 +944,12 @@ files in newer versions.
 - `crates/wasi/src/p2/ip_name_lookup.rs` — async conversion, `subscribe()` call site update
 
 **Modified files — `crates/wasi-http/` (wasmtime-wasi-http crate):**
-- `crates/wasi-http/src/lib.rs` — inlined async-only bindings, removed sync linker, `get_fields` re-export
-- `crates/wasi-http/src/types.rs` — `Deferred` variant, `deferred()` constructor, `Debug` on config, `io_ctx()` on `WasiHttpImpl`
-- `crates/wasi-http/src/types_impl.rs` — async conversions, deferred request execution, `get_fields` pub, `subscribe()` call site update
-- `crates/wasi-http/src/http_impl.rs` — `handle()` async conversion
-- `crates/wasi-http/src/body.rs` — `failing()` constructor, `FailingStream`, boxed `take_stream()`, `as_any()` impls
+- `crates/wasi-http/Cargo.toml` — added `hyper-util`, `hyper-rustls` optional dependencies for connection pooling
+- `crates/wasi-http/src/lib.rs` — inlined async-only bindings, removed sync linker, `get_fields` re-export, `HttpConnectionPool`/`HttpConnectionPoolConfig` re-exports
+- `crates/wasi-http/src/types.rs` — `Deferred` variant, `deferred()` constructor, `Debug` on config, `io_ctx()` on `WasiHttpImpl`, `HttpConnectionPool`, `HttpConnectionPoolConfig`, `default_send_request_with_pool()`, `pooled_send_request_handler()`, `ConnectionPermits`, `ConnWorkerErrorReceiver`, error classification helpers, `WasiHttpView::connection_pool()`, `WasiHttpCtx::connection_pool` field, worker error propagation
+- `crates/wasi-http/src/types_impl.rs` — async conversions, deferred request execution, `get_fields` pub, `subscribe()` call site update, `OutgoingBody::finish` ordering fix, `retain_worker()` error receiver, `retain_connection_permits()`
+- `crates/wasi-http/src/http_impl.rs` — `handle()` async conversion, request-options error propagation fix, empty authority rejection
+- `crates/wasi-http/src/body.rs` — `failing()` constructor, `FailingStream`, boxed `take_stream()`, `as_any()` impls, `ConnWorkerErrorReceiver` on `HostIncomingBody`/`BodyWithTimeout`, EOF signaling fix, `retain_connection_permits()`, `retain_worker()` signature change
 
 **Modified files — `crates/wasmtime/` (wasmtime crate):**
 - `crates/wasmtime/src/lib.rs` — `VERSION` constant
@@ -997,9 +1140,16 @@ The following crates pass `cargo check` successfully:
 | `InputStream: Any`, `as_any()` | `wasmtime-wasi-io` | ✅ Same |
 | `OutputStream: Any`, `as_any()` | `wasmtime-wasi-io` | ✅ Same |
 | `HostFutureIncomingResponse::deferred()` | `wasmtime-wasi-http` | ✅ Same |
-| `HostIncomingBody::failing(error)` | `wasmtime-wasi-http` | ✅ Same |
+| `HostIncomingBody::failing(error)` | `wasmtime-wasi-http` | ⚠️ `Failing` state uses `Arc<str>` (was `String`) |
 | `HostIncomingBody::take_stream() -> Option<Box<dyn InputStream>>` | `wasmtime-wasi-http` | ✅ Same |
 | `get_fields()` (pub) | `wasmtime-wasi-http` | ✅ Same |
+| `HttpConnectionPool`, `HttpConnectionPoolConfig` | `wasmtime-wasi-http` | 🆕 New connection pooling API |
+| `default_send_request_with_pool()` | `wasmtime-wasi-http` | 🆕 New pooled request dispatch |
+| `WasiHttpView::connection_pool()` | `wasmtime-wasi-http` | 🆕 New trait method (default returns `None`) |
+| `WasiHttpCtx::connection_pool` (pub field) | `wasmtime-wasi-http` | 🆕 New optional field |
+| `IncomingResponse::worker_error_receiver` | `wasmtime-wasi-http` | 🆕 New field for error propagation |
+| `IncomingResponse::connection_permits` | `wasmtime-wasi-http` | 🆕 New field for concurrency permits |
+| `HostOutputStream::check_write` (async) | `wasmtime-wasi-io` | 🆕 Newly made async |
 | `File { pub path: PathBuf }`, `Dir { pub path: PathBuf }` | `wasmtime-wasi` | ✅ Same (moved to `crates/wasi/src/filesystem.rs`) |
 | `ReaddirIterator::new()` (pub) | `wasmtime-wasi` | ✅ Same |
 | `ResourceTable::get_any()` (immutable) | `wasmtime` | ✅ Same |
@@ -1018,4 +1168,13 @@ When upgrading Golem to use the v42 fork:
 5. Update `set_suspend()` closure to return `wasmtime::Error` instead of `anyhow::Error`.
 6. Verify HTTP interception code works with the new `send_request()` dispatch in
    `HostFutureIncomingResponse::Deferred` handling.
-7. Build and run the Golem test suite.
+7. Optionally configure `HttpConnectionPool` on `WasiHttpCtx` and implement
+   `WasiHttpView::connection_pool()` to enable connection reuse across requests.
+8. Update `HostIncomingBody::retain_worker()` call sites to pass the new
+   `worker_error_receiver` parameter.
+9. When constructing `IncomingResponse` manually (e.g. in `do_wasi_http_hash_all`
+   test or replay code), populate the new `worker_error_receiver` field (typically
+   `None` for synthetic responses).
+10. Make `check_write` override async in `DurableWorkerCtx` if it is intercepted
+    for durability.
+11. Build and run the Golem test suite.

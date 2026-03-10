@@ -880,8 +880,10 @@ where
                 let mut body =
                     HostIncomingBody::new(body, resp.between_bytes_timeout, field_size_limit);
                 if let Some(worker) = resp.worker {
-                    body.retain_worker(worker);
+                    body.retain_worker(worker, resp.worker_error_receiver);
                 }
+                #[cfg(feature = "default-send-request")]
+                body.retain_connection_permits(resp.connection_permits);
                 body
             }),
         })?;
@@ -919,14 +921,13 @@ where
         id: Resource<HostOutgoingBody>,
         ts: Option<Resource<Trailers>>,
     ) -> crate::HttpResult<()> {
-        let body = self.table().delete(id)?;
-
         let ts = if let Some(ts) = ts {
             Some(move_fields(self.table(), ts)?)
         } else {
             None
         };
 
+        let body = self.table().delete(id)?;
         body.finish(ts)?;
         Ok(())
     }

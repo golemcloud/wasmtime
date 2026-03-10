@@ -16,7 +16,7 @@ all-features = true
 
 [features]
 default = ["default-send-request"]
-default-send-request = ["dep:tokio-rustls", "dep:rustls", "dep:webpki-roots"]
+default-send-request = ["dep:tokio-rustls", "dep:rustls", "dep:webpki-roots", "dep:hyper-util", "dep:hyper-rustls"]
 p3 = ["wasmtime-wasi/p3", "dep:tokio-util"]
 component-model-async = ["futures/alloc", "wasmtime/component-model-async"]
 
@@ -41,6 +41,8 @@ wasmtime = { workspace = true, features = ['component-model'] }
 tokio-rustls = { workspace = true, optional = true }
 rustls = { workspace = true, optional = true }
 webpki-roots = { workspace = true, optional = true }
+hyper-util = { workspace = true, features = ["http1", "client-legacy", "tokio"], optional = true }
+hyper-rustls = { workspace = true, features = ["http1", "webpki-roots"], optional = true }
 
 [dev-dependencies]
 wasmtime-wasi-http = { path = ".", features = ['default-send-request'] }

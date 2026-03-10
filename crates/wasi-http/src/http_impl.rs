@@ -24,7 +24,7 @@ where
         request_id: Resource<HostOutgoingRequest>,
         options: Option<Resource<types::RequestOptions>>,
     ) -> crate::HttpResult<Resource<HostFutureIncomingResponse>> {
-        let opts = options.and_then(|opts| self.table().get(&opts).ok());
+        let opts = options.map(|opts| self.table().get(&opts)).transpose()?;
 
         let connect_timeout = opts
             .and_then(|opts| opts.connect_timeout)
@@ -65,7 +65,10 @@ where
             Scheme::Other(_) => return Err(types::ErrorCode::HttpProtocolError.into()),
         };
 
-        let authority = req.authority.unwrap_or_else(String::new);
+        let authority = match req.authority {
+            Some(a) if !a.is_empty() => a,
+            _ => return Err(types::ErrorCode::HttpRequestUriInvalid.into()),
+        };
 
         builder = builder.header(hyper::header::HOST, &authority);
 
