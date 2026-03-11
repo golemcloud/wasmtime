@@ -374,6 +374,7 @@ where
                 headers,
                 scheme: None,
                 body: None,
+                body_completion: None,
             })
             .context("[new_outgoing_request] pushing request")
     }
@@ -398,10 +399,17 @@ where
             Err(..) => return Ok(Err(())),
         };
 
-        let (host_body, hyper_body) =
+        let (mut host_body, hyper_body) =
             HostOutgoingBody::new(StreamContext::Request, size, buffer_chunks, chunk_size);
 
+        // Always create a completion channel regardless of the current method,
+        // because the guest can call set_method() after body(). The decision of
+        // whether to use the deferred path will be made later in handle().
+        let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
+        host_body.set_completion_sender(completion_tx);
+
         req.body = Some(hyper_body);
+        req.body_completion = Some(completion_rx);
 
         // The output stream will necessarily outlive the request, because we could be still
         // writing to the stream after `outgoing-handler.handle` is called.
@@ -843,6 +851,7 @@ where
 
         match resp {
             HostFutureIncomingResponse::Pending(_) => return Ok(None),
+            HostFutureIncomingResponse::DeferredCollectingBody { .. } => return Ok(None),
             HostFutureIncomingResponse::Consumed => return Ok(Some(Err(()))),
             HostFutureIncomingResponse::Ready(_) => {}
             HostFutureIncomingResponse::Deferred { .. } => {

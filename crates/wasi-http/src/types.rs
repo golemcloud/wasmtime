@@ -825,7 +825,7 @@ fn make_host_key(scheme: &str, authority: &http::uri::Authority) -> String {
 /// before sending the request. Permits are held until the response (including
 /// body) is dropped.
 #[cfg(feature = "default-send-request")]
-async fn pooled_send_request_handler(
+pub(crate) async fn pooled_send_request_handler(
     request: hyper::Request<HyperOutgoingBody>,
     config: OutgoingRequestConfig,
     pool: HttpConnectionPool,
@@ -1138,6 +1138,11 @@ pub struct HostOutgoingRequest {
     pub headers: FieldMap,
     /// The request body.
     pub body: Option<HyperOutgoingBody>,
+    /// Receiver for body completion signal. Set when `body()` is called on a request
+    /// whose method doesn't expect a body (GET, HEAD, etc.). The deferred send path
+    /// awaits this before sending the request.
+    pub(crate) body_completion:
+        Option<tokio::sync::oneshot::Receiver<Result<(), crate::bindings::http::types::ErrorCode>>>,
 }
 
 /// The concrete type behind a `wasi:http/types.request-options` resource.
@@ -1313,6 +1318,9 @@ impl AsRef<HeaderMap> for FieldMap {
 pub type FutureIncomingResponseHandle =
     AbortOnDropJoinHandle<wasmtime::Result<Result<IncomingResponse, types::ErrorCode>>>;
 
+/// Handle type for the body collection task in deferred request sending.
+pub(crate) type BodyCollectionHandle = AbortOnDropJoinHandle<Result<HyperOutgoingBody, types::ErrorCode>>;
+
 /// A shared receiver for connection worker errors.
 ///
 /// The connection worker task sets this if the hyper connection driver
@@ -1373,6 +1381,16 @@ pub enum HostFutureIncomingResponse {
         /// The configuration for the request.
         config: OutgoingRequestConfig,
     },
+    /// Waiting for the outgoing body to be collected before sending.
+    /// Once collection completes, transitions to `Deferred`.
+    DeferredCollectingBody {
+        /// Handle to the body collection task.
+        body_collection: BodyCollectionHandle,
+        /// The request parts (method, URI, headers).
+        request_parts: http::request::Parts,
+        /// The configuration for the request.
+        config: OutgoingRequestConfig,
+    },
 }
 
 impl HostFutureIncomingResponse {
@@ -1403,7 +1421,7 @@ impl HostFutureIncomingResponse {
     pub fn unwrap_ready(self) -> wasmtime::Result<Result<IncomingResponse, types::ErrorCode>> {
         match self {
             Self::Ready(res) => res,
-            Self::Pending(_) | Self::Consumed | Self::Deferred { .. } => {
+            Self::Pending(_) | Self::Consumed | Self::Deferred { .. } | Self::DeferredCollectingBody { .. } => {
                 panic!("unwrap_ready called on a non-ready HostFutureIncomingResponse")
             }
         }
@@ -1413,9 +1431,34 @@ impl HostFutureIncomingResponse {
 #[async_trait::async_trait]
 impl Pollable for HostFutureIncomingResponse {
     async fn ready(&mut self) {
-        if let Self::Pending(handle) = self {
-            *self = Self::Ready(handle.await);
+        match self {
+            Self::Pending(handle) => {
+                *self = Self::Ready(handle.await);
+            }
+            Self::DeferredCollectingBody { body_collection, .. } => {
+                // Await the body collection handle in place. This is
+                // cancellation-safe: if the future is dropped during the
+                // await, self stays in DeferredCollectingBody (the handle
+                // is polled via &mut, not consumed until it resolves).
+                let result = std::pin::Pin::new(body_collection).await;
+
+                // Now that the await completed, take ownership to transition.
+                let old = std::mem::replace(self, Self::Consumed);
+                if let Self::DeferredCollectingBody { request_parts, config, .. } = old {
+                    match result {
+                        Ok(collected_body) => {
+                            let request = hyper::Request::from_parts(request_parts, collected_body);
+                            *self = Self::Deferred { request, config };
+                        }
+                        Err(e) => {
+                            *self = Self::Ready(Ok(Err(e)));
+                        }
+                    }
+                }
+            }
+            _ => {
+                // Ready, Consumed, Deferred: nothing to wait for
+            }
         }
-        // Deferred is always ready - get() will trigger the actual request
     }
 }

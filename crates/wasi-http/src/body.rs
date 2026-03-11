@@ -506,6 +506,9 @@ pub struct HostOutgoingBody {
     context: StreamContext,
     written: Option<WrittenState>,
     finish_sender: Option<tokio::sync::oneshot::Sender<FinishMessage>>,
+    /// Signals that the body has been completed (finished or aborted).
+    /// Used by the deferred request path to know when to send the request.
+    completion_sender: Option<tokio::sync::oneshot::Sender<Result<(), types::ErrorCode>>>,
 }
 
 impl HostOutgoingBody {
@@ -580,6 +583,7 @@ impl HostOutgoingBody {
                 context,
                 written,
                 finish_sender: Some(finish_sender),
+                completion_sender: None,
             },
             body_impl,
         )
@@ -588,6 +592,17 @@ impl HostOutgoingBody {
     /// Take the output stream, if it's available.
     pub fn take_output_stream(&mut self) -> Option<Box<dyn OutputStream>> {
         self.body_output_stream.take()
+    }
+
+    /// Set the completion sender for deferred request sending.
+    /// When `finish()` is called successfully, `Ok(())` will be sent.
+    /// When the body is aborted or dropped without finishing, an error will be sent.
+    pub fn set_completion_sender(
+        &mut self,
+        sender: tokio::sync::oneshot::Sender<Result<(), types::ErrorCode>>,
+    ) {
+        debug_assert!(self.completion_sender.is_none());
+        self.completion_sender = Some(sender);
     }
 
     /// Finish the body, optionally with trailers.
@@ -605,7 +620,11 @@ impl HostOutgoingBody {
             let written = w.written();
             if written != w.expected {
                 let _ = sender.send(FinishMessage::Abort);
-                return Err(self.context.as_body_size_error(written));
+                let err = self.context.as_body_size_error(written);
+                if let Some(completion_sender) = self.completion_sender.take() {
+                    let _ = completion_sender.send(Err(err.clone()));
+                }
+                return Err(err);
             }
         }
 
@@ -617,6 +636,10 @@ impl HostOutgoingBody {
 
         // Ignoring failure: receiver died sending body, but we can't report that here.
         let _ = sender.send(message);
+
+        if let Some(completion_sender) = self.completion_sender.take() {
+            let _ = completion_sender.send(Ok(()));
+        }
 
         Ok(())
     }
@@ -633,6 +656,10 @@ impl HostOutgoingBody {
             .expect("outgoing-body trailer_sender consumed by a non-owning function");
 
         let _ = sender.send(FinishMessage::Abort);
+
+        if let Some(completion_sender) = self.completion_sender.take() {
+            let _ = completion_sender.send(Err(types::ErrorCode::HttpProtocolError));
+        }
     }
 }
 
