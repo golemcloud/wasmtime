@@ -374,6 +374,7 @@ where
                 headers,
                 scheme: None,
                 body: None,
+                body_completion: None,
             })
             .context("[new_outgoing_request] pushing request")
     }
@@ -398,10 +399,17 @@ where
             Err(..) => return Ok(Err(())),
         };
 
-        let (host_body, hyper_body) =
+        let (mut host_body, hyper_body) =
             HostOutgoingBody::new(StreamContext::Request, size, buffer_chunks, chunk_size);
 
+        // Always create a completion channel regardless of the current method,
+        // because the guest can call set_method() after body(). The decision of
+        // whether to use the deferred path will be made later in handle().
+        let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
+        host_body.set_completion_sender(completion_tx);
+
         req.body = Some(hyper_body);
+        req.body_completion = Some(completion_rx);
 
         // The output stream will necessarily outlive the request, because we could be still
         // writing to the stream after `outgoing-handler.handle` is called.
@@ -839,22 +847,31 @@ where
         Option<Result<Result<Resource<HostIncomingResponse>, types::ErrorCode>, ()>>,
     > {
         let field_size_limit = self.ctx().field_size_limit;
-        let resp = self.table().get_mut(&id)?;
 
-        match resp {
-            HostFutureIncomingResponse::Pending(_) => return Ok(None),
-            HostFutureIncomingResponse::Consumed => return Ok(Some(Err(()))),
-            HostFutureIncomingResponse::Ready(_) => {}
-            HostFutureIncomingResponse::Deferred { .. } => {
-                // Deferred: the request hasn't been sent yet. Trigger it now.
-                let deferred = std::mem::replace(resp, HostFutureIncomingResponse::Consumed);
-                if let HostFutureIncomingResponse::Deferred { request, config } = deferred {
-                    let future = self.send_request(request, config)?;
-                    *self.table().get_mut(&id)? = future;
+        // Loop to handle deferred activation: if the response is Deferred,
+        // activate it and re-check the resulting state.
+        loop {
+            let resp = self.table().get_mut(&id)?;
+            match resp {
+                HostFutureIncomingResponse::Pending(_) => return Ok(None),
+                HostFutureIncomingResponse::Consumed => return Ok(Some(Err(()))),
+                HostFutureIncomingResponse::Ready(_) => break,
+                HostFutureIncomingResponse::Deferred { .. } => {
+                    // Deferred: the request hasn't been sent yet. Activate it now.
+                    let deferred =
+                        std::mem::replace(resp, HostFutureIncomingResponse::Consumed);
+                    if let HostFutureIncomingResponse::Deferred { activate } = deferred {
+                        let next =
+                            HostFutureIncomingResponse::normalize_activated(activate());
+                        *self.table().get_mut(&id)? = next;
+                    }
+                    // Loop back to handle the resulting state (Pending → None, Ready → extract).
+                    continue;
                 }
-                return Ok(None);
             }
         }
+
+        let resp = self.table().get_mut(&id)?;
 
         let resp =
             match std::mem::replace(resp, HostFutureIncomingResponse::Consumed).unwrap_ready() {

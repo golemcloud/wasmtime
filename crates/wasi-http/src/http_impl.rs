@@ -38,10 +38,11 @@ where
             .and_then(|opts| opts.between_bytes_timeout)
             .unwrap_or(std::time::Duration::from_secs(600));
 
-        let req = self.table().delete(request_id)?;
-        let mut builder = hyper::Request::builder();
+        let mut req = self.table().delete(request_id)?;
 
-        builder = builder.method(match req.method {
+        let body_completion = req.body_completion.take();
+
+        let method = match req.method {
             types::Method::Get => Method::GET,
             types::Method::Head => Method::HEAD,
             types::Method::Post => Method::POST,
@@ -55,13 +56,14 @@ where
                 Ok(method) => method,
                 Err(_) => return Err(types::ErrorCode::HttpRequestMethodInvalid.into()),
             },
-        });
+        };
+
+        let mut builder = hyper::Request::builder();
+        builder = builder.method(method.clone());
 
         let (use_tls, scheme) = match req.scheme.unwrap_or(Scheme::Https) {
             Scheme::Http => (false, http::uri::Scheme::HTTP),
             Scheme::Https => (true, http::uri::Scheme::HTTPS),
-
-            // We can only support http/https
             Scheme::Other(_) => return Err(types::ErrorCode::HttpProtocolError.into()),
         };
 
@@ -96,16 +98,18 @@ where
             .body(body)
             .map_err(|err| internal_error(err.to_string()))?;
 
-        let future = self.send_request(
-            request,
-            OutgoingRequestConfig {
-                use_tls,
-                connect_timeout,
-                first_byte_timeout,
-                between_bytes_timeout,
-            },
-        )?;
+        let config = OutgoingRequestConfig {
+            use_tls,
+            connect_timeout,
+            first_byte_timeout,
+            between_bytes_timeout,
+        };
 
+        // Always delegate to send_request, which allows the implementor
+        // (e.g. Golem) to decide whether to defer or send immediately.
+        // The default implementation handles body-collection for non-body
+        // methods internally.
+        let future = self.send_request(request, config, body_completion)?;
         Ok(self.table().push(future)?)
     }
 }
