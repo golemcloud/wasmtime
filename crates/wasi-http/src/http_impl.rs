@@ -15,15 +15,6 @@ use http_body_util::{BodyExt, Empty};
 use hyper::Method;
 use wasmtime::component::Resource;
 
-/// Returns `true` for HTTP methods where the server expects a request body
-/// (POST, PUT, PATCH). For all other methods (GET, HEAD, DELETE, CONNECT,
-/// OPTIONS, TRACE, and custom/unknown methods), the server may not wait for
-/// a body and could close the connection early.
-#[cfg(feature = "default-send-request")]
-fn method_expects_body(method: &Method) -> bool {
-    method == Method::POST || method == Method::PUT || method == Method::PATCH
-}
-
 impl<T> outgoing_handler::Host for WasiHttpImpl<T>
 where
     T: WasiHttpView + Send,
@@ -47,13 +38,8 @@ where
             .and_then(|opts| opts.between_bytes_timeout)
             .unwrap_or(std::time::Duration::from_secs(600));
 
-        #[cfg(feature = "default-send-request")]
         let mut req = self.table().delete(request_id)?;
-        #[cfg(not(feature = "default-send-request"))]
-        let req = self.table().delete(request_id)?;
 
-        // Extract body_completion before consuming the request fields.
-        #[cfg(feature = "default-send-request")]
         let body_completion = req.body_completion.take();
 
         let method = match req.method {
@@ -119,62 +105,11 @@ where
             between_bytes_timeout,
         };
 
-        // For methods that don't expect a body (GET, HEAD, DELETE, etc.),
-        // if the guest has created an OutgoingBody, defer sending the request
-        // until the body is finished. This prevents the server from closing
-        // the connection before the client is done.
-        // For body-expected methods (POST, PUT, PATCH), send immediately and
-        // stream the body concurrently as today.
-        #[cfg(feature = "default-send-request")]
-        if !method_expects_body(&method) && body_completion.is_some() {
-            let body_completion = body_completion.unwrap();
-            let (parts, body) = request.into_parts();
-
-            let body_collection: crate::types::BodyCollectionHandle =
-                wasmtime_wasi::runtime::spawn(async move {
-                    // Drain the body and wait for completion concurrently.
-                    // We must drain immediately (not wait for completion first)
-                    // because the body channel is bounded — if we wait, the guest
-                    // may fill the channel and block before reaching finish().
-                    let completion_fut = async {
-                        match body_completion.await {
-                            Ok(Ok(())) => Ok(()),
-                            Ok(Err(e)) => Err(e),
-                            Err(_) => Err(types::ErrorCode::HttpProtocolError),
-                        }
-                    };
-
-                    let collect_fut = async {
-                        // Collect all body frames (including trailers) using
-                        // BodyExt::collect, which preserves trailers.
-                        BodyExt::collect(body).await.map(|collected| {
-                            collected
-                                .map_err(|_: std::convert::Infallible| {
-                                    unreachable!("Infallible error")
-                                })
-                                .boxed_unsync()
-                        })
-                    };
-
-                    let (completion, collected) =
-                        futures::future::join(completion_fut, collect_fut).await;
-
-                    // Check completion first — it carries specific errors like
-                    // content-length mismatch or abort.
-                    completion?;
-                    collected
-                });
-
-            let future = HostFutureIncomingResponse::DeferredCollectingBody {
-                body_collection,
-                request_parts: parts,
-                config,
-            };
-            return Ok(self.table().push(future)?);
-        }
-
-        // Immediate send path: for body-expected methods, or when body() was never called
-        let future = self.send_request(request, config)?;
+        // Always delegate to send_request, which allows the implementor
+        // (e.g. Golem) to decide whether to defer or send immediately.
+        // The default implementation handles body-collection for non-body
+        // methods internally.
+        let future = self.send_request(request, config, body_completion)?;
         Ok(self.table().push(future)?)
     }
 }

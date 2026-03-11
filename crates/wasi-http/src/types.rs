@@ -304,13 +304,20 @@ pub trait WasiHttpView {
     }
 
     /// Send an outgoing request.
+    ///
+    /// The `body_completion` parameter signals when the outgoing body has been
+    /// finished by the guest. The default implementation uses it to collect the
+    /// body before sending for methods that don't expect a body (GET, HEAD, etc.).
+    /// Custom implementations may ignore it if they handle body collection differently,
+    /// or use it to decide whether to defer.
     #[cfg(feature = "default-send-request")]
     fn send_request(
         &mut self,
         request: hyper::Request<HyperOutgoingBody>,
         config: OutgoingRequestConfig,
+        body_completion: Option<BodyCompletionReceiver>,
     ) -> crate::HttpResult<HostFutureIncomingResponse> {
-        Ok(default_send_request_with_pool(request, config, self.connection_pool().cloned()))
+        Ok(default_send_request_with_pool(request, config, body_completion, self.connection_pool().cloned()))
     }
 
     /// Send an outgoing request.
@@ -319,6 +326,7 @@ pub trait WasiHttpView {
         &mut self,
         request: hyper::Request<HyperOutgoingBody>,
         config: OutgoingRequestConfig,
+        body_completion: Option<BodyCompletionReceiver>,
     ) -> crate::HttpResult<HostFutureIncomingResponse>;
 
     /// Whether a given header should be considered forbidden and not allowed.
@@ -385,8 +393,9 @@ impl<T: ?Sized + WasiHttpView> WasiHttpView for &mut T {
         &mut self,
         request: hyper::Request<HyperOutgoingBody>,
         config: OutgoingRequestConfig,
+        body_completion: Option<BodyCompletionReceiver>,
     ) -> crate::HttpResult<HostFutureIncomingResponse> {
-        T::send_request(self, request, config)
+        T::send_request(self, request, config, body_completion)
     }
 
     fn is_forbidden_header(&mut self, name: &HeaderName) -> bool {
@@ -429,8 +438,9 @@ impl<T: ?Sized + WasiHttpView> WasiHttpView for Box<T> {
         &mut self,
         request: hyper::Request<HyperOutgoingBody>,
         config: OutgoingRequestConfig,
+        body_completion: Option<BodyCompletionReceiver>,
     ) -> crate::HttpResult<HostFutureIncomingResponse> {
-        T::send_request(self, request, config)
+        T::send_request(self, request, config, body_completion)
     }
 
     fn is_forbidden_header(&mut self, name: &HeaderName) -> bool {
@@ -486,8 +496,9 @@ impl<T: WasiHttpView> WasiHttpView for WasiHttpImpl<T> {
         &mut self,
         request: hyper::Request<HyperOutgoingBody>,
         config: OutgoingRequestConfig,
+        body_completion: Option<BodyCompletionReceiver>,
     ) -> crate::HttpResult<HostFutureIncomingResponse> {
-        self.0.send_request(request, config)
+        self.0.send_request(request, config, body_completion)
     }
 
     fn is_forbidden_header(&mut self, name: &HeaderName) -> bool {
@@ -545,6 +556,24 @@ pub struct OutgoingRequestConfig {
     pub between_bytes_timeout: Duration,
 }
 
+/// Receiver for body completion signal.
+///
+/// When set, the default `send_request` implementation will await body
+/// completion and collect the body before sending for methods that don't
+/// expect a body (GET, HEAD, etc.). Custom `send_request` implementations
+/// may ignore this if they handle body collection differently.
+pub type BodyCompletionReceiver =
+    tokio::sync::oneshot::Receiver<Result<(), types::ErrorCode>>;
+
+/// Returns `true` for HTTP methods where the server expects a request body
+/// (POST, PUT, PATCH). For all other methods (GET, HEAD, DELETE, CONNECT,
+/// OPTIONS, TRACE, and custom/unknown methods), the server may not wait for
+/// a body and could close the connection early.
+#[cfg(feature = "default-send-request")]
+fn method_expects_body(method: &hyper::Method) -> bool {
+    method == hyper::Method::POST || method == hyper::Method::PUT || method == hyper::Method::PATCH
+}
+
 /// The default implementation of how an outgoing request is sent.
 ///
 /// This implementation is used by the `wasi:http/outgoing-handler` interface
@@ -554,8 +583,9 @@ pub struct OutgoingRequestConfig {
 pub fn default_send_request(
     request: hyper::Request<HyperOutgoingBody>,
     config: OutgoingRequestConfig,
+    body_completion: Option<BodyCompletionReceiver>,
 ) -> HostFutureIncomingResponse {
-    default_send_request_with_pool(request, config, None)
+    default_send_request_with_pool(request, config, body_completion, None)
 }
 
 /// Like [`default_send_request`], but optionally uses a connection pool.
@@ -563,20 +593,72 @@ pub fn default_send_request(
 /// When `connection_pool` is `Some`, connections are reused across requests
 /// to the same host. When `None`, falls back to creating a new connection
 /// per request.
+///
+/// For methods that don't expect a body (GET, HEAD, DELETE, etc.), if the
+/// request has a `body_completion` signal, the body is collected in full
+/// before sending to prevent the server from closing the connection early.
 #[cfg(feature = "default-send-request")]
 pub fn default_send_request_with_pool(
     request: hyper::Request<HyperOutgoingBody>,
     config: OutgoingRequestConfig,
+    body_completion: Option<BodyCompletionReceiver>,
     connection_pool: Option<HttpConnectionPool>,
 ) -> HostFutureIncomingResponse {
-    let handle = wasmtime_wasi::runtime::spawn(async move {
-        if let Some(pool) = connection_pool {
-            Ok(pooled_send_request_handler(request, config, pool).await)
-        } else {
-            Ok(default_send_request_handler(request, config).await)
-        }
-    });
-    HostFutureIncomingResponse::pending(handle)
+    // For methods that don't expect a body, if we have a body_completion
+    // signal, we need to collect the body first before sending.
+    if !method_expects_body(request.method()) && body_completion.is_some() {
+        let body_completion = body_completion.unwrap();
+        let (parts, body) = request.into_parts();
+
+        let handle = wasmtime_wasi::runtime::spawn(async move {
+            // Drain the body and wait for completion concurrently.
+            // We must drain immediately (not wait for completion first)
+            // because the body channel is bounded — if we wait, the guest
+            // may fill the channel and block before reaching finish().
+            let completion_fut = async {
+                match body_completion.await {
+                    Ok(Ok(())) => Ok(()),
+                    Ok(Err(e)) => Err(e),
+                    Err(_) => Err(types::ErrorCode::HttpProtocolError),
+                }
+            };
+
+            let collect_fut = async {
+                BodyExt::collect(body).await.map(|collected| {
+                    collected
+                        .map_err(|_: std::convert::Infallible| {
+                            unreachable!("Infallible error")
+                        })
+                        .boxed_unsync()
+                })
+            };
+
+            let (completion, collected) =
+                futures::future::join(completion_fut, collect_fut).await;
+
+            // Check completion first — it carries specific errors like
+            // content-length mismatch or abort.
+            completion?;
+            let collected_body = collected?;
+
+            let request = hyper::Request::from_parts(parts, collected_body);
+            if let Some(pool) = connection_pool {
+                Ok(pooled_send_request_handler(request, config, pool).await)
+            } else {
+                Ok(default_send_request_handler(request, config).await)
+            }
+        });
+        HostFutureIncomingResponse::pending(handle)
+    } else {
+        let handle = wasmtime_wasi::runtime::spawn(async move {
+            if let Some(pool) = connection_pool {
+                Ok(pooled_send_request_handler(request, config, pool).await)
+            } else {
+                Ok(default_send_request_handler(request, config).await)
+            }
+        });
+        HostFutureIncomingResponse::pending(handle)
+    }
 }
 
 /// Maximum depth to walk error source chains to avoid pathological cycles.
@@ -636,6 +718,7 @@ pub async fn default_send_request_handler(
         connect_timeout,
         first_byte_timeout,
         between_bytes_timeout,
+        ..
     }: OutgoingRequestConfig,
 ) -> Result<IncomingResponse, types::ErrorCode> {
     let authority = if let Some(authority) = request.uri().authority() {
@@ -1318,9 +1401,6 @@ impl AsRef<HeaderMap> for FieldMap {
 pub type FutureIncomingResponseHandle =
     AbortOnDropJoinHandle<wasmtime::Result<Result<IncomingResponse, types::ErrorCode>>>;
 
-/// Handle type for the body collection task in deferred request sending.
-pub(crate) type BodyCollectionHandle = AbortOnDropJoinHandle<Result<HyperOutgoingBody, types::ErrorCode>>;
-
 /// A shared receiver for connection worker errors.
 ///
 /// The connection worker task sets this if the hyper connection driver
@@ -1381,16 +1461,6 @@ pub enum HostFutureIncomingResponse {
         /// The configuration for the request.
         config: OutgoingRequestConfig,
     },
-    /// Waiting for the outgoing body to be collected before sending.
-    /// Once collection completes, transitions to `Deferred`.
-    DeferredCollectingBody {
-        /// Handle to the body collection task.
-        body_collection: BodyCollectionHandle,
-        /// The request parts (method, URI, headers).
-        request_parts: http::request::Parts,
-        /// The configuration for the request.
-        config: OutgoingRequestConfig,
-    },
 }
 
 impl HostFutureIncomingResponse {
@@ -1421,7 +1491,7 @@ impl HostFutureIncomingResponse {
     pub fn unwrap_ready(self) -> wasmtime::Result<Result<IncomingResponse, types::ErrorCode>> {
         match self {
             Self::Ready(res) => res,
-            Self::Pending(_) | Self::Consumed | Self::Deferred { .. } | Self::DeferredCollectingBody { .. } => {
+            Self::Pending(_) | Self::Consumed | Self::Deferred { .. } => {
                 panic!("unwrap_ready called on a non-ready HostFutureIncomingResponse")
             }
         }
@@ -1431,34 +1501,9 @@ impl HostFutureIncomingResponse {
 #[async_trait::async_trait]
 impl Pollable for HostFutureIncomingResponse {
     async fn ready(&mut self) {
-        match self {
-            Self::Pending(handle) => {
-                *self = Self::Ready(handle.await);
-            }
-            Self::DeferredCollectingBody { body_collection, .. } => {
-                // Await the body collection handle in place. This is
-                // cancellation-safe: if the future is dropped during the
-                // await, self stays in DeferredCollectingBody (the handle
-                // is polled via &mut, not consumed until it resolves).
-                let result = std::pin::Pin::new(body_collection).await;
-
-                // Now that the await completed, take ownership to transition.
-                let old = std::mem::replace(self, Self::Consumed);
-                if let Self::DeferredCollectingBody { request_parts, config, .. } = old {
-                    match result {
-                        Ok(collected_body) => {
-                            let request = hyper::Request::from_parts(request_parts, collected_body);
-                            *self = Self::Deferred { request, config };
-                        }
-                        Err(e) => {
-                            *self = Self::Ready(Ok(Err(e)));
-                        }
-                    }
-                }
-            }
-            _ => {
-                // Ready, Consumed, Deferred: nothing to wait for
-            }
+        if let Self::Pending(handle) = self {
+            *self = Self::Ready(handle.await);
         }
+        // Deferred is always ready - get() will trigger the actual request
     }
 }

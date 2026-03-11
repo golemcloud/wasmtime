@@ -169,7 +169,7 @@ async fn non_pooled_request_succeeds() -> Result<()> {
         .body(empty_body())
         .unwrap();
 
-    let future = default_send_request(request, fast_config(false));
+    let future = default_send_request(request, fast_config(false), None);
     let resp = resolve(future).await?.expect("request should succeed");
     assert_eq!(resp.resp.status(), StatusCode::OK);
     assert_eq!(
@@ -196,7 +196,7 @@ async fn pooled_request_succeeds() -> Result<()> {
         .body(empty_body())
         .unwrap();
 
-    let future = default_send_request_with_pool(request, fast_config(false), Some(pool.clone()));
+    let future = default_send_request_with_pool(request, fast_config(false), None, Some(pool.clone()));
     let resp = resolve(future).await?.expect("request should succeed");
     assert_eq!(resp.resp.status(), StatusCode::OK);
     assert_eq!(
@@ -224,7 +224,7 @@ async fn pooled_connection_reuse() -> Result<()> {
             .unwrap();
 
         let future =
-            default_send_request_with_pool(request, fast_config(false), Some(pool.clone()));
+            default_send_request_with_pool(request, fast_config(false), None, Some(pool.clone()));
         let resp = resolve(future).await?.expect("request should succeed");
         assert_eq!(resp.resp.status(), StatusCode::OK);
         assert_eq!(
@@ -259,7 +259,7 @@ async fn pool_none_falls_back_to_non_pooled() -> Result<()> {
         .body(empty_body())
         .unwrap();
 
-    let future = default_send_request_with_pool(request, fast_config(false), None);
+    let future = default_send_request_with_pool(request, fast_config(false), None, None);
     let resp = resolve(future).await?.expect("request should succeed");
     assert_eq!(resp.resp.status(), StatusCode::OK);
 
@@ -284,7 +284,7 @@ async fn non_pooled_connection_refused() -> Result<()> {
         .body(empty_body())
         .unwrap();
 
-    let future = default_send_request(request, fast_config(false));
+    let future = default_send_request(request, fast_config(false), None);
     let result = resolve(future).await?;
     match result {
         Err(ErrorCode::ConnectionRefused) => {} // expected
@@ -312,7 +312,7 @@ async fn pooled_connection_refused() -> Result<()> {
         .body(empty_body())
         .unwrap();
 
-    let future = default_send_request_with_pool(request, fast_config(false), Some(pool));
+    let future = default_send_request_with_pool(request, fast_config(false), None, Some(pool));
     let result = resolve(future).await?;
     match result {
         Err(ErrorCode::ConnectionRefused) => {}    // expected
@@ -359,7 +359,7 @@ async fn non_pooled_connection_timeout() -> Result<()> {
         .body(empty_body())
         .unwrap();
 
-    let future = default_send_request(request_timeout, config);
+    let future = default_send_request(request_timeout, config, None);
     let result = resolve(future).await?;
     match result {
         Err(ErrorCode::ConnectionTimeout) => {}
@@ -398,7 +398,7 @@ async fn pooled_connection_timeout() -> Result<()> {
         between_bytes_timeout: Duration::from_secs(5),
     };
 
-    let future = default_send_request_with_pool(request, config, Some(pool));
+    let future = default_send_request_with_pool(request, config, None, Some(pool));
     let result = resolve(future).await?;
     match result {
         Err(ErrorCode::ConnectionTimeout) => {}
@@ -423,7 +423,7 @@ async fn non_pooled_dns_error() -> Result<()> {
         .body(empty_body())
         .unwrap();
 
-    let future = default_send_request(request, fast_config(false));
+    let future = default_send_request(request, fast_config(false), None);
     let result = resolve(future).await?;
     match result {
         Err(ErrorCode::DnsError(_)) => {}         // expected
@@ -444,7 +444,7 @@ async fn pooled_dns_error() -> Result<()> {
         .body(empty_body())
         .unwrap();
 
-    let future = default_send_request_with_pool(request, fast_config(false), Some(pool));
+    let future = default_send_request_with_pool(request, fast_config(false), None, Some(pool));
     let result = resolve(future).await?;
     match result {
         Err(ErrorCode::DnsError(_)) => {}            // expected
@@ -529,7 +529,7 @@ async fn non_pooled_missing_authority() -> Result<()> {
         .body(empty_body())
         .unwrap();
 
-    let future = default_send_request(request, fast_config(false));
+    let future = default_send_request(request, fast_config(false), None);
     let result = resolve(future).await?;
     match result {
         Err(ErrorCode::HttpRequestUriInvalid) => {} // expected
@@ -549,7 +549,7 @@ async fn pooled_missing_authority() -> Result<()> {
         .body(empty_body())
         .unwrap();
 
-    let future = default_send_request_with_pool(request, fast_config(false), Some(pool));
+    let future = default_send_request_with_pool(request, fast_config(false), None, Some(pool));
     let result = resolve(future).await?;
     match result {
         // The pooled path requires an absolute URI (scheme + authority).

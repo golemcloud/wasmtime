@@ -62,6 +62,7 @@ impl WasiHttpView for Ctx {
         &mut self,
         request: hyper::Request<HyperOutgoingBody>,
         config: OutgoingRequestConfig,
+        body_completion: Option<types::BodyCompletionReceiver>,
     ) -> HttpResult<HostFutureIncomingResponse> {
         if let Some(rejected_authority) = &self.rejected_authority {
             let authority = request.uri().authority().map(ToString::to_string).unwrap();
@@ -72,7 +73,7 @@ impl WasiHttpView for Ctx {
         if let Some(send_request) = self.send_request.clone() {
             Ok(send_request(request, config))
         } else {
-            Ok(types::default_send_request(request, config))
+            Ok(types::default_send_request(request, config, body_completion))
         }
     }
 

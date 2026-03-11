@@ -851,14 +851,13 @@ where
 
         match resp {
             HostFutureIncomingResponse::Pending(_) => return Ok(None),
-            HostFutureIncomingResponse::DeferredCollectingBody { .. } => return Ok(None),
             HostFutureIncomingResponse::Consumed => return Ok(Some(Err(()))),
             HostFutureIncomingResponse::Ready(_) => {}
             HostFutureIncomingResponse::Deferred { .. } => {
                 // Deferred: the request hasn't been sent yet. Trigger it now.
                 let deferred = std::mem::replace(resp, HostFutureIncomingResponse::Consumed);
                 if let HostFutureIncomingResponse::Deferred { request, config } = deferred {
-                    let future = self.send_request(request, config)?;
+                    let future = self.send_request(request, config, None)?;
                     *self.table().get_mut(&id)? = future;
                 }
                 return Ok(None);
