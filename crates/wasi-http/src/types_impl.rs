@@ -847,22 +847,31 @@ where
         Option<Result<Result<Resource<HostIncomingResponse>, types::ErrorCode>, ()>>,
     > {
         let field_size_limit = self.ctx().field_size_limit;
-        let resp = self.table().get_mut(&id)?;
 
-        match resp {
-            HostFutureIncomingResponse::Pending(_) => return Ok(None),
-            HostFutureIncomingResponse::Consumed => return Ok(Some(Err(()))),
-            HostFutureIncomingResponse::Ready(_) => {}
-            HostFutureIncomingResponse::Deferred { .. } => {
-                // Deferred: the request hasn't been sent yet. Trigger it now.
-                let deferred = std::mem::replace(resp, HostFutureIncomingResponse::Consumed);
-                if let HostFutureIncomingResponse::Deferred { request, config } = deferred {
-                    let future = self.send_request(request, config, None)?;
-                    *self.table().get_mut(&id)? = future;
+        // Loop to handle deferred activation: if the response is Deferred,
+        // activate it and re-check the resulting state.
+        loop {
+            let resp = self.table().get_mut(&id)?;
+            match resp {
+                HostFutureIncomingResponse::Pending(_) => return Ok(None),
+                HostFutureIncomingResponse::Consumed => return Ok(Some(Err(()))),
+                HostFutureIncomingResponse::Ready(_) => break,
+                HostFutureIncomingResponse::Deferred { .. } => {
+                    // Deferred: the request hasn't been sent yet. Activate it now.
+                    let deferred =
+                        std::mem::replace(resp, HostFutureIncomingResponse::Consumed);
+                    if let HostFutureIncomingResponse::Deferred { activate } = deferred {
+                        let next =
+                            HostFutureIncomingResponse::normalize_activated(activate());
+                        *self.table().get_mut(&id)? = next;
+                    }
+                    // Loop back to handle the resulting state (Pending → None, Ready → extract).
+                    continue;
                 }
-                return Ok(None);
             }
         }
+
+        let resp = self.table().get_mut(&id)?;
 
         let resp =
             match std::mem::replace(resp, HostFutureIncomingResponse::Consumed).unwrap_ready() {

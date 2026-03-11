@@ -1443,8 +1443,15 @@ pub struct IncomingResponse {
     pub connection_permits: Option<ConnectionPermits>,
 }
 
+/// A closure that activates a deferred response by performing the actual HTTP send.
+///
+/// The closure captures everything it needs (request, config, body_completion,
+/// connection pool, etc.) so that `ready()` and `get()` can trigger the send
+/// without needing access to `&mut self` (the `WasiHttpView`).
+pub type DeferredSendFn =
+    Box<dyn FnOnce() -> crate::HttpResult<HostFutureIncomingResponse> + Send>;
+
 /// The concrete type behind a `wasi:http/types.future-incoming-response` resource.
-#[derive(Debug)]
 pub enum HostFutureIncomingResponse {
     /// A pending response
     Pending(FutureIncomingResponseHandle),
@@ -1455,12 +1462,25 @@ pub enum HostFutureIncomingResponse {
     /// The response has been consumed.
     Consumed,
     /// A deferred response that hasn't been sent yet.
+    ///
+    /// When `ready()` is called, the `activate` closure is invoked to trigger
+    /// the actual HTTP send. If `get()` is called without a prior `ready()`,
+    /// it also activates the closure as a fallback.
     Deferred {
-        /// The request to send.
-        request: hyper::Request<HyperOutgoingBody>,
-        /// The configuration for the request.
-        config: OutgoingRequestConfig,
+        /// The closure that performs the actual send.
+        activate: DeferredSendFn,
     },
+}
+
+impl fmt::Debug for HostFutureIncomingResponse {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Pending(_) => f.debug_tuple("Pending").field(&"...").finish(),
+            Self::Ready(_) => f.debug_tuple("Ready").field(&"...").finish(),
+            Self::Consumed => write!(f, "Consumed"),
+            Self::Deferred { .. } => f.debug_struct("Deferred").finish_non_exhaustive(),
+        }
+    }
 }
 
 impl HostFutureIncomingResponse {
@@ -1475,11 +1495,12 @@ impl HostFutureIncomingResponse {
     }
 
     /// Create a new `HostFutureIncomingResponse` that is deferred.
-    pub fn deferred(
-        request: hyper::Request<HyperOutgoingBody>,
-        config: OutgoingRequestConfig,
-    ) -> Self {
-        Self::Deferred { request, config }
+    ///
+    /// The `activate` closure will be called when `ready()` or `get()` is invoked
+    /// to trigger the actual HTTP send. It should capture everything needed
+    /// (request, config, body_completion, connection pool, etc.).
+    pub fn deferred(activate: DeferredSendFn) -> Self {
+        Self::Deferred { activate }
     }
 
     /// Returns `true` if the response is ready.
@@ -1498,12 +1519,44 @@ impl HostFutureIncomingResponse {
     }
 }
 
+impl HostFutureIncomingResponse {
+    /// Normalize the result of activating a deferred response.
+    ///
+    /// Valid activation results are `Pending` and `Ready`. Any other state
+    /// (e.g. `Deferred` again, `Consumed`) is treated as an internal error.
+    pub(crate) fn normalize_activated(
+        result: crate::HttpResult<HostFutureIncomingResponse>,
+    ) -> HostFutureIncomingResponse {
+        match result {
+            Ok(resp @ Self::Pending(_)) | Ok(resp @ Self::Ready(_)) => resp,
+            Ok(_) => Self::Ready(Err(wasmtime::Error::msg(
+                "deferred activation returned invalid state",
+            ))),
+            Err(e) => match e.downcast() {
+                Ok(code) => Self::Ready(Ok(Err(code))),
+                Err(trap) => Self::Ready(Err(trap)),
+            },
+        }
+    }
+}
+
 #[async_trait::async_trait]
 impl Pollable for HostFutureIncomingResponse {
     async fn ready(&mut self) {
+        // Activate deferred responses synchronously (no await, so cancellation-safe).
+        if matches!(self, Self::Deferred { .. }) {
+            let activated = match std::mem::replace(self, Self::Consumed) {
+                Self::Deferred { activate } => Self::normalize_activated(activate()),
+                _ => unreachable!(),
+            };
+            *self = activated;
+        }
+
+        // Await pending responses by mutable borrow — if this future is dropped
+        // mid-await (e.g. another pollable became ready first), `self` still
+        // holds `Pending(handle)` and the in-flight task is not aborted.
         if let Self::Pending(handle) = self {
             *self = Self::Ready(handle.await);
         }
-        // Deferred is always ready - get() will trigger the actual request
     }
 }
