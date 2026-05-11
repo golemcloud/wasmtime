@@ -2,6 +2,7 @@
 //! wasi-http API.
 
 use crate::FieldMap;
+use crate::p2::HttpResult;
 use crate::p2::{
     WasiHttpCtxView, WasiHttpHooks,
     bindings::http::types::{self, ErrorCode, Method, Scheme},
@@ -35,6 +36,7 @@ pub(crate) fn remove_forbidden_headers(
 }
 
 /// Configuration for an outgoing request.
+#[derive(Debug)]
 pub struct OutgoingRequestConfig {
     /// Whether to use TLS for the request.
     pub use_tls: bool,
@@ -212,10 +214,15 @@ pub struct HostOutgoingRequest {
     pub headers: FieldMap,
     /// The request body.
     pub body: Option<HyperOutgoingBody>,
+    /// Receiver signaling when the outgoing-body's `finish()` has been called.
+    /// Used by `default_send_request_with_pool` to wait on body completion
+    /// before sending requests for methods that don't expect a body.
+    #[cfg(feature = "default-send-request")]
+    pub body_completion: Option<crate::p2::BodyCompletionReceiver>,
 }
 
 /// The concrete type behind a `wasi:http/types.request-options` resource.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct HostRequestOptions {
     /// How long to wait for a connection to be established.
     pub connect_timeout: Option<std::time::Duration>,
@@ -234,11 +241,66 @@ pub struct HostIncomingResponse {
     pub headers: FieldMap,
     /// The response body
     pub body: Option<HostIncomingBody>,
+    /// Handle to the underlying pooled connection used for this response.
+    ///
+    /// `Some` only for responses produced by `pooled_send_request_handler`,
+    /// allowing callers to call `Connected::poison()` on the captured connection
+    /// so the pool will not hand the same TCP connection back for subsequent
+    /// requests.
+    #[cfg(feature = "default-send-request")]
+    pub pooled_connection:
+        Option<hyper_util::client::legacy::connect::CaptureConnection>,
+}
+
+#[cfg(feature = "default-send-request")]
+impl HostIncomingResponse {
+    /// Poison the underlying pooled connection, if any, so that the
+    /// connection pool will not hand it back for subsequent requests.
+    ///
+    /// This is a no-op when the response was not produced through a
+    /// connection pool, or when the pool has not yet recorded the
+    /// connection metadata.
+    pub fn poison_pooled_connection(&self) {
+        if let Some(capture) = &self.pooled_connection {
+            let meta = capture.connection_metadata();
+            if let Some(conn) = meta.as_ref() {
+                conn.poison();
+            }
+        }
+    }
 }
 
 /// A handle to a future incoming response.
 pub type FutureIncomingResponseHandle =
     AbortOnDropJoinHandle<wasmtime::Result<Result<IncomingResponse, types::ErrorCode>>>;
+
+/// A shared receiver for connection worker errors.
+///
+/// The connection worker task sets this if the hyper connection driver
+/// encounters an error. The body stream checks it while reading to surface
+/// connection-level failures to the guest.
+pub type ConnWorkerErrorReceiver =
+    tokio::sync::watch::Receiver<Option<std::sync::Arc<types::ErrorCode>>>;
+
+/// Holds semaphore permits for connection concurrency limiting.
+///
+/// When this struct is dropped, the permits are released, allowing queued
+/// requests to proceed. The permits are acquired per-host first, then
+/// globally, to avoid global permit hoarding.
+#[cfg(feature = "default-send-request")]
+pub struct ConnectionPermits {
+    /// Per-host concurrency permit.
+    pub _host: tokio::sync::OwnedSemaphorePermit,
+    /// Global concurrency permit.
+    pub _global: tokio::sync::OwnedSemaphorePermit,
+}
+
+#[cfg(feature = "default-send-request")]
+impl std::fmt::Debug for ConnectionPermits {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConnectionPermits").finish_non_exhaustive()
+    }
+}
 
 /// A response that is in the process of being received.
 #[derive(Debug)]
@@ -249,10 +311,33 @@ pub struct IncomingResponse {
     pub worker: Option<AbortOnDropJoinHandle<()>>,
     /// The timeout between chunks of the response.
     pub between_bytes_timeout: std::time::Duration,
+    /// Receives connection worker errors, if any.
+    pub worker_error_receiver: Option<ConnWorkerErrorReceiver>,
+    /// Connection concurrency permits. Released when the response is dropped,
+    /// allowing queued requests to proceed.
+    #[cfg(feature = "default-send-request")]
+    pub connection_permits: Option<ConnectionPermits>,
+    /// Handle to the underlying pooled connection used for this response.
+    ///
+    /// `Some` only for responses produced by `pooled_send_request_handler`,
+    /// allowing callers to call `Connected::poison()` so the pool will not
+    /// hand the same TCP connection back for subsequent requests.
+    #[cfg(feature = "default-send-request")]
+    pub pooled_connection:
+        Option<hyper_util::client::legacy::connect::CaptureConnection>,
 }
 
+/// A closure that activates a deferred response by performing the actual HTTP
+/// send.
+///
+/// The closure captures everything it needs (request, config, body
+/// completion, connection pool, etc.) so that `ready()` and `get()` can
+/// trigger the send without needing access to `&mut self` (the
+/// `WasiHttpView`).
+pub type DeferredSendFn =
+    Box<dyn FnOnce() -> HttpResult<HostFutureIncomingResponse> + Send>;
+
 /// The concrete type behind a `wasi:http/types.future-incoming-response` resource.
-#[derive(Debug)]
 pub enum HostFutureIncomingResponse {
     /// A pending response
     Pending(FutureIncomingResponseHandle),
@@ -262,6 +347,26 @@ pub enum HostFutureIncomingResponse {
     Ready(wasmtime::Result<Result<IncomingResponse, types::ErrorCode>>),
     /// The response has been consumed.
     Consumed,
+    /// A deferred response that hasn't been sent yet.
+    ///
+    /// When `ready()` is called, the `activate` closure is invoked to trigger
+    /// the actual HTTP send. If `get()` is called without a prior `ready()`,
+    /// it also activates the closure as a fallback.
+    Deferred {
+        /// The closure that performs the actual send.
+        activate: DeferredSendFn,
+    },
+}
+
+impl std::fmt::Debug for HostFutureIncomingResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Pending(_) => f.debug_tuple("Pending").field(&"...").finish(),
+            Self::Ready(_) => f.debug_tuple("Ready").field(&"...").finish(),
+            Self::Consumed => write!(f, "Consumed"),
+            Self::Deferred { .. } => f.debug_struct("Deferred").finish_non_exhaustive(),
+        }
+    }
 }
 
 impl HostFutureIncomingResponse {
@@ -275,6 +380,15 @@ impl HostFutureIncomingResponse {
         Self::Ready(result)
     }
 
+    /// Create a new `HostFutureIncomingResponse` that is deferred.
+    ///
+    /// The `activate` closure will be called when `ready()` or `get()` is
+    /// invoked to trigger the actual HTTP send. It should capture everything
+    /// needed (request, config, body_completion, connection pool, etc.).
+    pub fn deferred(activate: DeferredSendFn) -> Self {
+        Self::Deferred { activate }
+    }
+
     /// Returns `true` if the response is ready.
     pub fn is_ready(&self) -> bool {
         matches!(self, Self::Ready(_))
@@ -284,9 +398,28 @@ impl HostFutureIncomingResponse {
     pub fn unwrap_ready(self) -> wasmtime::Result<Result<IncomingResponse, types::ErrorCode>> {
         match self {
             Self::Ready(res) => res,
-            Self::Pending(_) | Self::Consumed => {
-                panic!("unwrap_ready called on a pending HostFutureIncomingResponse")
+            Self::Pending(_) | Self::Consumed | Self::Deferred { .. } => {
+                panic!("unwrap_ready called on a non-ready HostFutureIncomingResponse")
             }
+        }
+    }
+
+    /// Normalize the result of activating a deferred response.
+    ///
+    /// Valid activation results are `Pending` and `Ready`. Any other state
+    /// (e.g. `Deferred` again, `Consumed`) is treated as an internal error.
+    pub(crate) fn normalize_activated(
+        result: HttpResult<HostFutureIncomingResponse>,
+    ) -> HostFutureIncomingResponse {
+        match result {
+            Ok(resp @ Self::Pending(_)) | Ok(resp @ Self::Ready(_)) => resp,
+            Ok(_) => Self::Ready(Err(wasmtime::Error::msg(
+                "deferred activation returned invalid state",
+            ))),
+            Err(e) => match e.downcast() {
+                Ok(code) => Self::Ready(Ok(Err(code))),
+                Err(trap) => Self::Ready(Err(trap)),
+            },
         }
     }
 }
@@ -294,6 +427,18 @@ impl HostFutureIncomingResponse {
 #[async_trait::async_trait]
 impl Pollable for HostFutureIncomingResponse {
     async fn ready(&mut self) {
+        // Activate deferred responses synchronously (no await, so cancellation-safe).
+        if matches!(self, Self::Deferred { .. }) {
+            let activated = match std::mem::replace(self, Self::Consumed) {
+                Self::Deferred { activate } => Self::normalize_activated(activate()),
+                _ => unreachable!(),
+            };
+            *self = activated;
+        }
+
+        // Await pending responses by mutable borrow — if this future is dropped
+        // mid-await (e.g. another pollable became ready first), `self` still
+        // holds `Pending(handle)` and the in-flight task is not aborted.
         if let Self::Pending(handle) = self {
             *self = Self::Ready(handle.await);
         }

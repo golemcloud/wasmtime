@@ -234,6 +234,8 @@ impl types::HostOutgoingRequest for WasiHttpCtxView<'_> {
                 headers,
                 scheme: None,
                 body: None,
+                #[cfg(feature = "default-send-request")]
+                body_completion: None,
             })
             .context("[new_outgoing_request] pushing request")
     }
@@ -258,8 +260,22 @@ impl types::HostOutgoingRequest for WasiHttpCtxView<'_> {
             Err(..) => return Ok(Err(())),
         };
 
+        #[cfg(feature = "default-send-request")]
+        let (mut host_body, hyper_body) =
+            HostOutgoingBody::new(StreamContext::Request, size, buffer_chunks, chunk_size);
+        #[cfg(not(feature = "default-send-request"))]
         let (host_body, hyper_body) =
             HostOutgoingBody::new(StreamContext::Request, size, buffer_chunks, chunk_size);
+
+        // Always create a completion channel regardless of the current method,
+        // because the guest can call set_method() after body(). The decision of
+        // whether to use the deferred path will be made later in handle().
+        #[cfg(feature = "default-send-request")]
+        {
+            let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
+            host_body.set_completion_sender(completion_tx);
+            req.body_completion = Some(completion_rx);
+        }
 
         req.body = Some(hyper_body);
 
@@ -420,7 +436,7 @@ impl types::HostResponseOutparam for WasiHttpCtxView<'_> {
 }
 
 impl types::HostIncomingResponse for WasiHttpCtxView<'_> {
-    fn drop(&mut self, response: Resource<HostIncomingResponse>) -> wasmtime::Result<()> {
+    async fn drop(&mut self, response: Resource<HostIncomingResponse>) -> wasmtime::Result<()> {
         let _ = self
             .table
             .delete(response)
@@ -478,10 +494,10 @@ impl types::HostFutureTrailers for WasiHttpCtxView<'_> {
         &mut self,
         index: Resource<HostFutureTrailers>,
     ) -> wasmtime::Result<Resource<DynPollable>> {
-        wasmtime_wasi::p2::subscribe(self.table, index)
+        wasmtime_wasi::p2::subscribe(self.table, index, None)
     }
 
-    fn get(
+    async fn get(
         &mut self,
         id: Resource<HostFutureTrailers>,
     ) -> wasmtime::Result<Option<Result<Result<Option<Resource<Trailers>>, types::ErrorCode>, ()>>>
@@ -520,7 +536,7 @@ impl types::HostIncomingBody for WasiHttpCtxView<'_> {
         let body = self.table.get_mut(&id)?;
 
         if let Some(stream) = body.take_stream() {
-            let stream: DynInputStream = Box::new(stream);
+            let stream: DynInputStream = stream;
             let stream = self.table.push_child(stream, &id)?;
             return Ok(Ok(stream));
         }
@@ -528,7 +544,7 @@ impl types::HostIncomingBody for WasiHttpCtxView<'_> {
         Ok(Err(()))
     }
 
-    fn finish(
+    async fn finish(
         &mut self,
         id: Resource<HostIncomingBody>,
     ) -> wasmtime::Result<Resource<HostFutureTrailers>> {
@@ -537,7 +553,7 @@ impl types::HostIncomingBody for WasiHttpCtxView<'_> {
         Ok(trailers)
     }
 
-    fn drop(&mut self, id: Resource<HostIncomingBody>) -> wasmtime::Result<()> {
+    async fn drop(&mut self, id: Resource<HostIncomingBody>) -> wasmtime::Result<()> {
         let _ = self.table.delete(id)?;
         Ok(())
     }
@@ -624,24 +640,41 @@ impl types::HostOutgoingResponse for WasiHttpCtxView<'_> {
 }
 
 impl types::HostFutureIncomingResponse for WasiHttpCtxView<'_> {
-    fn drop(&mut self, id: Resource<HostFutureIncomingResponse>) -> wasmtime::Result<()> {
+    async fn drop(&mut self, id: Resource<HostFutureIncomingResponse>) -> wasmtime::Result<()> {
         let _ = self.table.delete(id)?;
         Ok(())
     }
 
-    fn get(
+    async fn get(
         &mut self,
         id: Resource<HostFutureIncomingResponse>,
     ) -> wasmtime::Result<
         Option<Result<Result<Resource<HostIncomingResponse>, types::ErrorCode>, ()>>,
     > {
-        let resp = self.table.get_mut(&id)?;
-
-        match resp {
-            HostFutureIncomingResponse::Pending(_) => return Ok(None),
-            HostFutureIncomingResponse::Consumed => return Ok(Some(Err(()))),
-            HostFutureIncomingResponse::Ready(_) => {}
+        // Loop to handle deferred activation: if the response is Deferred,
+        // activate it and re-check the resulting state.
+        loop {
+            let resp = self.table.get_mut(&id)?;
+            match resp {
+                HostFutureIncomingResponse::Pending(_) => return Ok(None),
+                HostFutureIncomingResponse::Consumed => return Ok(Some(Err(()))),
+                HostFutureIncomingResponse::Ready(_) => break,
+                HostFutureIncomingResponse::Deferred { .. } => {
+                    // Deferred: the request hasn't been sent yet. Activate it now.
+                    let deferred =
+                        std::mem::replace(resp, HostFutureIncomingResponse::Consumed);
+                    if let HostFutureIncomingResponse::Deferred { activate } = deferred {
+                        let next =
+                            HostFutureIncomingResponse::normalize_activated(activate());
+                        *self.table.get_mut(&id)? = next;
+                    }
+                    // Loop back to handle the resulting state.
+                    continue;
+                }
+            }
         }
+
+        let resp = self.table.get_mut(&id)?;
 
         let resp =
             match std::mem::replace(resp, HostFutureIncomingResponse::Consumed).unwrap_ready() {
@@ -665,10 +698,14 @@ impl types::HostFutureIncomingResponse for WasiHttpCtxView<'_> {
             body: Some({
                 let mut body = HostIncomingBody::new(body, resp.between_bytes_timeout);
                 if let Some(worker) = resp.worker {
-                    body.retain_worker(worker);
+                    body.retain_worker(worker, resp.worker_error_receiver);
                 }
+                #[cfg(feature = "default-send-request")]
+                body.retain_connection_permits(resp.connection_permits);
                 body
             }),
+            #[cfg(feature = "default-send-request")]
+            pooled_connection: resp.pooled_connection,
         })?;
 
         Ok(Some(Ok(Ok(resp))))
@@ -678,7 +715,7 @@ impl types::HostFutureIncomingResponse for WasiHttpCtxView<'_> {
         &mut self,
         id: Resource<HostFutureIncomingResponse>,
     ) -> wasmtime::Result<Resource<DynPollable>> {
-        wasmtime_wasi::p2::subscribe(self.table, id)
+        wasmtime_wasi::p2::subscribe(self.table, id, None)
     }
 }
 

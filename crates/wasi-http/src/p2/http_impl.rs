@@ -16,29 +16,43 @@ use hyper::Method;
 use wasmtime::component::Resource;
 
 impl outgoing_handler::Host for WasiHttpCtxView<'_> {
-    fn handle(
+    async fn handle(
         &mut self,
         request_id: Resource<HostOutgoingRequest>,
         options: Option<Resource<types::RequestOptions>>,
     ) -> HttpResult<Resource<HostFutureIncomingResponse>> {
-        let opts = options.and_then(|opts| self.table.get(&opts).ok());
+        // Map invalid options handle traps to a host trap (per fork: propagate via `?`).
+        let opts = options
+            .map(|opts| self.table.get(&opts).cloned())
+            .transpose()?;
 
         let connect_timeout = opts
+            .as_ref()
             .and_then(|opts| opts.connect_timeout)
             .unwrap_or(std::time::Duration::from_secs(600));
 
         let first_byte_timeout = opts
+            .as_ref()
             .and_then(|opts| opts.first_byte_timeout)
             .unwrap_or(std::time::Duration::from_secs(600));
 
         let between_bytes_timeout = opts
+            .as_ref()
             .and_then(|opts| opts.between_bytes_timeout)
             .unwrap_or(std::time::Duration::from_secs(600));
 
+        #[cfg(feature = "default-send-request")]
+        let mut req = self.table.delete(request_id)?;
+        #[cfg(not(feature = "default-send-request"))]
         let req = self.table.delete(request_id)?;
-        let mut builder = hyper::Request::builder();
 
-        builder = builder.method(match req.method {
+        // Take body_completion (set when the outgoing-body's finish() is called).
+        // For methods that don't expect a body, default_send_request_with_pool
+        // waits on this signal before sending.
+        #[cfg(feature = "default-send-request")]
+        let body_completion = req.body_completion.take();
+
+        let method = match req.method {
             types::Method::Get => Method::GET,
             types::Method::Head => Method::HEAD,
             types::Method::Post => Method::POST,
@@ -52,7 +66,10 @@ impl outgoing_handler::Host for WasiHttpCtxView<'_> {
                 Ok(method) => method,
                 Err(_) => return Err(types::ErrorCode::HttpRequestMethodInvalid.into()),
             },
-        });
+        };
+
+        let mut builder = hyper::Request::builder();
+        builder = builder.method(method.clone());
 
         let (use_tls, scheme) = match req.scheme.unwrap_or(Scheme::Https) {
             Scheme::Http => (false, http::uri::Scheme::HTTP),
@@ -62,7 +79,14 @@ impl outgoing_handler::Host for WasiHttpCtxView<'_> {
             Scheme::Other(_) => return Err(types::ErrorCode::HttpProtocolError.into()),
         };
 
-        let authority = req.authority.unwrap_or_else(String::new);
+        // Reject empty/missing authority - returning the proper WASI error
+        // rather than letting hyper's URI builder produce an obscure error.
+        let authority = match req.authority {
+            Some(a) if !a.is_empty() => a,
+            _ => return Err(types::ErrorCode::HttpRequestUriInvalid.into()),
+        };
+
+        builder = builder.header(hyper::header::HOST, &authority);
 
         let mut uri = http::Uri::builder()
             .scheme(scheme)
@@ -88,15 +112,21 @@ impl outgoing_handler::Host for WasiHttpCtxView<'_> {
             .body(body)
             .map_err(|err| internal_error(err.to_string()))?;
 
-        let future = self.hooks.send_request(
-            request,
-            OutgoingRequestConfig {
-                use_tls,
-                connect_timeout,
-                first_byte_timeout,
-                between_bytes_timeout,
-            },
-        )?;
+        let config = OutgoingRequestConfig {
+            use_tls,
+            connect_timeout,
+            first_byte_timeout,
+            between_bytes_timeout,
+        };
+
+        // Always delegate to send_request, which allows the implementor
+        // (e.g. Golem) to decide whether to defer or send immediately.
+        // The default implementation handles body-collection for non-body
+        // methods internally.
+        #[cfg(feature = "default-send-request")]
+        let future = self.hooks.send_request(request, config, body_completion)?;
+        #[cfg(not(feature = "default-send-request"))]
+        let future = self.hooks.send_request(request, config, None)?;
 
         Ok(self.table.push(future)?)
     }
