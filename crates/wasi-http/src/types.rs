@@ -23,6 +23,7 @@ use wasmtime_wasi::runtime::AbortOnDropJoinHandle;
 use {
     crate::io::TokioIo,
     crate::{error::dns_error, hyper_request_error},
+    hyper_util::client::legacy::connect::{CaptureConnection, capture_connection},
     std::collections::HashMap,
     std::sync::Weak,
     tokio::net::TcpStream,
@@ -879,6 +880,8 @@ pub async fn default_send_request_handler(
         worker_error_receiver: Some(worker_err_rx),
         #[cfg(feature = "default-send-request")]
         connection_permits: None,
+        #[cfg(feature = "default-send-request")]
+        pooled_connection: None,
     })
 }
 
@@ -909,7 +912,7 @@ fn make_host_key(scheme: &str, authority: &http::uri::Authority) -> String {
 /// body) is dropped.
 #[cfg(feature = "default-send-request")]
 pub(crate) async fn pooled_send_request_handler(
-    request: hyper::Request<HyperOutgoingBody>,
+    mut request: hyper::Request<HyperOutgoingBody>,
     config: OutgoingRequestConfig,
     pool: HttpConnectionPool,
 ) -> Result<IncomingResponse, types::ErrorCode> {
@@ -987,6 +990,14 @@ pub(crate) async fn pooled_send_request_handler(
         use_tls = config.use_tls,
         "pooled: sending request"
     );
+
+    // Capture a handle to the underlying pooled connection so the caller
+    // can poison it (via `Connected::poison()`) if it later determines the
+    // connection is in an unsafe state for reuse — for example when the
+    // server returned a non-2xx response without draining the request body.
+    // The pool will then refuse to hand the same connection back on
+    // subsequent requests.
+    let pooled_connection = capture_connection(&mut request);
 
     let resp = timeout(first_byte_timeout, pool.client.request(request))
         .await
@@ -1075,6 +1086,7 @@ pub(crate) async fn pooled_send_request_handler(
             _host: host_permit,
             _global: global_permit,
         }),
+        pooled_connection: Some(pooled_connection),
     })
 }
 
@@ -1248,6 +1260,32 @@ pub struct HostIncomingResponse {
     pub headers: FieldMap,
     /// The response body
     pub body: Option<HostIncomingBody>,
+    /// Handle to the underlying pooled connection used for this response.
+    ///
+    /// `Some` only when this response was produced via the connection pool.
+    /// Callers can call `poison_pooled_connection()` to mark the connection
+    /// as unsafe for reuse (the pool will not hand it back for subsequent
+    /// requests). See `IncomingResponse::pooled_connection` for details.
+    #[cfg(feature = "default-send-request")]
+    pub pooled_connection: Option<CaptureConnection>,
+}
+
+#[cfg(feature = "default-send-request")]
+impl HostIncomingResponse {
+    /// Poison the underlying pooled connection, if any, so that the
+    /// connection pool will not hand it back for subsequent requests.
+    ///
+    /// This is a no-op when the response was not produced through a
+    /// connection pool, or when the pool has not yet recorded the
+    /// connection metadata.
+    pub fn poison_pooled_connection(&self) {
+        if let Some(capture) = &self.pooled_connection {
+            let meta = capture.connection_metadata();
+            if let Some(conn) = meta.as_ref() {
+                conn.poison();
+            }
+        }
+    }
 }
 
 /// The concrete type behind a `wasi:http/types.fields` resource.
@@ -1441,6 +1479,16 @@ pub struct IncomingResponse {
     /// allowing queued requests to proceed.
     #[cfg(feature = "default-send-request")]
     pub connection_permits: Option<ConnectionPermits>,
+    /// Handle to the underlying pooled connection used for this response.
+    ///
+    /// `Some` only for responses produced by `pooled_send_request_handler`,
+    /// allowing callers to call `Connected::poison()` so the pool will not
+    /// hand the same TCP connection back for subsequent requests. This is
+    /// useful when the host knows the connection is in an unsafe state for
+    /// reuse (for example, the server returned a non-2xx response without
+    /// draining the request body, leaving leftover bytes on the wire).
+    #[cfg(feature = "default-send-request")]
+    pub pooled_connection: Option<CaptureConnection>,
 }
 
 /// A closure that activates a deferred response by performing the actual HTTP send.

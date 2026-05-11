@@ -903,6 +903,8 @@ where
                 body.retain_connection_permits(resp.connection_permits);
                 body
             }),
+            #[cfg(feature = "default-send-request")]
+            pooled_connection: resp.pooled_connection,
         })?;
 
         Ok(Some(Ok(Ok(resp))))
