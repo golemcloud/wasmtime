@@ -74,7 +74,7 @@ use crate::p2::bindings::{
     filesystem::types as filesystem,
 };
 use crate::p2::{FsError, IsATTY};
-use crate::{ResourceTable, WasiCtx, WasiCtxView, WasiView};
+use crate::{IoCtx, ResourceTable, WasiCtx, WasiCtxView, WasiView};
 use std::collections::{BTreeMap, BTreeSet, HashSet, btree_map};
 use std::mem::{self, size_of, size_of_val};
 use std::slice;
@@ -142,15 +142,17 @@ use wasmtime_wasi_io::bindings::wasi::io::poll::Host as _;
 pub struct WasiP1Ctx {
     table: ResourceTable,
     wasi: WasiCtx,
+    io_ctx: IoCtx,
     adapter: WasiP1Adapter,
     hostcall_fuel: usize,
 }
 
 impl WasiP1Ctx {
-    pub(crate) fn new(wasi: WasiCtx) -> Self {
+    pub fn new(wasi: WasiCtx, io_ctx: IoCtx) -> Self {
         Self {
             table: ResourceTable::new(),
             wasi,
+            io_ctx,
             adapter: WasiP1Adapter::new(),
             hostcall_fuel: 0,
         }
@@ -234,6 +236,7 @@ impl WasiView for WasiP1Ctx {
         WasiCtxView {
             ctx: &mut self.wasi,
             table: &mut self.table,
+            io_ctx: &mut self.io_ctx,
         }
     }
 }
