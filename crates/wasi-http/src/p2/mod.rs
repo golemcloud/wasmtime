@@ -219,12 +219,12 @@
 //! }
 //! ```
 
-#[cfg(feature = "default-send-request")]
-use self::bindings::http::types::ErrorCode;
 use crate::{DEFAULT_FORBIDDEN_HEADERS, WasiHttpCtx};
 use http::HeaderName;
-use wasmtime::component::{HasData, Linker, ResourceTable};
+use wasmtime::component::{HasData, ResourceTable};
 
+#[cfg(feature = "default-send-request")]
+mod connection_pool;
 mod error;
 mod http_impl;
 mod types_impl;
@@ -234,6 +234,31 @@ pub mod body;
 pub mod types;
 
 pub use self::error::*;
+#[cfg(feature = "default-send-request")]
+pub use self::connection_pool::{
+    HttpConnectionPool, HttpConnectionPoolConfig, default_send_request_handler,
+    default_send_request_with_pool,
+};
+
+/// A receiver that signals completion of an outgoing body.
+///
+/// This is exposed unconditionally so that the [`WasiHttpHooks::send_request`]
+/// signature is the same regardless of the `default-send-request` feature.
+/// Implementations without the feature simply receive `None`.
+pub type BodyCompletionReceiver = tokio::sync::oneshot::Receiver<
+    Result<(), self::bindings::http::types::ErrorCode>,
+>;
+
+/// Thin wrapper around [`default_send_request_with_pool`] for backward
+/// compatibility with the upstream wasi-http API. Spawns the request without
+/// a body completion signal and without a pool.
+#[cfg(feature = "default-send-request")]
+pub fn default_send_request(
+    request: hyper::Request<body::HyperOutgoingBody>,
+    config: types::OutgoingRequestConfig,
+) -> types::HostFutureIncomingResponse {
+    default_send_request_with_pool(request, config, None, None)
+}
 
 /// A trait which provides hooks into internal WASI HTTP operations.
 ///
@@ -284,13 +309,25 @@ pub use self::error::*;
 /// ```
 pub trait WasiHttpHooks: Send {
     /// Send an outgoing request.
+    ///
+    /// The `body_completion` parameter signals when the outgoing body has been
+    /// finished by the guest. The default implementation uses it to collect the
+    /// body before sending for methods that don't expect a body (GET, HEAD, etc.).
+    /// Custom implementations may ignore it if they handle body collection differently,
+    /// or use it to decide whether to defer.
     #[cfg(feature = "default-send-request")]
     fn send_request(
         &mut self,
         request: hyper::Request<body::HyperOutgoingBody>,
         config: types::OutgoingRequestConfig,
+        body_completion: Option<BodyCompletionReceiver>,
     ) -> HttpResult<types::HostFutureIncomingResponse> {
-        Ok(default_send_request(request, config))
+        Ok(default_send_request_with_pool(
+            request,
+            config,
+            body_completion,
+            self.connection_pool().cloned(),
+        ))
     }
 
     /// Send an outgoing request.
@@ -299,7 +336,17 @@ pub trait WasiHttpHooks: Send {
         &mut self,
         request: hyper::Request<body::HyperOutgoingBody>,
         config: types::OutgoingRequestConfig,
+        body_completion: Option<BodyCompletionReceiver>,
     ) -> HttpResult<types::HostFutureIncomingResponse>;
+
+    /// Returns the connection pool for outgoing requests, if configured.
+    ///
+    /// When a pool is returned, [`default_send_request_with_pool`] will reuse
+    /// connections instead of opening a new TCP+TLS connection per request.
+    #[cfg(feature = "default-send-request")]
+    fn connection_pool(&self) -> Option<&HttpConnectionPool> {
+        None
+    }
 
     /// Whether a given header should be considered forbidden and not allowed.
     fn is_forbidden_header(&mut self, name: &HeaderName) -> bool {
@@ -453,7 +500,7 @@ pub trait WasiHttpView {
 /// ```
 pub fn add_to_linker_async<T>(l: &mut wasmtime::component::Linker<T>) -> wasmtime::Result<()>
 where
-    T: WasiHttpView + wasmtime_wasi::WasiView + 'static,
+    T: WasiHttpView + wasmtime_wasi::WasiView + Send + 'static,
 {
     wasmtime_wasi::p2::add_to_linker_proxy_interfaces_async(l)?;
     add_only_http_to_linker_async(l)
@@ -468,7 +515,7 @@ pub fn add_only_http_to_linker_async<T>(
     l: &mut wasmtime::component::Linker<T>,
 ) -> wasmtime::Result<()>
 where
-    T: WasiHttpView + 'static,
+    T: WasiHttpView + Send + 'static,
 {
     let options = bindings::LinkOptions::default(); // FIXME: Thread through to the CLI options.
     bindings::http::outgoing_handler::add_to_linker::<_, WasiHttp>(l, T::http)?;
@@ -477,236 +524,3 @@ where
     Ok(())
 }
 
-/// Add all of the `wasi:http/proxy` world's interfaces to a [`wasmtime::component::Linker`].
-///
-/// This function will add the `sync` variant of all interfaces into the
-/// `Linker` provided. For embeddings with async support see
-/// [`add_to_linker_async`] instead.
-///
-/// # Example
-///
-/// ```
-/// use wasmtime::{Engine, Result, Config};
-/// use wasmtime::component::{ResourceTable, Linker};
-/// use wasmtime_wasi::{WasiCtx, WasiCtxView, WasiView};
-/// use wasmtime_wasi_http::WasiHttpCtx;
-/// use wasmtime_wasi_http::p2::{WasiHttpView, WasiHttpCtxView};
-///
-/// fn main() -> Result<()> {
-///     let config = Config::default();
-///     let engine = Engine::new(&config)?;
-///
-///     let mut linker = Linker::<MyState>::new(&engine);
-///     wasmtime_wasi_http::p2::add_to_linker_sync(&mut linker)?;
-///     // ... add any further functionality to `linker` if desired ...
-///
-///     Ok(())
-/// }
-///
-/// struct MyState {
-///     ctx: WasiCtx,
-///     http_ctx: WasiHttpCtx,
-///     table: ResourceTable,
-/// }
-/// impl WasiHttpView for MyState {
-///     fn http(&mut self) -> WasiHttpCtxView<'_> {
-///         WasiHttpCtxView {
-///             ctx: &mut self.http_ctx,
-///             table: &mut self.table,
-///             hooks: Default::default(),
-///         }
-///     }
-/// }
-/// impl WasiView for MyState {
-///     fn ctx(&mut self) -> WasiCtxView<'_> {
-///         WasiCtxView { ctx: &mut self.ctx, table: &mut self.table }
-///     }
-/// }
-/// ```
-pub fn add_to_linker_sync<T>(l: &mut Linker<T>) -> wasmtime::Result<()>
-where
-    T: WasiHttpView + wasmtime_wasi::WasiView + 'static,
-{
-    wasmtime_wasi::p2::add_to_linker_proxy_interfaces_sync(l)?;
-    add_only_http_to_linker_sync(l)
-}
-
-/// A slimmed down version of [`add_to_linker_sync`] which only adds
-/// `wasi:http` interfaces to the linker.
-///
-/// This is useful when using [`wasmtime_wasi::p2::add_to_linker_sync`] for
-/// example to avoid re-adding the same interfaces twice.
-pub fn add_only_http_to_linker_sync<T>(l: &mut Linker<T>) -> wasmtime::Result<()>
-where
-    T: WasiHttpView + 'static,
-{
-    let options = bindings::LinkOptions::default(); // FIXME: Thread through to the CLI options.
-    bindings::sync::http::outgoing_handler::add_to_linker::<_, WasiHttp>(l, T::http)?;
-    bindings::sync::http::types::add_to_linker::<_, WasiHttp>(l, &options.into(), T::http)?;
-
-    Ok(())
-}
-
-/// The default implementation of how an outgoing request is sent.
-///
-/// This implementation is used by the `wasi:http/outgoing-handler` interface
-/// default implementation.
-#[cfg(feature = "default-send-request")]
-pub fn default_send_request(
-    request: hyper::Request<body::HyperOutgoingBody>,
-    config: types::OutgoingRequestConfig,
-) -> types::HostFutureIncomingResponse {
-    let handle = wasmtime_wasi::runtime::spawn(async move {
-        Ok(default_send_request_handler(request, config).await)
-    });
-    types::HostFutureIncomingResponse::pending(handle)
-}
-
-/// The underlying implementation of how an outgoing request is sent. This should likely be spawned
-/// in a task.
-///
-/// This is called from [default_send_request] to actually send the request.
-#[cfg(feature = "default-send-request")]
-pub async fn default_send_request_handler(
-    mut request: hyper::Request<body::HyperOutgoingBody>,
-    types::OutgoingRequestConfig {
-        use_tls,
-        connect_timeout,
-        first_byte_timeout,
-        between_bytes_timeout,
-    }: types::OutgoingRequestConfig,
-) -> Result<types::IncomingResponse, ErrorCode> {
-    use crate::io::TokioIo;
-    use crate::p2::{error::dns_error, hyper_request_error};
-    use http_body_util::BodyExt;
-    use tokio::net::TcpStream;
-    use tokio::time::timeout;
-
-    if !request.headers().contains_key(hyper::header::HOST) {
-        if let Some(authority) = request.uri().authority() {
-            if let Ok(value) = hyper::header::HeaderValue::from_str(authority.as_str()) {
-                request.headers_mut().insert(hyper::header::HOST, value);
-            }
-        }
-    }
-
-    let authority = if let Some(authority) = request.uri().authority() {
-        if authority.port().is_some() {
-            authority.to_string()
-        } else {
-            let port = if use_tls { 443 } else { 80 };
-            format!("{}:{port}", authority.to_string())
-        }
-    } else {
-        return Err(ErrorCode::HttpRequestUriInvalid);
-    };
-    let tcp_stream = timeout(connect_timeout, TcpStream::connect(&authority))
-        .await
-        .map_err(|_| ErrorCode::ConnectionTimeout)?
-        .map_err(|e| match e.kind() {
-            std::io::ErrorKind::AddrNotAvailable => {
-                dns_error("address not available".to_string(), 0)
-            }
-
-            _ => {
-                if e.to_string()
-                    .starts_with("failed to lookup address information")
-                {
-                    dns_error("address not available".to_string(), 0)
-                } else {
-                    ErrorCode::ConnectionRefused
-                }
-            }
-        })?;
-
-    let (mut sender, worker) = if use_tls {
-        use rustls::pki_types::ServerName;
-
-        // derived from https://github.com/rustls/rustls/blob/main/examples/src/bin/simpleclient.rs
-        let root_cert_store = rustls::RootCertStore {
-            roots: webpki_roots::TLS_SERVER_ROOTS.into(),
-        };
-        let config = rustls::ClientConfig::builder()
-            .with_root_certificates(root_cert_store)
-            .with_no_client_auth();
-        let connector = tokio_rustls::TlsConnector::from(std::sync::Arc::new(config));
-        let mut parts = authority.split(":");
-        let host = parts.next().unwrap_or(&authority);
-        let domain = ServerName::try_from(host)
-            .map_err(|e| {
-                tracing::warn!("dns lookup error: {e:?}");
-                dns_error("invalid dns name".to_string(), 0)
-            })?
-            .to_owned();
-        let stream = connector.connect(domain, tcp_stream).await.map_err(|e| {
-            tracing::warn!("tls protocol error: {e:?}");
-            ErrorCode::TlsProtocolError
-        })?;
-        let stream = TokioIo::new(stream);
-
-        let (sender, conn) = timeout(
-            connect_timeout,
-            hyper::client::conn::http1::handshake(stream),
-        )
-        .await
-        .map_err(|_| ErrorCode::ConnectionTimeout)?
-        .map_err(hyper_request_error)?;
-
-        let worker = wasmtime_wasi::runtime::spawn(async move {
-            match conn.await {
-                Ok(()) => {}
-                // TODO: shouldn't throw away this error and ideally should
-                // surface somewhere.
-                Err(e) => tracing::warn!("dropping error {e}"),
-            }
-        });
-
-        (sender, worker)
-    } else {
-        let tcp_stream = TokioIo::new(tcp_stream);
-        let (sender, conn) = timeout(
-            connect_timeout,
-            // TODO: we should plumb the builder through the http context, and use it here
-            hyper::client::conn::http1::handshake(tcp_stream),
-        )
-        .await
-        .map_err(|_| ErrorCode::ConnectionTimeout)?
-        .map_err(hyper_request_error)?;
-
-        let worker = wasmtime_wasi::runtime::spawn(async move {
-            match conn.await {
-                Ok(()) => {}
-                // TODO: same as above, shouldn't throw this error away.
-                Err(e) => tracing::warn!("dropping error {e}"),
-            }
-        });
-
-        (sender, worker)
-    };
-
-    // at this point, the request contains the scheme and the authority, but
-    // the http packet should only include those if addressing a proxy, so
-    // remove them here, since SendRequest::send_request does not do it for us
-    *request.uri_mut() = http::Uri::builder()
-        .path_and_query(
-            request
-                .uri()
-                .path_and_query()
-                .map(|p| p.as_str())
-                .unwrap_or("/"),
-        )
-        .build()
-        .expect("comes from valid request");
-
-    let resp = timeout(first_byte_timeout, sender.send_request(request))
-        .await
-        .map_err(|_| ErrorCode::ConnectionReadTimeout)?
-        .map_err(hyper_request_error)?
-        .map(|body| body.map_err(hyper_request_error).boxed_unsync());
-
-    Ok(types::IncomingResponse {
-        resp,
-        worker: Some(worker),
-        between_bytes_timeout,
-    })
-}

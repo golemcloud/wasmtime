@@ -29,6 +29,12 @@ pub struct HostIncomingBody {
     /// This ensures that if the parent of this body is dropped before the body
     /// then the backing data behind this worker is kept alive.
     worker: Option<AbortOnDropJoinHandle<()>>,
+    /// Receives errors from the connection worker task, if any.
+    worker_error_receiver: Option<crate::p2::types::ConnWorkerErrorReceiver>,
+    /// Connection concurrency permits held while this body is being read.
+    /// Released when the body is dropped, allowing queued requests to proceed.
+    #[cfg(feature = "default-send-request")]
+    connection_permits: Option<crate::p2::types::ConnectionPermits>,
 }
 
 impl HostIncomingBody {
@@ -38,31 +44,66 @@ impl HostIncomingBody {
         HostIncomingBody {
             body: IncomingBodyState::Start(body),
             worker: None,
+            worker_error_receiver: None,
+            #[cfg(feature = "default-send-request")]
+            connection_permits: None,
         }
     }
 
     /// Retain a worker task that needs to be kept alive while this body is being read.
-    pub fn retain_worker(&mut self, worker: AbortOnDropJoinHandle<()>) {
+    ///
+    /// If a `worker_error_receiver` is provided, connection worker errors will be
+    /// surfaced through the body stream during reads.
+    pub fn retain_worker(
+        &mut self,
+        worker: AbortOnDropJoinHandle<()>,
+        worker_error_receiver: Option<crate::p2::types::ConnWorkerErrorReceiver>,
+    ) {
         assert!(self.worker.is_none());
         self.worker = Some(worker);
+        self.worker_error_receiver = worker_error_receiver;
+    }
+
+    /// Retain connection concurrency permits that should be held while this body
+    /// is being read. The permits are released when the body is dropped.
+    #[cfg(feature = "default-send-request")]
+    pub fn retain_connection_permits(
+        &mut self,
+        permits: Option<crate::p2::types::ConnectionPermits>,
+    ) {
+        self.connection_permits = permits;
+    }
+
+    /// Create a new `HostIncomingBody` that always fails with the given error.
+    pub fn failing(error: String) -> HostIncomingBody {
+        HostIncomingBody {
+            body: IncomingBodyState::Failing(Arc::from(error)),
+            worker: None,
+            worker_error_receiver: None,
+            #[cfg(feature = "default-send-request")]
+            connection_permits: None,
+        }
     }
 
     /// Try taking the stream of this body, if it's available.
-    pub fn take_stream(&mut self) -> Option<HostIncomingBodyStream> {
+    pub fn take_stream(&mut self) -> Option<Box<dyn InputStream>> {
         match &mut self.body {
             IncomingBodyState::Start(_) => {}
             IncomingBodyState::InBodyStream(_) => return None,
+            IncomingBodyState::Failing(error) => {
+                return Some(Box::new(FailingStream(Arc::clone(error))));
+            }
         }
         let (tx, rx) = oneshot::channel();
         let body = match mem::replace(&mut self.body, IncomingBodyState::InBodyStream(rx)) {
             IncomingBodyState::Start(b) => b,
-            IncomingBodyState::InBodyStream(_) => unreachable!(),
+            IncomingBodyState::InBodyStream(_) | IncomingBodyState::Failing(_) => unreachable!(),
         };
-        Some(HostIncomingBodyStream {
+        Some(Box::new(HostIncomingBodyStream {
             state: IncomingBodyStreamState::Open { body, tx },
             buffer: Bytes::new(),
             error: None,
-        })
+        }))
     }
 
     /// Convert this body into a `HostFutureTrailers` resource.
@@ -82,6 +123,11 @@ enum IncomingBodyState {
     /// currently owned here. The body will be sent back over this channel when
     /// it's done, however.
     InBodyStream(oneshot::Receiver<StreamEnd>),
+
+    /// The body has been replaced with a failing stream that always returns
+    /// the given error. Used when a deferred request fails before the body
+    /// could be sent.
+    Failing(Arc<str>),
 }
 
 /// Small wrapper around [`HyperIncomingBody`] which adds a timeout to every frame.
@@ -267,6 +313,10 @@ impl InputStream for HostIncomingBodyStream {
             }
         }
     }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
 }
 
 #[async_trait::async_trait]
@@ -364,6 +414,12 @@ impl Pollable for HostFutureTrailers {
         let hyper_body = match &mut body.body {
             IncomingBodyState::Start(body) => body,
             IncomingBodyState::InBodyStream(_) => unreachable!(),
+            IncomingBodyState::Failing(error) => {
+                let msg = (**error).to_string();
+                *self = HostFutureTrailers::Done(Ok(None));
+                tracing::debug!(error = %msg, "future-trailers on failing body");
+                return;
+            }
         };
         let result = loop {
             match hyper_body.frame().await {
@@ -419,6 +475,10 @@ pub struct HostOutgoingBody {
     context: StreamContext,
     written: Option<WrittenState>,
     finish_sender: Option<tokio::sync::oneshot::Sender<FinishMessage>>,
+    /// Signals that the body has been completed (finished or aborted).
+    /// Used by the deferred request path to know when to send the request.
+    completion_sender:
+        Option<tokio::sync::oneshot::Sender<Result<(), types::ErrorCode>>>,
 }
 
 impl HostOutgoingBody {
@@ -493,6 +553,7 @@ impl HostOutgoingBody {
                 context,
                 written,
                 finish_sender: Some(finish_sender),
+                completion_sender: None,
             },
             body_impl,
         )
@@ -501,6 +562,17 @@ impl HostOutgoingBody {
     /// Take the output stream, if it's available.
     pub fn take_output_stream(&mut self) -> Option<Box<dyn OutputStream>> {
         self.body_output_stream.take()
+    }
+
+    /// Set the completion sender for deferred request sending.
+    /// When `finish()` is called successfully, `Ok(())` will be sent.
+    /// When the body is aborted or fails, an error will be sent.
+    pub fn set_completion_sender(
+        &mut self,
+        sender: tokio::sync::oneshot::Sender<Result<(), types::ErrorCode>>,
+    ) {
+        debug_assert!(self.completion_sender.is_none());
+        self.completion_sender = Some(sender);
     }
 
     /// Finish the body, optionally with trailers.
@@ -518,7 +590,11 @@ impl HostOutgoingBody {
             let written = w.written();
             if written != w.expected {
                 let _ = sender.send(FinishMessage::Abort);
-                return Err(self.context.as_body_size_error(written));
+                let err = self.context.as_body_size_error(written);
+                if let Some(completion_sender) = self.completion_sender.take() {
+                    let _ = completion_sender.send(Err(err.clone()));
+                }
+                return Err(err);
             }
         }
 
@@ -530,6 +606,10 @@ impl HostOutgoingBody {
 
         // Ignoring failure: receiver died sending body, but we can't report that here.
         let _ = sender.send(message);
+
+        if let Some(completion_sender) = self.completion_sender.take() {
+            let _ = completion_sender.send(Ok(()));
+        }
 
         Ok(())
     }
@@ -546,6 +626,10 @@ impl HostOutgoingBody {
             .expect("outgoing-body trailer_sender consumed by a non-owning function");
 
         let _ = sender.send(FinishMessage::Abort);
+
+        if let Some(completion_sender) = self.completion_sender.take() {
+            let _ = completion_sender.send(Err(types::ErrorCode::HttpProtocolError));
+        }
     }
 }
 
@@ -662,6 +746,10 @@ impl OutputStream for BodyWriteStream {
             Ok(self.write_budget)
         }
     }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
 }
 
 #[async_trait::async_trait]
@@ -672,4 +760,28 @@ impl Pollable for BodyWriteStream {
         // If the channel is full this will block until capacity opens up.
         let _ = self.writer.reserve().await;
     }
+}
+
+/// A stream that always fails with a given error message.
+///
+/// Used by the deferred request path to surface failure of an early send error
+/// (e.g. invalid URI, body-finish error) to the guest through the body stream.
+pub struct FailingStream(pub Arc<str>);
+
+#[async_trait::async_trait]
+impl InputStream for FailingStream {
+    fn read(&mut self, _size: usize) -> Result<Bytes, StreamError> {
+        Err(StreamError::LastOperationFailed(wasmtime::Error::msg(
+            Arc::clone(&self.0),
+        )))
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+#[async_trait::async_trait]
+impl Pollable for FailingStream {
+    async fn ready(&mut self) {}
 }

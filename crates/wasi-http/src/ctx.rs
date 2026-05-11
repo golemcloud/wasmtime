@@ -11,7 +11,11 @@ const DEFAULT_FIELD_SIZE_LIMIT: usize = 128 * 1024;
 /// Capture the state necessary for use in the wasi-http API implementation.
 #[derive(Debug, Clone)]
 pub struct WasiHttpCtx {
-    pub(crate) field_size_limit: usize,
+    /// Maximum size for the contents of a fields resource.
+    pub field_size_limit: usize,
+    /// Optional connection pool used for outgoing HTTP requests.
+    #[cfg(feature = "default-send-request")]
+    pub connection_pool: Option<crate::p2::HttpConnectionPool>,
 }
 
 impl WasiHttpCtx {
@@ -19,6 +23,8 @@ impl WasiHttpCtx {
     pub fn new() -> Self {
         Self {
             field_size_limit: DEFAULT_FIELD_SIZE_LIMIT,
+            #[cfg(feature = "default-send-request")]
+            connection_pool: None,
         }
     }
 
