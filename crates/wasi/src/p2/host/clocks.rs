@@ -51,7 +51,7 @@ impl TryFrom<SystemTime> for Datetime {
 }
 
 impl wall_clock::Host for WasiClocksCtxView<'_> {
-    fn now(&mut self) -> wasmtime::Result<Datetime> {
+    async fn now(&mut self) -> wasmtime::Result<Datetime> {
         let now = self.ctx.wall_clock.now();
         Ok(Datetime {
             seconds: now.as_secs(),
@@ -59,7 +59,7 @@ impl wall_clock::Host for WasiClocksCtxView<'_> {
         })
     }
 
-    fn resolution(&mut self) -> wasmtime::Result<Datetime> {
+    async fn resolution(&mut self) -> wasmtime::Result<Datetime> {
         let res = self.ctx.wall_clock.resolution();
         Ok(Datetime {
             seconds: res.as_secs(),
@@ -72,6 +72,11 @@ fn subscribe_to_duration(
     table: &mut wasmtime::component::ResourceTable,
     duration: tokio::time::Duration,
 ) -> wasmtime::Result<Resource<DynPollable>> {
+    let supports_suspend = if duration.is_zero() {
+        None
+    } else {
+        std::time::Instant::now().checked_add(duration)
+    };
     let sleep = if duration.is_zero() {
         table.push(Deadline::Past)?
     } else if let Some(deadline) = tokio::time::Instant::now().checked_add(duration) {
@@ -84,19 +89,19 @@ fn subscribe_to_duration(
         // represent it, wait forever rather than trap.
         table.push(Deadline::Never)?
     };
-    subscribe(table, sleep)
+    subscribe(table, sleep, supports_suspend)
 }
 
 impl monotonic_clock::Host for WasiClocksCtxView<'_> {
-    fn now(&mut self) -> wasmtime::Result<Instant> {
+    async fn now(&mut self) -> wasmtime::Result<Instant> {
         Ok(self.ctx.monotonic_clock.now())
     }
 
-    fn resolution(&mut self) -> wasmtime::Result<Instant> {
+    async fn resolution(&mut self) -> wasmtime::Result<Instant> {
         Ok(self.ctx.monotonic_clock.resolution())
     }
 
-    fn subscribe_instant(&mut self, when: Instant) -> wasmtime::Result<Resource<DynPollable>> {
+    async fn subscribe_instant(&mut self, when: Instant) -> wasmtime::Result<Resource<DynPollable>> {
         let clock_now = self.ctx.monotonic_clock.now();
         let duration = if when > clock_now {
             Duration::from_nanos(when - clock_now)
@@ -106,7 +111,7 @@ impl monotonic_clock::Host for WasiClocksCtxView<'_> {
         subscribe_to_duration(self.table, duration)
     }
 
-    fn subscribe_duration(
+    async fn subscribe_duration(
         &mut self,
         duration: WasiDuration,
     ) -> wasmtime::Result<Resource<DynPollable>> {

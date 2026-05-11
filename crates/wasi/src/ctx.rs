@@ -9,10 +9,12 @@ use rand::Rng;
 use std::future::Future;
 use std::mem;
 use std::net::SocketAddr;
-use std::path::Path;
+use std::time::Duration;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use tokio::io::{stderr, stdin, stdout};
 use wasmtime::Result;
+use wasmtime_wasi_io::IoCtx;
 
 /// Builder-style structure used to create a [`WasiCtx`].
 ///
@@ -30,18 +32,34 @@ use wasmtime::Result;
 /// wasi.arg("--help");
 /// wasi.env("FOO", "bar");
 ///
-/// let wasi: WasiCtx = wasi.build();
+/// let (wasi, _io_ctx): (WasiCtx, wasmtime_wasi_io::IoCtx) = wasi.build();
 /// ```
 ///
 /// [`Store`]: wasmtime::Store
-#[derive(Default)]
 pub struct WasiCtxBuilder {
     cli: WasiCliCtx,
     clocks: WasiClocksCtx,
     filesystem: WasiFilesystemCtx,
     random: WasiRandomCtx,
     sockets: WasiSocketsCtx,
+    suspend_threshold: Duration,
+    suspend_signal: Box<dyn Fn(Duration) -> wasmtime::Error + Send + Sync + 'static>,
     built: bool,
+}
+
+impl Default for WasiCtxBuilder {
+    fn default() -> Self {
+        Self {
+            cli: Default::default(),
+            clocks: Default::default(),
+            filesystem: Default::default(),
+            random: Default::default(),
+            sockets: Default::default(),
+            suspend_threshold: Duration::MAX,
+            suspend_signal: Box::new(|_| unreachable!("suspend_signal not set")),
+            built: false,
+        }
+    }
 }
 
 impl WasiCtxBuilder {
@@ -310,6 +328,7 @@ impl WasiCtxBuilder {
                 file_perms,
                 open_mode,
                 self.filesystem.allow_blocking_current_thread,
+                PathBuf::from(host_path.as_ref()),
             ),
             guest_path.as_ref().to_owned(),
         ));
@@ -431,6 +450,16 @@ impl WasiCtxBuilder {
         self
     }
 
+    pub fn set_suspend(
+        &mut self,
+        suspend_threshold: Duration,
+        suspend_signal: impl Fn(Duration) -> wasmtime::Error + Send + Sync + 'static,
+    ) -> &mut Self {
+        self.suspend_threshold = suspend_threshold;
+        self.suspend_signal = Box::new(suspend_signal);
+        self
+    }
+
     /// Uses the configured context so far to construct the final [`WasiCtx`].
     ///
     /// Note that each `WasiCtxBuilder` can only be used to "build" once, and
@@ -441,7 +470,7 @@ impl WasiCtxBuilder {
     /// Panics if this method is called twice. Each [`WasiCtxBuilder`] can be
     /// used to create only a single [`WasiCtx`]. Repeated usage of this method
     /// is not allowed and should use a second builder instead.
-    pub fn build(&mut self) -> WasiCtx {
+    pub fn build(&mut self) -> (WasiCtx, IoCtx) {
         assert!(!self.built);
 
         let Self {
@@ -450,37 +479,25 @@ impl WasiCtxBuilder {
             filesystem,
             random,
             sockets,
+            suspend_threshold,
+            suspend_signal,
             built: _,
         } = mem::replace(self, Self::new());
         self.built = true;
 
-        WasiCtx {
-            cli,
-            clocks,
-            filesystem,
-            random,
-            sockets,
-        }
-    }
-    /// Builds a WASIp1 context instead of a [`WasiCtx`].
-    ///
-    /// This method is the same as [`build`](WasiCtxBuilder::build) but it
-    /// creates a [`WasiP1Ctx`] instead. This is intended for use with the
-    /// [`p1`] module of this crate
-    ///
-    /// [`WasiP1Ctx`]: crate::p1::WasiP1Ctx
-    /// [`p1`]: crate::p1
-    ///
-    /// # Panics
-    ///
-    /// Panics if this method is called twice. Each [`WasiCtxBuilder`] can be
-    /// used to create only a single [`WasiCtx`] or [`WasiP1Ctx`]. Repeated
-    /// usage of this method is not allowed and should use a second builder
-    /// instead.
-    #[cfg(feature = "p1")]
-    pub fn build_p1(&mut self) -> crate::p1::WasiP1Ctx {
-        let wasi = self.build();
-        crate::p1::WasiP1Ctx::new(wasi)
+        (
+            WasiCtx {
+                cli,
+                clocks,
+                filesystem,
+                random,
+                sockets,
+            },
+            IoCtx {
+                suspend_threshold,
+                suspend_signal,
+            },
+        )
     }
 }
 
@@ -505,11 +522,12 @@ impl WasiCtxBuilder {
 /// struct MyState {
 ///     ctx: WasiCtx,
 ///     table: ResourceTable,
+///     io_ctx: wasmtime_wasi_io::IoCtx,
 /// }
 ///
 /// impl WasiView for MyState {
 ///     fn ctx(&mut self) -> WasiCtxView<'_> {
-///         WasiCtxView { ctx: &mut self.ctx, table: &mut self.table }
+///         WasiCtxView { ctx: &mut self.ctx, table: &mut self.table, io_ctx: &mut self.io_ctx }
 ///     }
 /// }
 ///
@@ -520,9 +538,11 @@ impl WasiCtxBuilder {
 ///         wasi.arg("--help");
 ///         wasi.env("FOO", "bar");
 ///
+///         let (ctx, io_ctx) = wasi.build();
 ///         MyState {
-///             ctx: wasi.build(),
+///             ctx,
 ///             table: ResourceTable::new(),
+///             io_ctx,
 ///         }
 ///     }
 /// }

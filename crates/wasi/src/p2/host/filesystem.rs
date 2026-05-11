@@ -11,10 +11,8 @@ use crate::{DirPerms, FilePerms};
 use wasmtime::component::Resource;
 use wasmtime_wasi_io::streams::{DynInputStream, DynOutputStream};
 
-mod sync;
-
 impl preopens::Host for WasiFilesystemCtxView<'_> {
-    fn get_directories(&mut self) -> wasmtime::Result<Vec<(Resource<Descriptor>, String)>> {
+    async fn get_directories(&mut self) -> wasmtime::Result<Vec<(Resource<Descriptor>, String)>> {
         self.get_directories()
     }
 }
