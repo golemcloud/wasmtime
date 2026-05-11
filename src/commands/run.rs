@@ -490,7 +490,7 @@ impl RunCommand {
                 // code.
                 if store.data().legacy_p1_ctx.is_some() {
                     return Err(wasi_common::maybe_exit_on_error(e));
-                } else if store.data().wasip1_ctx.is_some() {
+                } else if store.data().wasi_ctx.is_some() {
                     if let Some(exit) = e.downcast_ref::<wasmtime_wasi::I32Exit>() {
                         std::process::exit(exit.0);
                     }
@@ -1138,17 +1138,10 @@ please reach out on Zulip with questions.
                             })?;
                             self.set_legacy_p1_ctx(store)?;
                         }
-                        // If preview2 was explicitly requested, always use it.
-                        // Otherwise use it so long as threads are disabled.
-                        //
-                        // Note that for now `p0` is currently
-                        // default-enabled but this may turn into
-                        // default-disabled in the future.
+                        // The Golem fork removed p0/p1 sync linkers; only
+                        // `set_wasi_ctx` remains, which constructs the new
+                        // (WasiCtx, IoCtx, ResourceTable) trio.
                         (Some(true), _) | (None, Some(false) | None) => {
-                            if self.run.common.wasi.preview0 != Some(false) {
-                                wasmtime_wasi::p0::add_to_linker_async(linker, |t| t.wasip1_ctx())?;
-                            }
-                            wasmtime_wasi::p1::add_to_linker_async(linker, |t| t.wasip1_ctx())?;
                             self.set_wasi_ctx(store)?;
                         }
                     }
@@ -1182,14 +1175,10 @@ please reach out on Zulip with questions.
                     #[cfg(feature = "component-model")]
                     CliLinker::Component(linker) => {
                         wasmtime_wasi_nn::wit::add_to_linker(linker, |h: &mut Host| {
-                            let ctx = h.wasip1_ctx.as_mut().expect("wasi is not configured");
-                            let ctx = Arc::get_mut(ctx)
-                                .expect("wasmtime_wasi is not compatible with threads")
-                                .get_mut()
-                                .unwrap();
+                            let table = unwrap_singlethread_context(&mut h.wasi_table);
                             let nn_ctx = Arc::get_mut(h.wasi_nn_wit.as_mut().unwrap())
                                 .expect("wasi-nn is not implemented with multi-threading support");
-                            WasiNnView::new(ctx.ctx().table, nn_ctx)
+                            WasiNnView::new(table, nn_ctx)
                         })?;
                         store.data_mut().wasi_nn_wit = Some(Arc::new(
                             wasmtime_wasi_nn::wit::WasiNnCtx::new(backends, registry),
@@ -1257,11 +1246,10 @@ please reach out on Zulip with questions.
                             .build();
 
                         wasmtime_wasi_keyvalue::add_to_linker(linker, |h| {
-                            let ctx = h.wasip1_ctx.as_mut().expect("wasip2 is not configured");
-                            let ctx = Arc::get_mut(ctx).unwrap().get_mut().unwrap();
+                            let table = unwrap_singlethread_context(&mut h.wasi_table);
                             WasiKeyValue::new(
                                 Arc::get_mut(h.wasi_keyvalue.as_mut().unwrap()).unwrap(),
-                                ctx.ctx().table,
+                                table,
                             )
                         })?;
                         store.data_mut().wasi_keyvalue = Some(Arc::new(ctx));
@@ -1411,13 +1399,8 @@ please reach out on Zulip with questions.
         Ok(())
     }
 
-    /// Note the naming here is subtle, but this is effectively setting up a
-    /// `wasmtime_wasi::WasiCtx` structure.
-    ///
-    /// This is stored in `Host` as `WasiP1Ctx` which internally contains the
-    /// `WasiCtx` and `ResourceTable` used for WASI implementations. Exactly
-    /// which "p" for WASIpN is more a reference to
-    /// `wasmtime-wasi`-vs-`wasi-common` here more than anything else.
+    /// Sets up the `wasmtime_wasi::WasiCtx`, `ResourceTable`, and `IoCtx`
+    /// stored in `Host` for WASI implementations.
     fn set_wasi_ctx(&self, store: &mut Store<Host>) -> Result<()> {
         let mut builder = wasmtime_wasi::WasiCtxBuilder::new();
         builder.args(&self.compute_argv()?);
@@ -1431,18 +1414,21 @@ please reach out on Zulip with questions.
             builder.inherit_stderr();
         }
         self.run.configure_wasip2(&mut builder)?;
-        let mut ctx = builder.build_p1();
+        let (wasi_ctx, io_ctx) = builder.build();
+        let mut table = wasmtime::component::ResourceTable::new();
         if let Some(max) = self.run.common.wasi.max_resources {
-            ctx.ctx().table.set_max_capacity(max);
+            table.set_max_capacity(max);
             #[cfg(feature = "component-model-async")]
-            if let Some(table) = store.concurrent_resource_table() {
-                table.set_max_capacity(max);
+            if let Some(concurrent_table) = store.concurrent_resource_table() {
+                concurrent_table.set_max_capacity(max);
             }
         }
         if let Some(fuel) = self.run.common.wasi.hostcall_fuel {
             store.set_hostcall_fuel(fuel);
         }
-        store.data_mut().wasip1_ctx = Some(Arc::new(Mutex::new(ctx)));
+        store.data_mut().wasi_ctx = Some(Arc::new(Mutex::new(wasi_ctx)));
+        store.data_mut().wasi_table = Some(Arc::new(Mutex::new(table)));
+        store.data_mut().wasi_io_ctx = Some(Arc::new(Mutex::new(io_ctx)));
         Ok(())
     }
 
@@ -1488,13 +1474,14 @@ pub struct Host {
     legacy_p1_ctx: Option<wasi_common::WasiCtx>,
 
     // Context for both WASIp1 and WASIp2 (and beyond) for the `wasmtime_wasi`
-    // crate. This has both `wasmtime_wasi::WasiCtx` as well as a
-    // `ResourceTable` internally to be used.
+    // crate.
     //
     // The Mutex is only needed to satisfy the Sync constraint but we never
     // actually perform any locking on it as we use Mutex::get_mut for every
     // access.
-    wasip1_ctx: Option<Arc<Mutex<wasmtime_wasi::p1::WasiP1Ctx>>>,
+    wasi_ctx: Option<Arc<Mutex<wasmtime_wasi::WasiCtx>>>,
+    wasi_table: Option<Arc<Mutex<wasmtime::component::ResourceTable>>>,
+    wasi_io_ctx: Option<Arc<Mutex<wasmtime_wasi::IoCtx>>>,
 
     #[cfg(feature = "wasi-nn")]
     wasi_nn_wit: Option<Arc<wasmtime_wasi_nn::wit::WasiNnCtx>>,
@@ -1516,11 +1503,7 @@ pub struct Host {
     wasi_tls: Option<Arc<wasmtime_wasi_tls::WasiTlsCtx>>,
 }
 
-impl Host {
-    pub(crate) fn wasip1_ctx(&mut self) -> &mut wasmtime_wasi::p1::WasiP1Ctx {
-        unwrap_singlethread_context(&mut self.wasip1_ctx)
-    }
-}
+impl Host {}
 
 fn unwrap_singlethread_context<T>(ctx: &mut Option<Arc<Mutex<T>>>) -> &mut T {
     let ctx = ctx.as_mut().expect("context not configured");
@@ -1532,7 +1515,11 @@ fn unwrap_singlethread_context<T>(ctx: &mut Option<Arc<Mutex<T>>>) -> &mut T {
 
 impl WasiView for Host {
     fn ctx(&mut self) -> WasiCtxView<'_> {
-        WasiView::ctx(self.wasip1_ctx())
+        WasiCtxView {
+            ctx: unwrap_singlethread_context(&mut self.wasi_ctx),
+            table: unwrap_singlethread_context(&mut self.wasi_table),
+            io_ctx: unwrap_singlethread_context(&mut self.wasi_io_ctx),
+        }
     }
 }
 
@@ -1542,7 +1529,7 @@ impl wasmtime_wasi_http::p2::WasiHttpView for Host {
         let ctx = self.wasi_http.as_mut().unwrap();
         let ctx = Arc::get_mut(ctx).expect("wasmtime_wasi_http is not compatible with threads");
         wasmtime_wasi_http::p2::WasiHttpCtxView {
-            table: WasiView::ctx(unwrap_singlethread_context(&mut self.wasip1_ctx)).table,
+            table: unwrap_singlethread_context(&mut self.wasi_table),
             ctx,
             hooks: &mut self.wasi_http_hooks,
         }
@@ -1555,7 +1542,7 @@ impl wasmtime_wasi_http::p3::WasiHttpView for Host {
         let ctx = self.wasi_http.as_mut().unwrap();
         let ctx = Arc::get_mut(ctx).expect("wasmtime_wasi_http is not compatible with threads");
         wasmtime_wasi_http::p3::WasiHttpCtxView {
-            table: WasiView::ctx(unwrap_singlethread_context(&mut self.wasip1_ctx)).table,
+            table: unwrap_singlethread_context(&mut self.wasi_table),
             ctx,
             hooks: &mut self.wasi_http_hooks,
         }
@@ -1566,7 +1553,7 @@ impl wasmtime_wasi_http::p3::WasiHttpView for Host {
 impl wasmtime_wasi_tls::WasiTlsView for Host {
     fn tls(&mut self) -> wasmtime_wasi_tls::WasiTlsCtxView<'_> {
         wasmtime_wasi_tls::WasiTlsCtxView {
-            table: WasiView::ctx(unwrap_singlethread_context(&mut self.wasip1_ctx)).table,
+            table: unwrap_singlethread_context(&mut self.wasi_table),
             ctx: Arc::get_mut(self.wasi_tls.as_mut().unwrap()).unwrap(),
         }
     }
