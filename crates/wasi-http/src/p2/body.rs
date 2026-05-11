@@ -61,7 +61,14 @@ impl HostIncomingBody {
     ) {
         assert!(self.worker.is_none());
         self.worker = Some(worker);
-        self.worker_error_receiver = worker_error_receiver;
+        if let Some(rx) = worker_error_receiver {
+            self.worker_error_receiver = Some(rx.clone());
+            // Also propagate to the body if it hasn't been taken yet so that
+            // end-of-stream reads see worker-level errors.
+            if let IncomingBodyState::Start(body) = &mut self.body {
+                body.worker_error_receiver = Some(rx);
+            }
+        }
     }
 
     /// Retain connection concurrency permits that should be held while this body
@@ -143,6 +150,8 @@ struct BodyWithTimeout {
     /// Maximal duration between when a frame is first requested and when it's
     /// allowed to arrive.
     between_bytes_timeout: Duration,
+    /// Receives errors from the connection worker task.
+    worker_error_receiver: Option<crate::p2::types::ConnWorkerErrorReceiver>,
 }
 
 impl BodyWithTimeout {
@@ -154,6 +163,7 @@ impl BodyWithTimeout {
             timeout: Box::pin(wasmtime_wasi::runtime::with_ambient_tokio_runtime(|| {
                 tokio::time::sleep(Duration::new(0, 0))
             })),
+            worker_error_receiver: None,
         }
     }
 }
@@ -188,6 +198,25 @@ impl Body for BodyWithTimeout {
         // arrives then the sleep timer will be reset on the next frame.
         let result = Pin::new(&mut me.inner).poll_frame(cx);
         me.reset_sleep = result.is_ready();
+
+        // At end-of-stream (EOF or trailers), check if the connection worker
+        // reported an error. This surfaces connection-level failures that
+        // might not otherwise propagate through the body stream (e.g. the
+        // connection was reset after all data frames were sent but before
+        // a clean shutdown).
+        let is_end_of_stream = match &result {
+            Poll::Ready(None) => true,
+            Poll::Ready(Some(Ok(frame))) if !frame.is_data() => true,
+            _ => false,
+        };
+        if is_end_of_stream {
+            if let Some(rx) = me.worker_error_receiver.take() {
+                if let Some(err) = rx.borrow().as_ref() {
+                    return Poll::Ready(Some(Err(err.as_ref().clone())));
+                }
+            }
+        }
+
         result
     }
 }
@@ -249,11 +278,15 @@ impl HostIncomingBodyStream {
                 self.state = IncomingBodyStreamState::Closed;
             }
 
-            // No more frames are going to be received again, so drop the `body`
-            // and the `tx` channel we'd send the body back onto because it's
-            // not needed as frames are done.
+            // No more frames are going to be received, so send an explicit
+            // EOF (no trailers) and close the stream. This ensures that any
+            // outstanding HostFutureTrailers will resolve to `None` rather
+            // than waiting forever for a body that already finished.
             None => {
-                self.state = IncomingBodyStreamState::Closed;
+                let prev = mem::replace(&mut self.state, IncomingBodyStreamState::Closed);
+                if let IncomingBodyStreamState::Open { body: _, tx } = prev {
+                    let _ = tx.send(StreamEnd::Trailers(None));
+                }
             }
         }
     }

@@ -292,7 +292,7 @@ impl wit::HostEventFuture for ResourceTable {
     }
 
     async fn subscribe(&mut self, self_: Resource<EventFuture>) -> Result<Resource<DynPollable>> {
-        subscribe(self, self_)
+        subscribe(self, self_, None)
     }
 }
 
