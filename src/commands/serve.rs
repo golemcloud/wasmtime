@@ -53,6 +53,7 @@ const DEFAULT_WASIP3_MAX_INSTANCE_CONCURRENT_REUSE_COUNT: usize = 16;
 struct Host {
     table: wasmtime::component::ResourceTable,
     ctx: WasiCtx,
+    io_ctx: wasmtime_wasi::IoCtx,
     http: WasiHttpCtx,
     hooks: HttpHooks,
 
@@ -78,6 +79,7 @@ impl WasiView for Host {
         WasiCtxView {
             ctx: &mut self.ctx,
             table: &mut self.table,
+            io_ctx: &mut self.io_ctx,
         }
     }
 }
@@ -390,9 +392,11 @@ impl ServeCommand {
         if let Some(max) = self.run.common.wasi.max_resources {
             table.set_max_capacity(max);
         }
+        let (ctx, io_ctx) = builder.build();
         let mut host = Host {
             table,
-            ctx: builder.build(),
+            ctx,
+            io_ctx,
             http: self.run.wasi_http_ctx()?,
             hooks: self.run.wasi_http_hooks(),
 
@@ -1370,6 +1374,10 @@ impl wasmtime_wasi::p2::OutputStream for LogStream {
 
     fn check_write(&mut self) -> StreamResult<usize> {
         Ok(1024 * 1024)
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
     }
 }
 
