@@ -22,6 +22,26 @@ pub struct DynPollable {
     pub(crate) make_future: MakeFuture,
     pub(crate) remove_index_on_delete: Option<fn(&mut ResourceTable, u32) -> Result<()>>,
     pub(crate) supports_suspend: Option<Instant>,
+    /// If `true`, when this pollable participates in a `wasi:io/poll#poll` (or
+    /// `pollable.block`) call that would otherwise return synchronously on the
+    /// very first poll because all of its futures resolved immediately, the
+    /// host will inject a single cooperative yield to the async runtime before
+    /// returning.
+    ///
+    /// This preserves runtime fairness for guests that use a zero-duration
+    /// pollable as an idiomatic `yield_now`, without breaking
+    /// `pollable.ready` (which is supposed to be a synchronous "is ready right
+    /// now?" probe).
+    pub(crate) yield_on_immediate_return: bool,
+}
+
+impl DynPollable {
+    /// Mark this pollable so the host injects a cooperative yield to the async
+    /// runtime when a `poll`/`block` call would otherwise return synchronously
+    /// on its first poll because of this pollable.
+    pub fn set_yield_on_immediate_return(&mut self, yield_on_immediate_return: bool) {
+        self.yield_on_immediate_return = yield_on_immediate_return;
+    }
 }
 
 /// The trait used to implement [`DynPollable`] to create a `pollable`
@@ -120,6 +140,7 @@ where
         },
         make_future: make_future::<T>,
         supports_suspend,
+        yield_on_immediate_return: false,
     };
 
     Ok(table.push_child(pollable, &resource)?)
@@ -172,6 +193,7 @@ where
         },
         make_future: make_future::<T>,
         supports_suspend,
+        yield_on_immediate_return: false,
     };
 
     Ok(table.push_child(pollable, &resource)?)
