@@ -51,6 +51,7 @@ impl poll::Host for IoData<'_> {
 
         let mut table_futures: BTreeMap<u32, (MakeFuture, Vec<ReadylistIndex>)> = BTreeMap::new();
         let mut all_supports_suspend = Some(None);
+        let mut yield_on_immediate_return = false;
 
         for (ix, p) in pollables.iter().enumerate() {
             let ix: u32 = ix.try_into()?;
@@ -61,6 +62,10 @@ impl poll::Host for IoData<'_> {
                 .entry(pollable.index)
                 .or_insert((pollable.make_future, Vec::new()));
             list.push(ix);
+
+            if pollable.yield_on_immediate_return {
+                yield_on_immediate_return = true;
+            }
 
             match pollable.supports_suspend {
                 None => {
@@ -82,47 +87,100 @@ impl poll::Host for IoData<'_> {
             }
         }
 
-        let mut futures: Vec<(DynFuture<'_>, Vec<ReadylistIndex>)> = Vec::new();
+        let mut futures: Vec<(Option<DynFuture<'_>>, Vec<ReadylistIndex>)> = Vec::new();
         for (entry, (make_future, readylist_indices)) in self.table.iter_entries(table_futures) {
             let entry = entry?;
-            futures.push((make_future(entry), readylist_indices));
+            futures.push((Some(make_future(entry)), readylist_indices));
         }
 
         struct PollList<'a> {
-            futures: Vec<(DynFuture<'a>, Vec<ReadylistIndex>)>,
+            /// Futures that have already resolved to `Ready` are replaced with
+            /// `None` so we don't poll a completed `async fn` again (which
+            /// would panic with `async fn resumed after completion`). The
+            /// readylist indices of completed futures are still reported in
+            /// the output.
+            futures: Vec<(Option<DynFuture<'a>>, Vec<ReadylistIndex>)>,
+            /// Indices accumulated from futures that have already resolved.
+            ready_indices: Vec<u32>,
+            /// If `true` and the futures all resolve on the very first poll,
+            /// the host injects a single cooperative yield to the async
+            /// runtime before returning, so other tasks (e.g. `mio`-driven
+            /// sockets in the host runtime) get a chance to make progress.
+            ///
+            /// See `wasmtime-wasi-io::poll::DynPollable::yield_on_immediate_return`
+            /// and upstream wasmtime issue #13040 for context.
+            yield_on_immediate_return: bool,
+            /// Tracks whether we've already yielded to the async runtime at
+            /// least once during this `poll` call. Returning `Pending`
+            /// naturally also counts, so we never inject more than one yield.
+            fairness_yielded: bool,
         }
         impl<'a> Future for PollList<'a> {
             type Output = Vec<u32>;
 
             fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-                let mut any_ready = false;
-                let mut results = Vec::new();
-                for (fut, readylist_indices) in self.futures.iter_mut() {
+                let mut newly_ready: Vec<u32> = Vec::new();
+                for (fut_slot, readylist_indices) in self.futures.iter_mut() {
+                    let Some(fut) = fut_slot.as_mut() else {
+                        continue;
+                    };
                     match fut.as_mut().poll(cx) {
                         Poll::Ready(()) => {
-                            results.extend_from_slice(readylist_indices);
-                            any_ready = true;
+                            // Drop the future so we never poll it again on a
+                            // subsequent re-poll (Rust panics if an already
+                            // completed `async fn` future is polled again).
+                            newly_ready.extend_from_slice(readylist_indices);
+                            *fut_slot = None;
                         }
                         Poll::Pending => {}
                     }
                 }
+                let any_newly_ready = !newly_ready.is_empty();
+                self.ready_indices.append(&mut newly_ready);
+                let any_ready = !self.ready_indices.is_empty();
                 if any_ready {
-                    Poll::Ready(results)
+                    if self.yield_on_immediate_return
+                        && !self.fairness_yielded
+                        && any_newly_ready
+                    {
+                        // Force a single yield to the async runtime, then
+                        // re-poll on the next wake to allow any other futures
+                        // that may become ready in the meantime to be
+                        // collected before returning to the guest.
+                        self.fairness_yielded = true;
+                        cx.waker().wake_by_ref();
+                        Poll::Pending
+                    } else {
+                        let results = std::mem::take(&mut self.ready_indices);
+                        Poll::Ready(results)
+                    }
                 } else {
+                    // Returning `Pending` naturally yields to the runtime, so
+                    // mark fairness as satisfied to avoid an additional
+                    // injected yield on subsequent polls.
+                    self.fairness_yielded = true;
                     Poll::Pending
                 }
             }
         }
 
-        Ok(PollList { futures }.await)
+        Ok(PollList {
+            futures,
+            ready_indices: Vec::new(),
+            yield_on_immediate_return,
+            fairness_yielded: false,
+        }
+        .await)
     }
 }
 
 impl crate::bindings::wasi::io::poll::HostPollable for IoData<'_> {
     async fn block(&mut self, pollable: Resource<DynPollable>) -> Result<()> {
-        let pollable = get_pollable_following_overrides(self.table, &pollable)?;
-        let ready = (pollable.make_future)(self.table.get_any_mut(pollable.index)?);
-        ready.await;
+        // `block` is defined as equivalent to `poll([self])`, so delegate to
+        // `poll::Host::poll` to share the cooperative-yield handling for
+        // `yield_on_immediate_return` pollables (see upstream wasmtime
+        // issue #13040).
+        let _ = <Self as poll::Host>::poll(self, vec![pollable]).await?;
         Ok(())
     }
     async fn ready(&mut self, pollable: Resource<DynPollable>) -> Result<bool> {
