@@ -954,6 +954,21 @@ impl<T> Store<T> {
         self.as_context_mut().run_concurrent(fun).await
     }
 
+    /// Convenience wrapper for [`StoreContextMut::run_concurrent_and_drain`].
+    pub async fn run_concurrent_and_drain<R>(
+        &mut self,
+        fun: impl AsyncFnOnce(&Accessor<T>) -> R,
+    ) -> Result<R>
+    where
+        T: Send + 'static,
+    {
+        ensure!(
+            self.as_context().0.concurrency_support(),
+            "cannot use `run_concurrent_and_drain` when Config::concurrency_support disabled",
+        );
+        self.as_context_mut().run_concurrent_and_drain(fun).await
+    }
+
     #[doc(hidden)]
     pub fn assert_concurrent_state_empty(&mut self) {
         self.as_context_mut().assert_concurrent_state_empty();
@@ -1147,7 +1162,7 @@ impl<T> StoreContextMut<'_, T> {
             self.0.concurrency_support(),
             "cannot use `run_concurrent` when Config::concurrency_support disabled",
         );
-        self.do_run_concurrent(fun, false).await
+        self.do_run_concurrent(fun, false, false).await
     }
 
     pub(super) async fn run_concurrent_trap_on_idle<R>(
@@ -1157,18 +1172,55 @@ impl<T> StoreContextMut<'_, T> {
     where
         T: Send + 'static,
     {
-        self.do_run_concurrent(fun, true).await
+        self.do_run_concurrent(fun, true, false).await
+    }
+
+    /// Like [`StoreContextMut::run_concurrent`], but after `fun` completes the
+    /// event loop keeps running until the store is fully quiescent: no pending
+    /// host tasks, no remaining work items, and no remaining "interesting"
+    /// guest tasks (i.e. every guest task has not just returned its result via
+    /// `task.return` but has actually exited).
+    ///
+    /// This is needed to drain "tail work" that a guest may keep running after
+    /// it has returned its result via `task.return` (e.g. futures created with
+    /// `wit_bindgen::spawn`). `run_concurrent` / `call_async` resolve as soon
+    /// as the driving future completes and leave such tail work for a later
+    /// event-loop scope; this variant instead drives the loop to genuine idle
+    /// before returning the captured result.
+    ///
+    /// Like the `call_async` path, the event loop traps with
+    /// [`Trap::AsyncDeadlock`] if it goes idle while still unable to finish:
+    /// either *before* `fun` completes, or *after* it completes while a tail
+    /// guest task is parked with no pending host future or queued work that
+    /// could let it make progress.
+    pub async fn run_concurrent_and_drain<R>(
+        self,
+        fun: impl AsyncFnOnce(&Accessor<T>) -> R,
+    ) -> Result<R>
+    where
+        T: Send + 'static,
+    {
+        ensure!(
+            self.0.concurrency_support(),
+            "cannot use `run_concurrent_and_drain` when Config::concurrency_support disabled",
+        );
+        self.do_run_concurrent(fun, true, true).await
     }
 
     async fn do_run_concurrent<R>(
         mut self,
         fun: impl AsyncFnOnce(&Accessor<T>) -> R,
         trap_on_idle: bool,
+        drain_after_complete: bool,
     ) -> Result<R>
     where
         T: Send + 'static,
     {
         debug_assert!(self.0.concurrency_support());
+        // Draining after completion relies on `trap_on_idle` to surface a
+        // post-`task.return` tail task that can no longer make progress; without
+        // it such a task would make `poll_until` hang forever.
+        debug_assert!(!drain_after_complete || trap_on_idle);
         check_recursive_run();
         let token = StoreToken::new(self.as_context_mut());
 
@@ -1200,7 +1252,7 @@ impl<T> StoreContextMut<'_, T> {
         dropper
             .store
             .as_context_mut()
-            .poll_until(future, trap_on_idle)
+            .poll_until(future, trap_on_idle, drain_after_complete)
             .await
     }
 
@@ -1209,10 +1261,21 @@ impl<T> StoreContextMut<'_, T> {
     /// The returned future will resolve when the specified future completes or,
     /// if `trap_on_idle` is true, when the event loop can't make further
     /// progress.
+    ///
+    /// If `drain_after_complete` is true, the result produced by `future` is
+    /// captured but not returned immediately; instead the event loop keeps
+    /// running until the store is fully quiescent (no pending host tasks, no
+    /// remaining work items, and no remaining "interesting" guest tasks), at
+    /// which point the captured result is returned. This drains any "tail work"
+    /// the guest keeps running after `task.return`. `drain_after_complete`
+    /// requires `trap_on_idle`: a tail task that becomes parked after completion
+    /// with no way to make progress is reported as [`Trap::AsyncDeadlock`]
+    /// rather than hanging.
     async fn poll_until<R>(
         mut self,
         mut future: Pin<&mut impl Future<Output = R>>,
         trap_on_idle: bool,
+        drain_after_complete: bool,
     ) -> Result<R>
     where
         T: Send + 'static,
@@ -1229,6 +1292,12 @@ impl<T> StoreContextMut<'_, T> {
                 }
             }
         }
+
+        // When `drain_after_complete` is set, `future`'s result is stashed here
+        // once it resolves, and the loop keeps draining until idle. A completed
+        // future must never be polled again, so all poll sites are guarded by
+        // `completed.is_none()`.
+        let mut completed: Option<R> = None;
 
         loop {
             // Take `ConcurrentState::futures` out of the store so we can poll
@@ -1253,10 +1322,21 @@ impl<T> StoreContextMut<'_, T> {
             }
 
             let result = future::poll_fn(|cx| {
-                // First, poll the future we were passed as an argument and
-                // return immediately if it's ready.
-                if let Poll::Ready(value) = tls::set(reset.store.0, || future.as_mut().poll(cx)) {
-                    return Poll::Ready(Ok(PollResult::Complete(value)));
+                // First, poll the future we were passed as an argument. If it's
+                // ready, return immediately -- unless we are draining tail work
+                // after completion, in which case stash the result and keep the
+                // loop running until the store is fully quiescent. A completed
+                // future is never polled again (`completed.is_none()` guard).
+                if completed.is_none() {
+                    if let Poll::Ready(value) =
+                        tls::set(reset.store.0, || future.as_mut().poll(cx))
+                    {
+                        if drain_after_complete {
+                            completed = Some(value);
+                        } else {
+                            return Poll::Ready(Ok(PollResult::Complete(value)));
+                        }
+                    }
                 }
 
                 // Next, poll `ConcurrentState::futures` (which includes any
@@ -1311,27 +1391,52 @@ impl<T> StoreContextMut<'_, T> {
                     Poll::Ready(false) => {
                         // Poll the future we were passed one last time
                         // in case one of `ConcurrentState::futures` had
-                        // the side effect of unblocking it.
-                        if let Poll::Ready(value) =
+                        // the side effect of unblocking it (skipped once
+                        // it has already completed while draining).
+                        let polled = if completed.is_none() {
                             tls::set(reset.store.0, || future.as_mut().poll(cx))
-                        {
-                            Poll::Ready(Ok(PollResult::Complete(value)))
                         } else {
-                            // In this case, there are no more pending
-                            // futures in `ConcurrentState::futures`,
-                            // there are no remaining work items, _and_
-                            // the future we were passed as an argument
-                            // still hasn't completed.
-                            if trap_on_idle {
-                                // `trap_on_idle` is true, so we exit
-                                // immediately.
-                                Poll::Ready(Err(Trap::AsyncDeadlock.into()))
+                            Poll::Pending
+                        };
+                        if let Poll::Ready(value) = polled {
+                            if drain_after_complete {
+                                // The future just completed at an otherwise
+                                // idle point. Stash the result and take one
+                                // more turn so that any work it queued on its
+                                // final poll -- or a guest task that has
+                                // returned but not yet exited -- is observed
+                                // before we declare the store quiescent.
+                                completed = Some(value);
+                                Poll::Ready(Ok(PollResult::ProcessWork {
+                                    ready: Vec::new(),
+                                    low_priority: false,
+                                }))
                             } else {
-                                // `trap_on_idle` is false, so we assume
-                                // that future will wake up and give us
-                                // more work to do when it's ready to.
-                                Poll::Pending
+                                Poll::Ready(Ok(PollResult::Complete(value)))
                             }
+                        } else if completed.is_some()
+                            && reset.store.0.concurrent_state_mut().interesting_tasks == 0
+                        {
+                            // We are draining tail work, the future already
+                            // completed, and the guest task has fully exited
+                            // (no interesting tasks remain), so the store is
+                            // quiescent: return the stashed result.
+                            Poll::Ready(Ok(PollResult::Complete(completed.take().unwrap())))
+                        } else if trap_on_idle {
+                            // Either the future never completed (a pre-return
+                            // deadlock) or it completed but a post-return tail
+                            // task is parked with no pending host future and no
+                            // queued work, so it can no longer make progress.
+                            // There are no more pending futures in
+                            // `ConcurrentState::futures` and no remaining work
+                            // items, so `trap_on_idle` makes us exit
+                            // immediately.
+                            Poll::Ready(Err(Trap::AsyncDeadlock.into()))
+                        } else {
+                            // `trap_on_idle` is false, so we assume the future
+                            // (or a tail task) will wake up and give us more
+                            // work to do when it's ready to.
+                            Poll::Pending
                         }
                     }
                     // There is at least one pending future in
