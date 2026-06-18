@@ -66,7 +66,7 @@ use crate::{
     AsContext, AsContextMut, FuncType, Result, StoreContext, StoreContextMut, ValRaw, ValType, bail,
 };
 use alloc::borrow::ToOwned;
-use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
+use alloc::collections::{BTreeMap, VecDeque};
 use core::any::Any;
 use core::cell::UnsafeCell;
 use core::fmt;
@@ -4879,7 +4879,12 @@ struct WaitableCommon {
 }
 
 /// Represents a Component Model Async `waitable`.
-#[derive(Copy, Clone, Ord, PartialOrd, Eq, PartialEq)]
+///
+/// Note: deliberately not `Ord`/`PartialOrd`. Ready waitables are tracked in
+/// insertion (completion) order via `ReadySet`; ordering them by identity
+/// (`TableId` rep) would reintroduce the nondeterministic delivery order that
+/// `ReadySet` exists to avoid.
+#[derive(Copy, Clone, Eq, PartialEq)]
 enum Waitable {
     /// A host task
     Host(TableId<HostTask>),
@@ -5048,11 +5053,72 @@ impl fmt::Debug for Waitable {
     }
 }
 
+/// An insertion-ordered set of "ready" waitables (those with a pending event).
+///
+/// This behaves like a set -- each waitable appears at most once -- but, unlike
+/// a `BTreeSet`, it preserves FIFO insertion order. `get_event` pops from the
+/// front, so when several waitables become ready before the guest drains them
+/// they are delivered in the order they became ready in this set (i.e.
+/// completion order) rather than by waitable identity (`TableId` rep).
+///
+/// This is a Golem fork change: deterministic durable replay requires the
+/// host->guest event *delivery* order to match the order completions were
+/// recorded in the oplog. Ordering by rep would make delivery order depend on
+/// table-slot allocation instead of completion order, which would break replay
+/// of concurrently-completing durable host calls.
+#[derive(Default)]
+struct ReadySet {
+    queue: VecDeque<Waitable>,
+}
+
+impl ReadySet {
+    /// Mark `waitable` ready by appending it, unless it is already present.
+    /// Returns `true` if it was newly inserted.
+    fn insert(&mut self, waitable: Waitable) -> bool {
+        if self.queue.contains(&waitable) {
+            false
+        } else {
+            self.queue.push_back(waitable);
+            true
+        }
+    }
+
+    /// Remove `waitable` if present, preserving the relative order of the rest.
+    /// Returns `true` if it was present.
+    fn remove(&mut self, waitable: &Waitable) -> bool {
+        if let Some(index) = self.queue.iter().position(|w| w == waitable) {
+            self.queue.remove(index);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Remove and return the oldest ready waitable, if any.
+    fn pop_first(&mut self) -> Option<Waitable> {
+        self.queue.pop_front()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.queue.is_empty()
+    }
+}
+
+impl IntoIterator for ReadySet {
+    type Item = Waitable;
+    type IntoIter = std::collections::vec_deque::IntoIter<Waitable>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.queue.into_iter()
+    }
+}
+
 /// Represents a Component Model Async `waitable-set`.
 #[derive(Default)]
 struct WaitableSet {
-    /// Which waitables in this set have pending events, if any.
-    ready: BTreeSet<Waitable>,
+    /// Which waitables in this set have pending events, if any, in the order
+    /// they became ready.
+    ready: ReadySet,
     /// Which guest threads are currently waiting on this set, if any.
     waiting: BTreeMap<QualifiedThreadId, WaitMode>,
     /// Whether this set is a synthetic, internal one meant for handling
