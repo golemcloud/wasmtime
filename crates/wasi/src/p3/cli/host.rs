@@ -14,7 +14,7 @@ use std::io;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::oneshot;
 use wasmtime::component::{
-    Access, Destination, FutureReader, Resource, Source, StreamConsumer, StreamProducer,
+    Accessor, Destination, FutureReader, Resource, Source, StreamConsumer, StreamProducer,
     StreamReader, StreamResult,
 };
 use wasmtime::{AsContextMut as _, StoreContextMut, error::Context as _, format_err};
@@ -223,49 +223,53 @@ impl terminal_stderr::Host for WasiCliCtxView<'_> {
 }
 
 impl<U> stdin::HostWithStore<U> for WasiCli {
-    fn read_via_stream(
-        mut store: Access<U, Self>,
+    async fn read_via_stream(
+        accessor: &Accessor<U, Self>,
     ) -> wasmtime::Result<(StreamReader<u8>, FutureReader<Result<(), ErrorCode>>)> {
-        let rx = store.get().ctx.stdin.async_stream();
-        let (result_tx, result_rx) = oneshot::channel();
-        let stream = StreamReader::new(
-            &mut store,
-            InputStreamProducer {
-                rx: Box::into_pin(rx),
-                result_tx: Some(result_tx),
-            },
-        )?;
-        let future = FutureReader::new(&mut store, async {
-            wasmtime::error::Ok(match result_rx.await {
-                Ok(err) => Err(err),
-                Err(_) => Ok(()),
-            })
-        })?;
-        Ok((stream, future))
+        accessor.with(|mut store| {
+            let rx = store.get().ctx.stdin.async_stream();
+            let (result_tx, result_rx) = oneshot::channel();
+            let stream = StreamReader::new(
+                &mut store,
+                InputStreamProducer {
+                    rx: Box::into_pin(rx),
+                    result_tx: Some(result_tx),
+                },
+            )?;
+            let future = FutureReader::new(&mut store, async {
+                wasmtime::error::Ok(match result_rx.await {
+                    Ok(err) => Err(err),
+                    Err(_) => Ok(()),
+                })
+            })?;
+            Ok((stream, future))
+        })
     }
 }
 
 impl stdin::Host for WasiCliCtxView<'_> {}
 
 impl<U> stdout::HostWithStore<U> for WasiCli {
-    fn write_via_stream(
-        mut store: Access<'_, U, Self>,
+    async fn write_via_stream(
+        accessor: &Accessor<U, Self>,
         data: StreamReader<u8>,
     ) -> wasmtime::Result<FutureReader<Result<(), ErrorCode>>> {
-        let (result_tx, result_rx) = oneshot::channel();
-        let tx = store.get().ctx.stdout.async_stream();
-        data.pipe(
-            &mut store,
-            OutputStreamConsumer {
-                tx: Box::into_pin(tx),
-                result_tx: Some(result_tx),
-                flush_pending: false,
-            },
-        )?;
-        FutureReader::new(&mut store, async {
-            wasmtime::error::Ok(match result_rx.await {
-                Ok(err) => Err(err),
-                Err(_) => Ok(()),
+        accessor.with(|mut store| {
+            let (result_tx, result_rx) = oneshot::channel();
+            let tx = store.get().ctx.stdout.async_stream();
+            data.pipe(
+                &mut store,
+                OutputStreamConsumer {
+                    tx: Box::into_pin(tx),
+                    result_tx: Some(result_tx),
+                    flush_pending: false,
+                },
+            )?;
+            FutureReader::new(&mut store, async {
+                wasmtime::error::Ok(match result_rx.await {
+                    Ok(err) => Err(err),
+                    Err(_) => Ok(()),
+                })
             })
         })
     }
@@ -274,24 +278,26 @@ impl<U> stdout::HostWithStore<U> for WasiCli {
 impl stdout::Host for WasiCliCtxView<'_> {}
 
 impl<U> stderr::HostWithStore<U> for WasiCli {
-    fn write_via_stream(
-        mut store: Access<'_, U, Self>,
+    async fn write_via_stream(
+        accessor: &Accessor<U, Self>,
         data: StreamReader<u8>,
     ) -> wasmtime::Result<FutureReader<Result<(), ErrorCode>>> {
-        let (result_tx, result_rx) = oneshot::channel();
-        let tx = store.get().ctx.stderr.async_stream();
-        data.pipe(
-            &mut store,
-            OutputStreamConsumer {
-                tx: Box::into_pin(tx),
-                result_tx: Some(result_tx),
-                flush_pending: false,
-            },
-        )?;
-        FutureReader::new(&mut store, async {
-            wasmtime::error::Ok(match result_rx.await {
-                Ok(err) => Err(err),
-                Err(_) => Ok(()),
+        accessor.with(|mut store| {
+            let (result_tx, result_rx) = oneshot::channel();
+            let tx = store.get().ctx.stderr.async_stream();
+            data.pipe(
+                &mut store,
+                OutputStreamConsumer {
+                    tx: Box::into_pin(tx),
+                    result_tx: Some(result_tx),
+                    flush_pending: false,
+                },
+            )?;
+            FutureReader::new(&mut store, async {
+                wasmtime::error::Ok(match result_rx.await {
+                    Ok(err) => Err(err),
+                    Err(_) => Ok(()),
+                })
             })
         })
     }

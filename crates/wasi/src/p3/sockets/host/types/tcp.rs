@@ -290,55 +290,59 @@ impl<T> HostTcpSocketWithStore<T> for WasiSockets {
         Ok(ret)
     }
 
-    fn send(
-        mut store: Access<'_, T, Self>,
+    async fn send(
+        accessor: &Accessor<T, Self>,
         socket: Resource<TcpSocket>,
         mut data: StreamReader<u8>,
     ) -> wasmtime::Result<FutureReader<Result<(), ErrorCode>>> {
-        let socket = get_socket_mut(store.get().table, &socket)?;
-        match socket.take_send_stream() {
-            Ok(stream) => {
-                let (result_tx, result_rx) = oneshot::channel();
-                data.pipe(
-                    &mut store,
-                    SendStreamConsumer {
-                        stream,
-                        result: Some(result_tx),
-                    },
-                )?;
-                FutureReader::new(&mut store, result_rx)
-            }
-            Err(err) => {
-                data.close(&mut store)?;
-                FutureReader::new(&mut store, async { wasmtime::error::Ok(Err(err.into())) })
-            }
-        }
-    }
-
-    fn receive(
-        mut store: Access<T, Self>,
-        socket: Resource<TcpSocket>,
-    ) -> wasmtime::Result<(StreamReader<u8>, FutureReader<Result<(), ErrorCode>>)> {
-        let socket = get_socket_mut(store.get().table, &socket)?;
-        match socket.take_receive_stream() {
-            Ok(stream) => {
-                let (result_tx, result_rx) = oneshot::channel();
-                Ok((
-                    StreamReader::new(
+        accessor.with(|mut store| {
+            let socket = get_socket_mut(store.get().table, &socket)?;
+            match socket.take_send_stream() {
+                Ok(stream) => {
+                    let (result_tx, result_rx) = oneshot::channel();
+                    data.pipe(
                         &mut store,
-                        ReceiveStreamProducer {
+                        SendStreamConsumer {
                             stream,
                             result: Some(result_tx),
                         },
-                    )?,
-                    FutureReader::new(&mut store, result_rx)?,
-                ))
+                    )?;
+                    FutureReader::new(&mut store, result_rx)
+                }
+                Err(err) => {
+                    data.close(&mut store)?;
+                    FutureReader::new(&mut store, async { wasmtime::error::Ok(Err(err.into())) })
+                }
             }
-            Err(err) => Ok((
-                StreamReader::new(&mut store, iter::empty())?,
-                FutureReader::new(&mut store, async { wasmtime::error::Ok(Err(err.into())) })?,
-            )),
-        }
+        })
+    }
+
+    async fn receive(
+        accessor: &Accessor<T, Self>,
+        socket: Resource<TcpSocket>,
+    ) -> wasmtime::Result<(StreamReader<u8>, FutureReader<Result<(), ErrorCode>>)> {
+        accessor.with(|mut store| {
+            let socket = get_socket_mut(store.get().table, &socket)?;
+            match socket.take_receive_stream() {
+                Ok(stream) => {
+                    let (result_tx, result_rx) = oneshot::channel();
+                    Ok((
+                        StreamReader::new(
+                            &mut store,
+                            ReceiveStreamProducer {
+                                stream,
+                                result: Some(result_tx),
+                            },
+                        )?,
+                        FutureReader::new(&mut store, result_rx)?,
+                    ))
+                }
+                Err(err) => Ok((
+                    StreamReader::new(&mut store, iter::empty())?,
+                    FutureReader::new(&mut store, async { wasmtime::error::Ok(Err(err.into())) })?,
+                )),
+            }
+        })
     }
 }
 

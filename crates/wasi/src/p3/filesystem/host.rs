@@ -19,7 +19,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::{JoinHandle, spawn_blocking};
 use wasmtime::StoreContextMut;
 use wasmtime::component::{
-    Access, Accessor, Destination, FutureReader, Resource, ResourceTable, Source, StreamConsumer,
+    Accessor, Destination, FutureReader, Resource, ResourceTable, Source, StreamConsumer,
     StreamProducer, StreamReader, StreamResult,
 };
 use wasmtime::error::Context as _;
@@ -517,87 +517,93 @@ impl types::Host for WasiFilesystemCtxView<'_> {
 }
 
 impl<U> types::HostDescriptorWithStore<U> for WasiFilesystem {
-    fn read_via_stream(
-        mut store: Access<U, Self>,
+    async fn read_via_stream(
+        accessor: &Accessor<U, Self>,
         fd: Resource<Descriptor>,
         offset: Filesize,
     ) -> wasmtime::Result<(StreamReader<u8>, FutureReader<Result<(), ErrorCode>>)> {
-        let file = get_file(store.get().table, &fd)?;
-        if !file.perms.contains(FilePerms::READ) {
-            return Ok((
-                StreamReader::new(&mut store, iter::empty())?,
-                FutureReader::new(&mut store, async {
-                    wasmtime::error::Ok(Err(ErrorCode::NotPermitted))
-                })?,
-            ));
-        }
+        accessor.with(|mut store| {
+            let file = get_file(store.get().table, &fd)?;
+            if !file.perms.contains(FilePerms::READ) {
+                return Ok((
+                    StreamReader::new(&mut store, iter::empty())?,
+                    FutureReader::new(&mut store, async {
+                        wasmtime::error::Ok(Err(ErrorCode::NotPermitted))
+                    })?,
+                ));
+            }
 
-        let file = file.clone();
-        let (result_tx, result_rx) = oneshot::channel();
-        Ok((
-            StreamReader::new(
-                &mut store,
-                ReadStreamProducer {
-                    file,
-                    offset,
-                    result: Some(result_tx),
-                    task: None,
-                },
-            )?,
-            FutureReader::new(&mut store, result_rx)?,
-        ))
+            let file = file.clone();
+            let (result_tx, result_rx) = oneshot::channel();
+            Ok((
+                StreamReader::new(
+                    &mut store,
+                    ReadStreamProducer {
+                        file,
+                        offset,
+                        result: Some(result_tx),
+                        task: None,
+                    },
+                )?,
+                FutureReader::new(&mut store, result_rx)?,
+            ))
+        })
     }
 
-    fn write_via_stream(
-        mut store: Access<'_, U, Self>,
+    async fn write_via_stream(
+        accessor: &Accessor<U, Self>,
         fd: Resource<Descriptor>,
         mut data: StreamReader<u8>,
         offset: Filesize,
     ) -> wasmtime::Result<FutureReader<Result<(), ErrorCode>>> {
-        let (result_tx, result_rx) = oneshot::channel();
-        match get_file(store.get().table, &fd).and_then(|file| {
-            if !file.perms.contains(FilePerms::WRITE) {
-                Err(ErrorCode::NotPermitted.into())
-            } else {
-                Ok(file.clone())
+        accessor.with(|mut store| {
+            let (result_tx, result_rx) = oneshot::channel();
+            match get_file(store.get().table, &fd).and_then(|file| {
+                if !file.perms.contains(FilePerms::WRITE) {
+                    Err(ErrorCode::NotPermitted.into())
+                } else {
+                    Ok(file.clone())
+                }
+            }) {
+                Ok(file) => {
+                    data.pipe(
+                        &mut store,
+                        WriteStreamConsumer::new_at(file, offset, result_tx),
+                    )?;
+                }
+                Err(err) => {
+                    data.close(&mut store)?;
+                    let _ = result_tx.send(Err(err.downcast().unwrap_or(ErrorCode::Io)));
+                }
             }
-        }) {
-            Ok(file) => {
-                data.pipe(
-                    &mut store,
-                    WriteStreamConsumer::new_at(file, offset, result_tx),
-                )?;
-            }
-            Err(err) => {
-                data.close(&mut store)?;
-                let _ = result_tx.send(Err(err.downcast().unwrap_or(ErrorCode::Io)));
-            }
-        }
-        FutureReader::new(&mut store, result_rx)
+            FutureReader::new(&mut store, result_rx)
+        })
     }
 
-    fn append_via_stream(
-        mut store: Access<'_, U, Self>,
+    async fn append_via_stream(
+        accessor: &Accessor<U, Self>,
         fd: Resource<Descriptor>,
         mut data: StreamReader<u8>,
     ) -> wasmtime::Result<FutureReader<Result<(), ErrorCode>>> {
-        let (result_tx, result_rx) = oneshot::channel();
-        match get_file(store.get().table, &fd).and_then(|file| {
-            if !file.perms.contains(FilePerms::WRITE) {
-                Err(ErrorCode::NotPermitted.into())
-            } else {
-                Ok(file.clone())
+        accessor.with(|mut store| {
+            let (result_tx, result_rx) = oneshot::channel();
+            match get_file(store.get().table, &fd).and_then(|file| {
+                if !file.perms.contains(FilePerms::WRITE) {
+                    Err(ErrorCode::NotPermitted.into())
+                } else {
+                    Ok(file.clone())
+                }
+            }) {
+                Ok(file) => {
+                    data.pipe(&mut store, WriteStreamConsumer::new_append(file, result_tx))?;
+                }
+                Err(err) => {
+                    data.close(&mut store)?;
+                    let _ = result_tx.send(Err(err.downcast().unwrap_or(ErrorCode::Io)));
+                }
             }
-        }) {
-            Ok(file) => {
-                data.pipe(&mut store, WriteStreamConsumer::new_append(file, result_tx))?;
-            }
-            Err(err) => {
-                data.close(&mut store)?;
-                let _ = result_tx.send(Err(err.downcast().unwrap_or(ErrorCode::Io)));
-            }
-        }
-        FutureReader::new(&mut store, result_rx)
+            FutureReader::new(&mut store, result_rx)
+        })
     }
 
     async fn advise(
@@ -662,48 +668,50 @@ impl<U> types::HostDescriptorWithStore<U> for WasiFilesystem {
         Ok(())
     }
 
-    fn read_directory(
-        mut store: Access<'_, U, Self>,
+    async fn read_directory(
+        accessor: &Accessor<U, Self>,
         fd: Resource<Descriptor>,
     ) -> wasmtime::Result<(
         StreamReader<DirectoryEntry>,
         FutureReader<Result<(), ErrorCode>>,
     )> {
-        let (result_tx, result_rx) = oneshot::channel();
-        let stream = match get_dir(store.get().table, &fd).and_then(|dir| {
-            if !dir.perms.contains(DirPerms::READ) {
-                Err(ErrorCode::NotPermitted.into())
-            } else {
-                Ok(dir)
-            }
-        }) {
-            Ok(dir) => {
-                let allow_blocking_current_thread = dir.allow_blocking_current_thread;
-                let dir = Arc::clone(dir.as_dir());
-                if allow_blocking_current_thread {
-                    match dir.entries() {
-                        Ok(readdir) => StreamReader::new(
-                            &mut store,
-                            FallibleIteratorProducer::new(
-                                readdir.filter_map(|e| map_dir_entry(e).transpose()),
-                                result_tx,
-                            ),
-                        )?,
-                        Err(e) => {
-                            let _ = result_tx.send(Err(e.into()));
-                            StreamReader::new(&mut store, iter::empty())?
-                        }
-                    }
+        accessor.with(|mut store| {
+            let (result_tx, result_rx) = oneshot::channel();
+            let stream = match get_dir(store.get().table, &fd).and_then(|dir| {
+                if !dir.perms.contains(DirPerms::READ) {
+                    Err(ErrorCode::NotPermitted.into())
                 } else {
-                    StreamReader::new(&mut store, ReadDirStream::new(dir, result_tx))?
+                    Ok(dir)
                 }
-            }
-            Err(err) => {
-                let _ = result_tx.send(Err(err.downcast().unwrap_or(ErrorCode::Io)));
-                StreamReader::new(&mut store, iter::empty())?
-            }
-        };
-        Ok((stream, FutureReader::new(&mut store, result_rx)?))
+            }) {
+                Ok(dir) => {
+                    let allow_blocking_current_thread = dir.allow_blocking_current_thread;
+                    let dir = Arc::clone(dir.as_dir());
+                    if allow_blocking_current_thread {
+                        match dir.entries() {
+                            Ok(readdir) => StreamReader::new(
+                                &mut store,
+                                FallibleIteratorProducer::new(
+                                    readdir.filter_map(|e| map_dir_entry(e).transpose()),
+                                    result_tx,
+                                ),
+                            )?,
+                            Err(e) => {
+                                let _ = result_tx.send(Err(e.into()));
+                                StreamReader::new(&mut store, iter::empty())?
+                            }
+                        }
+                    } else {
+                        StreamReader::new(&mut store, ReadDirStream::new(dir, result_tx))?
+                    }
+                }
+                Err(err) => {
+                    let _ = result_tx.send(Err(err.downcast().unwrap_or(ErrorCode::Io)));
+                    StreamReader::new(&mut store, iter::empty())?
+                }
+            };
+            Ok((stream, FutureReader::new(&mut store, result_rx)?))
+        })
     }
 
     async fn sync(store: &Accessor<U, Self>, fd: Resource<Descriptor>) -> FilesystemResult<()> {
