@@ -440,7 +440,7 @@ where
 }
 
 /// [StreamProducer] implementation for bodies originating in the host.
-pub(crate) struct HostBodyStreamProducer<T> {
+pub struct HostBodyStreamProducer<T> {
     pub(crate) body: UnsyncBoxBody<Bytes, ErrorCode>,
     trailers: Option<oneshot::Sender<Result<Option<Resource<Trailers>>, ErrorCode>>>,
     getter: fn(&mut T) -> WasiHttpCtxView<'_>,
@@ -457,6 +457,19 @@ impl<T> HostBodyStreamProducer<T> {
         if let Some(tx) = self.trailers.take() {
             _ = tx.send(res);
         }
+    }
+
+    /// Takes the underlying host body out of this producer, leaving an empty
+    /// body behind.
+    ///
+    /// Used by durable embedders that recover this producer from a
+    /// host-constructed response body stream (via `StreamReader::try_into`)
+    /// so they can drive — and record — the body transfer themselves while
+    /// still surfacing the original transport future. The leftover producer
+    /// (with its now-empty body and trailers sender) should be dropped by the
+    /// caller.
+    pub fn take_body(&mut self) -> UnsyncBoxBody<Bytes, ErrorCode> {
+        core::mem::take(&mut self.body)
     }
 }
 

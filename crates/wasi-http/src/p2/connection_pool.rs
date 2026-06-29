@@ -171,6 +171,345 @@ impl HttpConnectionPool {
 
         sem
     }
+
+    /// Send `request` through the pool, shaped for the wasi-http p3 host.
+    ///
+    /// Unlike [`pooled_send_request_handler`], which returns a p2
+    /// [`IncomingResponse`], this returns the response directly with its body
+    /// already mapped to the p3
+    /// [`ErrorCode`](crate::p3::bindings::http::types::ErrorCode). The per-host
+    /// and global concurrency permits are held by the returned response body and
+    /// released only when that body is dropped (fully drained or aborted),
+    /// mirroring the p2 permit lifecycle.
+    ///
+    /// Connection reuse, keep-alive, and TLS are handled by the same pooled
+    /// `hyper-util` client used by the p2 path. Connection poisoning is not
+    /// performed here; the p3 body lifecycle hooks own that responsibility.
+    #[cfg(feature = "p3")]
+    pub async fn pooled_send_request_p3(
+        &self,
+        request: http::Request<
+            http_body_util::combinators::UnsyncBoxBody<
+                bytes::Bytes,
+                crate::p3::bindings::http::types::ErrorCode,
+            >,
+        >,
+        options: Option<crate::p3::RequestOptions>,
+    ) -> Result<
+        (
+            http::Response<
+                http_body_util::combinators::UnsyncBoxBody<
+                    bytes::Bytes,
+                    crate::p3::bindings::http::types::ErrorCode,
+                >,
+            >,
+            Box<
+                dyn std::future::Future<
+                        Output = Result<(), crate::p3::bindings::http::types::ErrorCode>,
+                    > + Send,
+            >,
+        ),
+        crate::p3::bindings::http::types::ErrorCode,
+    > {
+        use crate::p3::bindings::http::types::ErrorCode as P3ErrorCode;
+        use http_body::Body as _;
+
+        let scheme = request
+            .uri()
+            .scheme_str()
+            .ok_or(P3ErrorCode::HttpRequestUriInvalid)?;
+        let authority = request
+            .uri()
+            .authority()
+            .ok_or(P3ErrorCode::HttpRequestUriInvalid)?
+            .clone();
+        let scheme_is_http = scheme.eq_ignore_ascii_case("http");
+        let scheme_is_https = scheme.eq_ignore_ascii_case("https");
+        if !scheme_is_http && !scheme_is_https {
+            return Err(P3ErrorCode::HttpProtocolError);
+        }
+
+        let connect_timeout = options
+            .and_then(|o| o.connect_timeout)
+            .unwrap_or(Duration::from_secs(600));
+        let first_byte_timeout = options
+            .and_then(|o| o.first_byte_timeout)
+            .unwrap_or(Duration::from_secs(600));
+        let between_bytes_timeout = options
+            .and_then(|o| o.between_bytes_timeout)
+            .unwrap_or(Duration::from_secs(600));
+
+        // Use a single deadline for both semaphore acquisitions so the total
+        // wait never exceeds connect_timeout (rather than 2x connect_timeout).
+        let acquire_deadline = tokio::time::Instant::now() + connect_timeout;
+
+        // Per-host first avoids global permit hoarding where a burst to one host
+        // grabs all global permits while waiting on per-host, starving others.
+        let host_key = make_host_key(scheme, &authority);
+        let host_sem = self.host_semaphore(&host_key).await;
+        let host_permit = tokio::time::timeout_at(acquire_deadline, host_sem.acquire_owned())
+            .await
+            .map_err(|_| P3ErrorCode::ConnectionTimeout)?
+            .map_err(|_| P3ErrorCode::ConnectionTimeout)?;
+        let global_permit = tokio::time::timeout_at(
+            acquire_deadline,
+            self.global_semaphore.clone().acquire_owned(),
+        )
+        .await
+        .map_err(|_| P3ErrorCode::ConnectionTimeout)?
+        .map_err(|_| P3ErrorCode::ConnectionTimeout)?;
+
+        // The pool client is typed for the p2 outgoing body error, so the guest
+        // request body error must be adapted to that type. Formatting it loses
+        // the structured p3 `ErrorCode`, which step 3 records into the durable
+        // oplog (e.g. content-length `HttpRequestBodySize` validation), so the
+        // original error is captured out-of-band and preferred when the send
+        // fails because of it.
+        //
+        // The returned request-transmission future must mirror the non-pooled
+        // path: it stays pending while the request body is still being sent and
+        // resolves with the transmission result. The pooled `hyper-util` client
+        // owns connection I/O internally and exposes no per-request connection
+        // driver, so completion is signalled off the outgoing request body
+        // reaching a terminal state (EOF or error).
+        let captured_body_error: Arc<std::sync::Mutex<Option<P3ErrorCode>>> =
+            Arc::new(std::sync::Mutex::new(None));
+        let (body_done_tx, body_done_rx) =
+            tokio::sync::oneshot::channel::<Result<(), P3ErrorCode>>();
+        // A body that is already end-of-stream (e.g. an empty body for GET) may
+        // never be polled by the client, so signal transmission completion up
+        // front; otherwise hand the sender to the body wrapper.
+        let body_done_tx = if request.body().is_end_stream() {
+            let _ = body_done_tx.send(Ok(()));
+            None
+        } else {
+            Some(body_done_tx)
+        };
+        let request = request.map(|body| {
+            OutgoingRequestBodyP3 {
+                inner: body,
+                captured_error: Arc::clone(&captured_body_error),
+                done: body_done_tx,
+            }
+            .boxed_unsync()
+        });
+
+        let resp = timeout(first_byte_timeout, self.client.request(request))
+            .await
+            .map_err(|_| P3ErrorCode::ConnectionReadTimeout)?
+            .map_err(|e| {
+                captured_body_error
+                    .lock()
+                    .expect("p3 pooled body error mutex poisoned")
+                    .clone()
+                    .unwrap_or_else(|| map_pooled_client_error_p3(&e))
+            })?;
+
+        let (parts, incoming) = resp.into_parts();
+        let mut between_bytes = tokio::time::interval(between_bytes_timeout);
+        between_bytes.reset();
+        let body = PooledResponseBodyP3 {
+            incoming,
+            timeout: between_bytes,
+            host_permit: Some(host_permit),
+            global_permit: Some(global_permit),
+        };
+        // If the body wrapper is dropped before signalling (e.g. the client
+        // tears down the request after receiving the response without fully
+        // draining the request body), report a successful transmission: a
+        // response was received, matching the non-pooled path's behaviour when
+        // its connection driver has already completed.
+        let io: Box<dyn std::future::Future<Output = Result<(), P3ErrorCode>> + Send> =
+            Box::new(async move { body_done_rx.await.unwrap_or(Ok(())) });
+        Ok((http::Response::from_parts(parts, body.boxed_unsync()), io))
+    }
+}
+
+/// Outgoing request body wrapper for [`HttpConnectionPool::pooled_send_request_p3`].
+///
+/// Adapts the guest p3 request body to the pool client's p2 body error type,
+/// captures the original p3 [`ErrorCode`](crate::p3::bindings::http::types::ErrorCode)
+/// on failure so it can be reported as the send result, and signals
+/// transmission completion (or failure) once the body reaches a terminal state.
+#[cfg(feature = "p3")]
+struct OutgoingRequestBodyP3 {
+    inner: http_body_util::combinators::UnsyncBoxBody<
+        bytes::Bytes,
+        crate::p3::bindings::http::types::ErrorCode,
+    >,
+    captured_error:
+        Arc<std::sync::Mutex<Option<crate::p3::bindings::http::types::ErrorCode>>>,
+    done: Option<tokio::sync::oneshot::Sender<Result<(), crate::p3::bindings::http::types::ErrorCode>>>,
+}
+
+#[cfg(feature = "p3")]
+impl http_body::Body for OutgoingRequestBodyP3 {
+    type Data = bytes::Bytes;
+    type Error = types::ErrorCode;
+
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+        use std::task::Poll;
+
+        match std::pin::Pin::new(&mut self.inner).poll_frame(cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(None) => {
+                if let Some(tx) = self.done.take() {
+                    let _ = tx.send(Ok(()));
+                }
+                Poll::Ready(None)
+            }
+            Poll::Ready(Some(Ok(frame))) => Poll::Ready(Some(Ok(frame))),
+            Poll::Ready(Some(Err(err))) => {
+                self.captured_error
+                    .lock()
+                    .expect("p3 pooled body error mutex poisoned")
+                    .get_or_insert_with(|| err.clone());
+                if let Some(tx) = self.done.take() {
+                    let _ = tx.send(Err(err.clone()));
+                }
+                Poll::Ready(Some(Err(types::ErrorCode::InternalError(Some(format!(
+                    "{err:?}"
+                ))))))
+            }
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        self.inner.size_hint()
+    }
+}
+
+/// Response body returned by [`HttpConnectionPool::pooled_send_request_p3`].
+///
+/// Wraps the hyper response body, applies the configured between-bytes timeout,
+/// and holds the pool concurrency permits. The permits are released as soon as
+/// the body reaches a terminal state (EOF, trailers, error, or read timeout),
+/// and otherwise on drop (covering an aborted body that is never fully read).
+#[cfg(feature = "p3")]
+struct PooledResponseBodyP3 {
+    incoming: hyper::body::Incoming,
+    timeout: tokio::time::Interval,
+    host_permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    global_permit: Option<tokio::sync::OwnedSemaphorePermit>,
+}
+
+#[cfg(feature = "p3")]
+impl PooledResponseBodyP3 {
+    /// Release the pool concurrency permits, allowing queued requests to the
+    /// same host (and globally) to proceed. Idempotent.
+    fn release_permits(&mut self) {
+        self.host_permit.take();
+        self.global_permit.take();
+    }
+}
+
+#[cfg(feature = "p3")]
+impl http_body::Body for PooledResponseBodyP3 {
+    type Data = bytes::Bytes;
+    type Error = crate::p3::bindings::http::types::ErrorCode;
+
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+        use crate::p3::bindings::http::types::ErrorCode as P3ErrorCode;
+        use std::task::{Poll, ready};
+
+        match std::pin::Pin::new(&mut self.incoming).poll_frame(cx) {
+            Poll::Ready(None) => {
+                self.release_permits();
+                Poll::Ready(None)
+            }
+            Poll::Ready(Some(Err(err))) => {
+                self.release_permits();
+                Poll::Ready(Some(Err(P3ErrorCode::from_hyper_response_error(err))))
+            }
+            Poll::Ready(Some(Ok(frame))) => {
+                // Trailers are the terminal frame of a body; the p3 stream
+                // producer treats them as terminal and may not poll again, so
+                // release permits now rather than waiting for an EOF poll.
+                if frame.is_trailers() {
+                    self.release_permits();
+                } else {
+                    self.timeout.reset();
+                }
+                Poll::Ready(Some(Ok(frame)))
+            }
+            Poll::Pending => {
+                ready!(self.timeout.poll_tick(cx));
+                self.release_permits();
+                Poll::Ready(Some(Err(P3ErrorCode::ConnectionReadTimeout)))
+            }
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.incoming.is_end_stream()
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        self.incoming.size_hint()
+    }
+}
+
+/// Map a pooled `hyper-util` client error to a p3 [`ErrorCode`], mirroring the
+/// p2 [`pooled_send_request_handler`] error classification.
+#[cfg(feature = "p3")]
+fn map_pooled_client_error_p3(
+    e: &hyper_util::client::legacy::Error,
+) -> crate::p3::bindings::http::types::ErrorCode {
+    use crate::p3::bindings::http::types::ErrorCode as P3ErrorCode;
+
+    if e.is_connect() {
+        if let Some(io_err) = find_io_error(e) {
+            match io_err.kind() {
+                std::io::ErrorKind::ConnectionRefused => return P3ErrorCode::ConnectionRefused,
+                std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::ConnectionAborted
+                | std::io::ErrorKind::BrokenPipe
+                | std::io::ErrorKind::UnexpectedEof => return P3ErrorCode::ConnectionTerminated,
+                std::io::ErrorKind::TimedOut => return P3ErrorCode::ConnectionTimeout,
+                _ => {}
+            }
+            if io_err.kind() == std::io::ErrorKind::AddrNotAvailable
+                || io_err
+                    .to_string()
+                    .starts_with("failed to lookup address information")
+            {
+                return P3ErrorCode::DnsError(crate::p3::bindings::http::types::DnsErrorPayload {
+                    rcode: Some("address not available".to_string()),
+                    info_code: Some(0),
+                });
+            }
+        }
+        if find_elapsed_error(e).is_some() {
+            return P3ErrorCode::ConnectionTimeout;
+        }
+        if let Some(rustls_err) = find_rustls_error(e) {
+            match rustls_err {
+                rustls::Error::InvalidCertificate(_) => return P3ErrorCode::TlsCertificateError,
+                rustls::Error::AlertReceived(alert) => {
+                    return P3ErrorCode::TlsAlertReceived(
+                        crate::p3::bindings::http::types::TlsAlertReceivedPayload {
+                            alert_id: Some(u8::from(*alert)),
+                            alert_message: Some(format!("{alert:?}")),
+                        },
+                    );
+                }
+                _ => return P3ErrorCode::TlsProtocolError,
+            }
+        }
+        P3ErrorCode::DestinationUnavailable
+    } else {
+        P3ErrorCode::HttpProtocolError
+    }
 }
 
 /// A oneshot receiver used to signal completion of an outgoing body before
