@@ -17,6 +17,7 @@
 
 #![cfg(feature = "default-send-request")]
 
+use crate::io::TokioIo;
 use crate::p2::bindings::http::types;
 use crate::p2::body::HyperOutgoingBody;
 use crate::p2::error::{dns_error, hyper_request_error};
@@ -32,7 +33,6 @@ use std::time::Duration;
 use tokio::net::TcpStream;
 use tokio::sync::{Semaphore, watch};
 use tokio::time::timeout;
-use crate::io::TokioIo;
 
 /// Configuration for the HTTP connection pool.
 #[derive(Clone, Debug)]
@@ -129,15 +129,13 @@ impl HttpConnectionPool {
         // input, so we cannot pre-set it. The From impl is equivalent to
         // .https_or_http().wrap_connector() (force_https=false) but lets us
         // keep the ALPN we configured above.
-        let https: hyper_rustls::HttpsConnector<_> =
-            (http_connector, Arc::new(tls_config)).into();
+        let https: hyper_rustls::HttpsConnector<_> = (http_connector, Arc::new(tls_config)).into();
 
-        let client = hyper_util::client::legacy::Client::builder(
-            hyper_util::rt::TokioExecutor::new(),
-        )
-        .pool_idle_timeout(config.idle_timeout)
-        .pool_max_idle_per_host(config.max_idle_per_host)
-        .build(https);
+        let client =
+            hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
+                .pool_idle_timeout(config.idle_timeout)
+                .pool_max_idle_per_host(config.max_idle_per_host)
+                .build(https);
 
         Self {
             client,
@@ -337,9 +335,10 @@ struct OutgoingRequestBodyP3 {
         bytes::Bytes,
         crate::p3::bindings::http::types::ErrorCode,
     >,
-    captured_error:
-        Arc<std::sync::Mutex<Option<crate::p3::bindings::http::types::ErrorCode>>>,
-    done: Option<tokio::sync::oneshot::Sender<Result<(), crate::p3::bindings::http::types::ErrorCode>>>,
+    captured_error: Arc<std::sync::Mutex<Option<crate::p3::bindings::http::types::ErrorCode>>>,
+    done: Option<
+        tokio::sync::oneshot::Sender<Result<(), crate::p3::bindings::http::types::ErrorCode>>,
+    >,
 }
 
 #[cfg(feature = "p3")]
@@ -561,15 +560,12 @@ pub fn default_send_request_with_pool(
             let collect_fut = async {
                 BodyExt::collect(body).await.map(|collected| {
                     collected
-                        .map_err(|_: std::convert::Infallible| {
-                            unreachable!("Infallible error")
-                        })
+                        .map_err(|_: std::convert::Infallible| unreachable!("Infallible error"))
                         .boxed_unsync()
                 })
             };
 
-            let (completion, collected) =
-                futures::future::join(completion_fut, collect_fut).await;
+            let (completion, collected) = futures::future::join(completion_fut, collect_fut).await;
 
             // Check completion first — it carries specific errors like
             // content-length mismatch or abort.
@@ -600,9 +596,7 @@ pub fn default_send_request_with_pool(
 const MAX_ERROR_CHAIN_DEPTH: usize = 32;
 
 /// Walk the error source chain to find a `rustls::Error`, if one exists.
-fn find_rustls_error<'a>(
-    err: &'a (dyn std::error::Error + 'static),
-) -> Option<&'a rustls::Error> {
+fn find_rustls_error<'a>(err: &'a (dyn std::error::Error + 'static)) -> Option<&'a rustls::Error> {
     let mut cur: &(dyn std::error::Error + 'static) = err;
     for _ in 0..MAX_ERROR_CHAIN_DEPTH {
         if let Some(r) = cur.downcast_ref::<rustls::Error>() {
@@ -614,9 +608,7 @@ fn find_rustls_error<'a>(
 }
 
 /// Walk the error source chain to find a `std::io::Error`, if one exists.
-fn find_io_error<'a>(
-    err: &'a (dyn std::error::Error + 'static),
-) -> Option<&'a std::io::Error> {
+fn find_io_error<'a>(err: &'a (dyn std::error::Error + 'static)) -> Option<&'a std::io::Error> {
     let mut cur: &(dyn std::error::Error + 'static) = err;
     for _ in 0..MAX_ERROR_CHAIN_DEPTH {
         if let Some(io_err) = cur.downcast_ref::<std::io::Error>() {
@@ -825,9 +817,15 @@ pub async fn default_send_request_handler(
 /// This ensures that `Example.com`, `example.com:443`, and `HTTPS://example.com`
 /// all map to the same semaphore.
 fn make_host_key(scheme: &str, authority: &http::uri::Authority) -> String {
-    let scheme = if scheme.eq_ignore_ascii_case("https") { "https" } else { "http" };
+    let scheme = if scheme.eq_ignore_ascii_case("https") {
+        "https"
+    } else {
+        "http"
+    };
     let host = authority.host().to_ascii_lowercase();
-    let port = authority.port_u16().unwrap_or(if scheme == "https" { 443 } else { 80 });
+    let port = authority
+        .port_u16()
+        .unwrap_or(if scheme == "https" { 443 } else { 80 });
     format!("{scheme}://{host}:{port}")
 }
 
@@ -901,17 +899,19 @@ pub(crate) async fn pooled_send_request_handler(
         })?;
 
     tracing::debug!("pooled: acquiring global permit");
-    let global_permit =
-        tokio::time::timeout_at(acquire_deadline, pool.global_semaphore.clone().acquire_owned())
-            .await
-            .map_err(|_| {
-                tracing::warn!("pooled: timed out waiting for global permit");
-                types::ErrorCode::ConnectionTimeout
-            })?
-            .map_err(|_| {
-                tracing::warn!("pooled: global semaphore closed");
-                types::ErrorCode::ConnectionTimeout
-            })?;
+    let global_permit = tokio::time::timeout_at(
+        acquire_deadline,
+        pool.global_semaphore.clone().acquire_owned(),
+    )
+    .await
+    .map_err(|_| {
+        tracing::warn!("pooled: timed out waiting for global permit");
+        types::ErrorCode::ConnectionTimeout
+    })?
+    .map_err(|_| {
+        tracing::warn!("pooled: global semaphore closed");
+        types::ErrorCode::ConnectionTimeout
+    })?;
 
     let uri = request.uri().clone();
     tracing::debug!(

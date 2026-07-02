@@ -63,7 +63,9 @@ impl OutputStream for OutputFile {
     fn check_write(&mut self) -> StreamResult<usize> {
         Ok(1024 * 1024)
     }
-    fn as_any(&self) -> &dyn std::any::Any { self }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
 }
 
 impl AsyncWrite for OutputFile {
@@ -136,7 +138,9 @@ impl InputStream for InputFile {
         buf.truncate(bytes_read);
         StreamResult::Ok(buf.into())
     }
-    fn as_any(&self) -> &dyn std::any::Any { self }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
 }
 
 impl AsyncRead for InputFile {

@@ -61,8 +61,8 @@ pub use rand::Rng;
 #[doc(no_inline)]
 pub use wasmtime::component::{ResourceTable, ResourceTableError};
 pub use wasmtime_wasi_io::poll::{
-    dynamic_subscribe, subscribe, DynFuture, DynPollable, DynamicPollable, MakeFuture,
-    OverrideSelf, Pollable,
+    DynFuture, DynPollable, DynamicPollable, MakeFuture, OverrideSelf, Pollable, dynamic_subscribe,
+    subscribe,
 };
 pub use wasmtime_wasi_io::streams::{
     DynInputStream, DynOutputStream, Error as IoError, InputStream, OutputStream, StreamError,

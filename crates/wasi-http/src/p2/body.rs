@@ -510,8 +510,7 @@ pub struct HostOutgoingBody {
     finish_sender: Option<tokio::sync::oneshot::Sender<FinishMessage>>,
     /// Signals that the body has been completed (finished or aborted).
     /// Used by the deferred request path to know when to send the request.
-    completion_sender:
-        Option<tokio::sync::oneshot::Sender<Result<(), types::ErrorCode>>>,
+    completion_sender: Option<tokio::sync::oneshot::Sender<Result<(), types::ErrorCode>>>,
 }
 
 impl HostOutgoingBody {

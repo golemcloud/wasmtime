@@ -178,7 +178,9 @@ impl InputStream for FileInputStream {
             _ => {}
         }
     }
-    fn as_any(&self) -> &dyn std::any::Any { self }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
 }
 #[async_trait::async_trait]
 impl Pollable for FileInputStream {
@@ -374,7 +376,9 @@ impl OutputStream for FileOutputStream {
             _ => {}
         }
     }
-    fn as_any(&self) -> &dyn std::any::Any { self }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
 }
 
 #[async_trait::async_trait]
@@ -399,9 +403,7 @@ pub struct ReaddirIterator(
 );
 
 impl ReaddirIterator {
-    pub fn new(
-        i: impl Iterator<Item = FsResult<types::DirectoryEntry>> + Send + 'static,
-    ) -> Self {
+    pub fn new(i: impl Iterator<Item = FsResult<types::DirectoryEntry>> + Send + 'static) -> Self {
         ReaddirIterator(std::sync::Mutex::new(Box::new(i)))
     }
     pub(crate) fn next(&self) -> FsResult<Option<types::DirectoryEntry>> {

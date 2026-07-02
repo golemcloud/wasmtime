@@ -1328,8 +1328,7 @@ impl<T> StoreContextMut<'_, T> {
                 // loop running until the store is fully quiescent. A completed
                 // future is never polled again (`completed.is_none()` guard).
                 if completed.is_none() {
-                    if let Poll::Ready(value) =
-                        tls::set(reset.store.0, || future.as_mut().poll(cx))
+                    if let Poll::Ready(value) = tls::set(reset.store.0, || future.as_mut().poll(cx))
                     {
                         if drain_after_complete {
                             completed = Some(value);

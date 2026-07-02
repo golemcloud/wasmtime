@@ -270,8 +270,7 @@ pub struct HostIncomingResponse {
     /// so the pool will not hand the same TCP connection back for subsequent
     /// requests.
     #[cfg(feature = "default-send-request")]
-    pub pooled_connection:
-        Option<hyper_util::client::legacy::connect::CaptureConnection>,
+    pub pooled_connection: Option<hyper_util::client::legacy::connect::CaptureConnection>,
 }
 
 #[cfg(feature = "default-send-request")]
@@ -345,8 +344,7 @@ pub struct IncomingResponse {
     /// allowing callers to call `Connected::poison()` so the pool will not
     /// hand the same TCP connection back for subsequent requests.
     #[cfg(feature = "default-send-request")]
-    pub pooled_connection:
-        Option<hyper_util::client::legacy::connect::CaptureConnection>,
+    pub pooled_connection: Option<hyper_util::client::legacy::connect::CaptureConnection>,
 }
 
 /// A closure that activates a deferred response by performing the actual HTTP
@@ -356,8 +354,7 @@ pub struct IncomingResponse {
 /// completion, connection pool, etc.) so that `ready()` and `get()` can
 /// trigger the send without needing access to `&mut self` (the
 /// `WasiHttpView`).
-pub type DeferredSendFn =
-    Box<dyn FnOnce() -> HttpResult<HostFutureIncomingResponse> + Send>;
+pub type DeferredSendFn = Box<dyn FnOnce() -> HttpResult<HostFutureIncomingResponse> + Send>;
 
 /// The concrete type behind a `wasi:http/types.future-incoming-response` resource.
 pub enum HostFutureIncomingResponse {

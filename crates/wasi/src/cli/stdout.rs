@@ -92,7 +92,9 @@ impl OutputStream for StdioOutputStream {
     fn check_write(&mut self) -> p2::StreamResult<usize> {
         Ok(1024 * 1024)
     }
-    fn as_any(&self) -> &dyn std::any::Any { self }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
 }
 
 impl AsyncWrite for StdioOutputStream {

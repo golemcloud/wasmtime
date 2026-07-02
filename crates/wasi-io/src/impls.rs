@@ -139,10 +139,7 @@ impl poll::Host for IoData<'_> {
                 self.ready_indices.append(&mut newly_ready);
                 let any_ready = !self.ready_indices.is_empty();
                 if any_ready {
-                    if self.yield_on_immediate_return
-                        && !self.fairness_yielded
-                        && any_newly_ready
-                    {
+                    if self.yield_on_immediate_return && !self.fairness_yielded && any_newly_ready {
                         // Force a single yield to the async runtime, then
                         // re-poll on the next wake to allow any other futures
                         // that may become ready in the meantime to be
@@ -237,7 +234,11 @@ impl streams::HostOutputStream for ResourceTable {
         Ok(bytes as u64)
     }
 
-    async fn write(&mut self, stream: Resource<DynOutputStream>, bytes: Vec<u8>) -> StreamResult<()> {
+    async fn write(
+        &mut self,
+        stream: Resource<DynOutputStream>,
+        bytes: Vec<u8>,
+    ) -> StreamResult<()> {
         self.get_mut(&stream)?.write(bytes.into())?;
         Ok(())
     }
@@ -279,7 +280,11 @@ impl streams::HostOutputStream for ResourceTable {
         self.get_mut(&stream)?.blocking_write_and_flush(bs).await
     }
 
-    async fn write_zeroes(&mut self, stream: Resource<DynOutputStream>, len: u64) -> StreamResult<()> {
+    async fn write_zeroes(
+        &mut self,
+        stream: Resource<DynOutputStream>,
+        len: u64,
+    ) -> StreamResult<()> {
         self.get_mut(&stream)?.write_zeroes(len as usize)?;
         Ok(())
     }
@@ -353,7 +358,6 @@ impl streams::HostOutputStream for ResourceTable {
         output.blocking_write_and_flush(contents).await?;
         Ok(len.try_into().expect("usize can fit in u64"))
     }
-
 }
 
 impl streams::HostInputStream for ResourceTable {

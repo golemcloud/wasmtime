@@ -204,7 +204,9 @@ impl OutputStream for AsyncWriteStream {
             None => {}
         }
     }
-    fn as_any(&self) -> &dyn std::any::Any { self }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
 }
 #[async_trait::async_trait]
 impl Pollable for AsyncWriteStream {

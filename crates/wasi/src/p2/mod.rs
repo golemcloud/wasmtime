@@ -242,8 +242,8 @@ pub(crate) use tcp::P2TcpStreamingState;
 // they were originally defined in this module before being factored out, and many
 // users of this module depend on them at these names.
 pub use wasmtime_wasi_io::poll::{
-    dynamic_subscribe, subscribe, DynFuture, DynPollable, DynamicPollable, MakeFuture,
-    OverrideSelf, Pollable,
+    DynFuture, DynPollable, DynamicPollable, MakeFuture, OverrideSelf, Pollable, dynamic_subscribe,
+    subscribe,
 };
 pub use wasmtime_wasi_io::streams::{
     DynInputStream, DynOutputStream, Error as IoError, InputStream, OutputStream, StreamError,

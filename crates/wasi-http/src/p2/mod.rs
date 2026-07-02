@@ -233,21 +233,20 @@ pub mod bindings;
 pub mod body;
 pub mod types;
 
-pub use self::error::*;
 #[cfg(feature = "default-send-request")]
 pub use self::connection_pool::{
     HttpConnectionPool, HttpConnectionPoolConfig, default_send_request_handler,
     default_send_request_with_pool,
 };
+pub use self::error::*;
 
 /// A receiver that signals completion of an outgoing body.
 ///
 /// This is exposed unconditionally so that the [`WasiHttpHooks::send_request`]
 /// signature is the same regardless of the `default-send-request` feature.
 /// Implementations without the feature simply receive `None`.
-pub type BodyCompletionReceiver = tokio::sync::oneshot::Receiver<
-    Result<(), self::bindings::http::types::ErrorCode>,
->;
+pub type BodyCompletionReceiver =
+    tokio::sync::oneshot::Receiver<Result<(), self::bindings::http::types::ErrorCode>>;
 
 /// Thin wrapper around [`default_send_request_with_pool`] for backward
 /// compatibility with the upstream wasi-http API. Spawns the request without
@@ -523,4 +522,3 @@ where
 
     Ok(())
 }
-

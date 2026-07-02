@@ -114,7 +114,10 @@ impl monotonic_clock::Host for WasiClocksCtxView<'_> {
         Ok(self.ctx.monotonic_clock.resolution())
     }
 
-    async fn subscribe_instant(&mut self, when: Instant) -> wasmtime::Result<Resource<DynPollable>> {
+    async fn subscribe_instant(
+        &mut self,
+        when: Instant,
+    ) -> wasmtime::Result<Resource<DynPollable>> {
         let clock_now = self.ctx.monotonic_clock.now();
         let duration = if when > clock_now {
             Duration::from_nanos(when - clock_now)

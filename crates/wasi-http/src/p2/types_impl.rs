@@ -657,11 +657,9 @@ impl types::HostFutureIncomingResponse for WasiHttpCtxView<'_> {
                 HostFutureIncomingResponse::Ready(_) => break,
                 HostFutureIncomingResponse::Deferred { .. } => {
                     // Deferred: the request hasn't been sent yet. Activate it now.
-                    let deferred =
-                        std::mem::replace(resp, HostFutureIncomingResponse::Consumed);
+                    let deferred = std::mem::replace(resp, HostFutureIncomingResponse::Consumed);
                     if let HostFutureIncomingResponse::Deferred { activate } = deferred {
-                        let next =
-                            HostFutureIncomingResponse::normalize_activated(activate());
+                        let next = HostFutureIncomingResponse::normalize_activated(activate());
                         *self.table.get_mut(&id)? = next;
                     }
                     // Loop back to handle the resulting state.

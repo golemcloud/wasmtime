@@ -50,7 +50,9 @@ impl InputStream for MemoryInputPipe {
         let read = buffer.split_to(size);
         Ok(read)
     }
-    fn as_any(&self) -> &dyn std::any::Any { self }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
 }
 
 #[async_trait::async_trait]
@@ -121,7 +123,9 @@ impl OutputStream for MemoryOutputPipe {
             Err(StreamError::Closed)
         }
     }
-    fn as_any(&self) -> &dyn std::any::Any { self }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
 }
 
 #[async_trait::async_trait]
@@ -262,7 +266,9 @@ impl InputStream for AsyncReadStream {
             None => {}
         }
     }
-    fn as_any(&self) -> &dyn std::any::Any { self }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
 }
 
 #[async_trait::async_trait]
@@ -290,7 +296,9 @@ impl OutputStream for SinkOutputStream {
         // This stream is always ready for writing.
         Ok(usize::MAX)
     }
-    fn as_any(&self) -> &dyn std::any::Any { self }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
 }
 
 #[async_trait::async_trait]
@@ -307,7 +315,9 @@ impl InputStream for ClosedInputStream {
     fn read(&mut self, _size: usize) -> Result<Bytes, StreamError> {
         Err(StreamError::Closed)
     }
-    fn as_any(&self) -> &dyn std::any::Any { self }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
 }
 
 #[async_trait::async_trait]
@@ -331,7 +341,9 @@ impl OutputStream for ClosedOutputStream {
     fn check_write(&mut self) -> Result<usize, StreamError> {
         Err(StreamError::Closed)
     }
-    fn as_any(&self) -> &dyn std::any::Any { self }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
 }
 
 #[async_trait::async_trait]

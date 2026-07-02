@@ -278,5 +278,3 @@ impl Pollable for TcpSocket {
         <TcpSocket>::ready(self).await;
     }
 }
-
-
