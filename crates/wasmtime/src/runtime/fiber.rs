@@ -7,7 +7,7 @@ use core::mem;
 use core::ops::Range;
 use core::pin::Pin;
 use core::ptr::{self, NonNull};
-use core::task::{Context, Poll};
+use core::task::{Context, Poll, Waker};
 use wasmtime_fiber::{Fiber, FiberStack, Suspend};
 
 type WasmtimeResume = Result<NonNull<Context<'static>>>;
@@ -77,6 +77,15 @@ pub(crate) struct AsyncState {
     /// than the original `Context` lifetime.
     current_future_cx: Option<NonNull<Context<'static>>>,
 
+    /// The `Context` passed to the currently executing `Fiber::resume` call, if any.
+    ///
+    /// Unlike `current_future_cx`, this slot is *not* taken by `BlockingContext` and is only
+    /// installed for the dynamic extent of `resume_fiber(..., Ok(cx))`. It exists purely as a
+    /// read-only source for [`AsyncState::current_task_waker`], so host code that runs while a
+    /// `BlockingContext` has temporarily taken `current_future_cx` can still obtain the waker of
+    /// the task currently driving the fiber.
+    current_poll_cx: Option<NonNull<Context<'static>>>,
+
     /// The last fiber stack that was in use by the store.
     ///
     /// We use this to cache and reuse stacks as a performance optimization.
@@ -107,6 +116,7 @@ impl Default for AsyncState {
         Self {
             current_suspend: None,
             current_future_cx: None,
+            current_poll_cx: None,
             last_fiber_stack: None,
             async_required: false,
         }
@@ -122,6 +132,27 @@ impl AsyncState {
     #[inline]
     pub(crate) fn can_block(&mut self) -> bool {
         self.current_future_cx.is_some()
+    }
+
+    /// Returns a clone of the waker of the task currently driving this store's fiber, if any.
+    ///
+    /// Host futures that are polled once inline during guest execution (the first poll of an
+    /// async-lowered host call, or of a sync-lowered call about to block) must not be polled with
+    /// a noop waker: any wakeup registered during that poll — directly by the host future, or by
+    /// a fiber resumed during the poll capturing the polling context — would be lost, and if the
+    /// registering party can only make progress via that wakeup while the event loop is parked on
+    /// a store-keeping fiber, the whole store deadlocks. Polling with the driving task's waker
+    /// instead turns those lost wakeups into (harmless) spurious wakes of the task.
+    ///
+    /// # Safety of the dereference
+    ///
+    /// `current_future_cx` is only populated while this store's fiber is being polled, and this
+    /// method must only be called from host code running within such a poll, so the pointed-to
+    /// `Context` is live for the duration of this call.
+    pub(crate) fn current_task_waker(&mut self) -> Option<Waker> {
+        self.current_future_cx
+            .or(self.current_poll_cx)
+            .map(|mut cx| unsafe { cx.as_mut().waker().clone() })
     }
 }
 
@@ -719,15 +750,34 @@ fn resume_fiber<'a>(
                 Some(unsafe { self.state.take().unwrap().replace(self.store).into() });
         }
     }
+    // Install the resume payload's `Context` as the store's `current_poll_cx` for the dynamic
+    // extent of this resume, so host code executing on the fiber can always obtain the waker of
+    // the task currently driving it (see `AsyncState::current_task_waker`). The previous value is
+    // restored on exit to support nested fiber resumes.
+    struct RestorePollCx<'a> {
+        store: &'a mut StoreOpaque,
+        old: Option<NonNull<Context<'static>>>,
+    }
+    impl Drop for RestorePollCx<'_> {
+        fn drop(&mut self) {
+            self.store.fiber_async_state_mut().current_poll_cx = self.old;
+        }
+    }
+    let poll_cx = result.as_ref().ok().copied();
     let result = unsafe {
+        let old_poll_cx = mem::replace(&mut store.fiber_async_state_mut().current_poll_cx, poll_cx);
+        let mut poll_guard = RestorePollCx {
+            store,
+            old: old_poll_cx,
+        };
         let prev = fiber
             .state
             .take()
             .unwrap()
             .into_inner()
-            .replace(store, fiber);
+            .replace(&mut *poll_guard.store, fiber);
         let restore = Restore {
-            store,
+            store: &mut *poll_guard.store,
             fiber,
             state: Some(prev),
         };

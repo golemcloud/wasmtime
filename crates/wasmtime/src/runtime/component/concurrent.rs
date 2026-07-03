@@ -820,13 +820,19 @@ pub(crate) fn poll_and_block<R: Send + Sync + 'static>(
         })
     }) as HostTaskFuture;
 
-    // Finally, poll the future.  We can use a dummy `Waker` here because we'll
-    // add the future to `ConcurrentState::futures` and poll it automatically
-    // from the event loop if it doesn't complete immediately here.
+    // Finally, poll the future. Use the waker of the task currently driving this store's fiber
+    // (falling back to a dummy `Waker` outside fiber context): the future will be added to
+    // `ConcurrentState::futures` and polled by the event loop if it doesn't complete immediately,
+    // but a wakeup registered *during this first poll* (directly, or via a fiber resumed during
+    // the poll that captures this polling context) must still be able to wake the driving task —
+    // with a dummy waker such wakeups are silently lost and can deadlock the store when the event
+    // loop is later parked on a store-keeping fiber.
+    let waker = store
+        .fiber_async_state_mut()
+        .current_task_waker()
+        .unwrap_or_else(|| Waker::noop().clone());
     let poll = tls::set(store, || {
-        future
-            .as_mut()
-            .poll(&mut Context::from_waker(&Waker::noop()))
+        future.as_mut().poll(&mut Context::from_waker(&waker))
     });
 
     match poll {
@@ -3117,14 +3123,20 @@ impl Instance {
 
         let mut future = Box::pin(future);
 
-        // Finally, poll the future.  We can use a dummy `Waker` here because
-        // we'll add the future to `ConcurrentState::futures` and poll it
-        // automatically from the event loop if it doesn't complete immediately
-        // here.
+        // Finally, poll the future. Use the waker of the task currently driving this store's
+        // fiber (falling back to a dummy `Waker` outside fiber context): the future will be added
+        // to `ConcurrentState::futures` and polled by the event loop if it doesn't complete
+        // immediately, but a wakeup registered *during this first poll* (directly, or via a fiber
+        // resumed during the poll that captures this polling context) must still be able to wake
+        // the driving task — with a dummy waker such wakeups are silently lost and can deadlock
+        // the store when the event loop is later parked on a store-keeping fiber.
+        let waker = store
+            .0
+            .fiber_async_state_mut()
+            .current_task_waker()
+            .unwrap_or_else(|| Waker::noop().clone());
         let poll = tls::set(store.0, || {
-            future
-                .as_mut()
-                .poll(&mut Context::from_waker(&Waker::noop()))
+            future.as_mut().poll(&mut Context::from_waker(&waker))
         });
 
         match poll {
