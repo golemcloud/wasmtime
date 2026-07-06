@@ -624,7 +624,14 @@ where
 
     fn typecheck(ty: TypeFuncIndex, types: &InstanceType<'_>) -> Result<()> {
         let ty = &types.types[ty];
-        if ASYNC != ty.async_ {
+        // Golem fork relaxation: a concurrent host function (`func_wrap_concurrent`,
+        // `ASYNC = true`) may also serve an import whose WIT-level type is a plain
+        // (non-`async`) `func`. The runtime already supports this combination: dispatch
+        // between `call_sync_lower` / `call_async_lower` is driven by the guest's
+        // `canon lower` options, and `call_sync_lower` resolves a `HostResult::Future`
+        // via `concurrent::poll_and_block`. Only the reverse direction (a synchronous
+        // host function registered for an `async func` typed import) remains rejected.
+        if !ASYNC && ty.async_ {
             bail!("type mismatch with async");
         }
         P::typecheck(&InterfaceType::Tuple(ty.params), types)
@@ -707,7 +714,10 @@ where
     /// checks. However, we _do_ verify async-ness here.
     fn typecheck(ty: TypeFuncIndex, types: &InstanceType<'_>) -> Result<()> {
         let ty = &types.types[ty];
-        if ASYNC != ty.async_ {
+        // Golem fork relaxation: see `StaticHostFn::typecheck` above — a concurrent
+        // host function may serve a plain (non-`async`) `func` typed import; only a
+        // synchronous host function registered for an `async func` import is rejected.
+        if !ASYNC && ty.async_ {
             bail!("type mismatch with async");
         }
 
