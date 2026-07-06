@@ -460,8 +460,18 @@ pub async fn default_send_request(
             match res {
                 // `hyper` connection has successfully completed, optimistically poll for response
                 Ok(()) => send.as_mut().poll(cx),
-                // `hyper` connection has failed, return the error
-                Err(err) => Poll::Ready(Err(ErrorCode::from_hyper_request_error(err))),
+                // `hyper` connection has failed. The response head may nevertheless have been
+                // dispatched in the very same poll: hyper's HTTP/1 dispatcher reads before it
+                // writes, so an early response (e.g. a redirect sent before the streaming
+                // request body finished uploading, followed by the server closing the
+                // connection) is handed to the `send_request` future first, and only then does
+                // the failed body write surface as a connection error. Give `send` a final poll
+                // and prefer its result; only if the response head never arrived is the
+                // connection error the true outcome of the request.
+                Err(err) => match send.as_mut().poll(cx) {
+                    Poll::Ready(res) => Poll::Ready(res),
+                    Poll::Pending => Poll::Ready(Err(ErrorCode::from_hyper_request_error(err))),
+                },
             }
         }
     })
