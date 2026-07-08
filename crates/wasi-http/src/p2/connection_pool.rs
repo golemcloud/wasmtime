@@ -410,6 +410,13 @@ impl PooledResponseBodyP3 {
 }
 
 #[cfg(feature = "p3")]
+impl Drop for PooledResponseBodyP3 {
+    fn drop(&mut self) {
+        self.release_permits();
+    }
+}
+
+#[cfg(feature = "p3")]
 impl http_body::Body for PooledResponseBodyP3 {
     type Data = bytes::Bytes;
     type Error = crate::p3::bindings::http::types::ErrorCode;
