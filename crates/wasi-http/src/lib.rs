@@ -28,7 +28,7 @@ pub use field_map::*;
 /// `default-send-request` feature, so embedders can configure
 /// [`WasiHttpCtx::connection_pool`] without depending on the `p2` module path.
 #[cfg(all(feature = "p2", feature = "default-send-request"))]
-pub use crate::p2::{HttpConnectionPool, HttpConnectionPoolConfig};
+pub use crate::p2::{HttpConnectionPool, HttpConnectionPoolConfig, P3PooledConnection};
 
 /// Extract the `Content-Length` header value from a [`http::HeaderMap`], returning `None` if it's not
 /// present. This function will return `Err` if it's not possible to parse the `Content-Length`

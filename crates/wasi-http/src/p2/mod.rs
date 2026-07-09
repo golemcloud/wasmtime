@@ -235,7 +235,7 @@ pub mod types;
 
 #[cfg(feature = "default-send-request")]
 pub use self::connection_pool::{
-    HttpConnectionPool, HttpConnectionPoolConfig, default_send_request_handler,
+    HttpConnectionPool, HttpConnectionPoolConfig, P3PooledConnection, default_send_request_handler,
     default_send_request_with_pool,
 };
 pub use self::error::*;

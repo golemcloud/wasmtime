@@ -101,6 +101,27 @@ pub struct HttpConnectionPool {
     max_host_entries: usize,
 }
 
+/// Captured pooled connection returned by the p3 pooled send path.
+///
+/// Call [`Self::poison`] before dropping a response whose connection is unsafe
+/// to reuse, for example after a retryable HTTP status response where the
+/// server may not have drained the request body.
+#[cfg(feature = "p3")]
+pub struct P3PooledConnection {
+    capture: CaptureConnection,
+}
+
+#[cfg(feature = "p3")]
+impl P3PooledConnection {
+    /// Marks the captured pooled connection as unsafe for reuse.
+    pub fn poison(&self) {
+        let meta = self.capture.connection_metadata();
+        if let Some(connection) = meta.as_ref() {
+            connection.poison();
+        }
+    }
+}
+
 impl fmt::Debug for HttpConnectionPool {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("HttpConnectionPool").finish_non_exhaustive()
@@ -181,8 +202,9 @@ impl HttpConnectionPool {
     /// mirroring the p2 permit lifecycle.
     ///
     /// Connection reuse, keep-alive, and TLS are handled by the same pooled
-    /// `hyper-util` client used by the p2 path. Connection poisoning is not
-    /// performed here; the p3 body lifecycle hooks own that responsibility.
+    /// `hyper-util` client used by the p2 path. The returned capture handle
+    /// lets callers poison the underlying connection before dropping a response
+    /// that is unsafe to keep alive.
     #[cfg(feature = "p3")]
     pub async fn pooled_send_request_p3(
         &self,
@@ -206,6 +228,7 @@ impl HttpConnectionPool {
                         Output = Result<(), crate::p3::bindings::http::types::ErrorCode>,
                     > + Send,
             >,
+            P3PooledConnection,
         ),
         crate::p3::bindings::http::types::ErrorCode,
     > {
@@ -283,7 +306,7 @@ impl HttpConnectionPool {
         } else {
             Some(body_done_tx)
         };
-        let request = request.map(|body| {
+        let mut request = request.map(|body| {
             OutgoingRequestBodyP3 {
                 inner: body,
                 captured_error: Arc::clone(&captured_body_error),
@@ -291,6 +314,7 @@ impl HttpConnectionPool {
             }
             .boxed_unsync()
         });
+        let pooled_connection = capture_connection(&mut request);
 
         let resp = timeout(first_byte_timeout, self.client.request(request))
             .await
@@ -319,7 +343,13 @@ impl HttpConnectionPool {
         // its connection driver has already completed.
         let io: Box<dyn std::future::Future<Output = Result<(), P3ErrorCode>> + Send> =
             Box::new(async move { body_done_rx.await.unwrap_or(Ok(())) });
-        Ok((http::Response::from_parts(parts, body.boxed_unsync()), io))
+        Ok((
+            http::Response::from_parts(parts, body.boxed_unsync()),
+            io,
+            P3PooledConnection {
+                capture: pooled_connection,
+            },
+        ))
     }
 }
 
