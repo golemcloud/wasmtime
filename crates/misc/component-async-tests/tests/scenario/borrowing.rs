@@ -4,9 +4,8 @@ use std::time::Duration;
 use super::util::{config, make_component};
 use futures::stream::{FuturesUnordered, TryStreamExt};
 use wasmtime::Result;
-use wasmtime::component::{Linker, ResourceTable};
+use wasmtime::component::Linker;
 use wasmtime::{Engine, Store};
-use wasmtime_wasi::WasiCtxBuilder;
 
 #[tokio::test]
 pub async fn async_borrowing_caller() -> Result<()> {
@@ -82,14 +81,7 @@ pub async fn test_run_bool(components: &[&str], v: bool) -> Result<()> {
         component_async_tests::Ctx,
     >(&mut linker, |ctx| ctx)?;
 
-    let mut store = Store::new(
-        &engine,
-        component_async_tests::Ctx {
-            wasi: WasiCtxBuilder::new().inherit_stdio().build(),
-            table: ResourceTable::default(),
-            continue_: false,
-        },
-    );
+    let mut store = Store::new(&engine, component_async_tests::Ctx::default());
 
     if env::var_os("MIRI_TEST_CWASM_DIR").is_none() {
         store.set_epoch_deadline(1);

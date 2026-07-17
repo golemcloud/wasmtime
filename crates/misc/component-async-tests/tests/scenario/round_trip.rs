@@ -12,7 +12,7 @@ use wasmtime::component::{
     Accessor, AccessorTask, HasData, HasSelf, Instance, Linker, ResourceTable, Val,
 };
 use wasmtime::{Engine, Result, Store, Trap, format_err};
-use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
+use wasmtime_wasi::{IoCtx, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 
 #[tokio::test]
 pub async fn async_round_trip_stackful() -> Result<()> {
@@ -250,6 +250,7 @@ pub async fn async_round_trip_synchronous_recurse_trap() -> Result<()> {
 async fn test_round_trip_recurse(component: &str, same_instance: bool) -> Result<()> {
     pub struct MyCtx {
         wasi: WasiCtx,
+        io_ctx: IoCtx,
         table: ResourceTable,
         instance: Option<Arc<Instance>>,
     }
@@ -259,6 +260,7 @@ async fn test_round_trip_recurse(component: &str, same_instance: bool) -> Result
             WasiCtxView {
                 ctx: &mut self.wasi,
                 table: &mut self.table,
+                io_ctx: &mut self.io_ctx,
             }
         }
     }
@@ -311,14 +313,15 @@ async fn test_round_trip_recurse(component: &str, same_instance: bool) -> Result
 
     let component = make_component(&engine, &[component]).await?;
 
-    let mut store = Store::new(
-        &engine,
+    let mut store = Store::new(&engine, {
+        let (wasi, io_ctx) = WasiCtxBuilder::new().inherit_stdio().build();
         MyCtx {
-            wasi: WasiCtxBuilder::new().inherit_stdio().build(),
+            wasi,
+            io_ctx,
             table: ResourceTable::default(),
             instance: None,
-        },
-    );
+        }
+    });
 
     let instance = Arc::new(linker.instantiate_async(&mut store, &component).await?);
     store.data_mut().instance = Some(instance.clone());
@@ -346,16 +349,7 @@ pub async fn test_round_trip(
 ) -> Result<()> {
     let engine = Engine::new(&config())?;
 
-    let make_store = || {
-        Store::new(
-            &engine,
-            Ctx {
-                wasi: WasiCtxBuilder::new().inherit_stdio().build(),
-                table: ResourceTable::default(),
-                continue_: false,
-            },
-        )
-    };
+    let make_store = || Store::new(&engine, Ctx::default());
 
     let component = make_component(&engine, components).await?;
 

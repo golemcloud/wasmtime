@@ -6,9 +6,8 @@ use std::future;
 use std::pin::pin;
 use std::task::Poll;
 use wasmtime::Result;
-use wasmtime::component::{Linker, ResourceTable};
+use wasmtime::component::Linker;
 use wasmtime::{AsContextMut, Engine, Store, StoreContextMut};
-use wasmtime_wasi::WasiCtxBuilder;
 
 mod yield_post_return {
     wasmtime::component::bindgen!({
@@ -58,14 +57,7 @@ async fn test_yield_post_return(components: &[&str]) -> Result<()> {
     wasmtime_wasi::p2::add_to_linker_async(&mut linker)?;
     yield_::local::local::yield_::add_to_linker::<_, Ctx>(&mut linker, |ctx| ctx)?;
 
-    let mut store = Store::new(
-        &engine,
-        Ctx {
-            wasi: WasiCtxBuilder::new().inherit_stdio().build(),
-            table: ResourceTable::default(),
-            continue_: false,
-        },
-    );
+    let mut store = Store::new(&engine, Ctx::default());
 
     let guest = yield_post_return::YieldPostReturnCallee::instantiate_async(
         &mut store, &component, &linker,

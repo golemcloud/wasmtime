@@ -10,9 +10,8 @@ use futures::stream::{FuturesUnordered, TryStreamExt};
 use tokio::fs;
 use tokio::sync::Mutex;
 use wasm_compose::composer::ComponentComposer;
-use wasmtime::component::{Component, Linker, ResourceTable};
+use wasmtime::component::{Component, Linker};
 use wasmtime::{Config, Engine, Result, Store, ToWasmtimeResult as _, bail, format_err};
-use wasmtime_wasi::WasiCtxBuilder;
 
 pub fn init_logger() {
     static ONCE: Once = Once::new();
@@ -197,14 +196,7 @@ pub async fn test_run_with_count(components: &[&str], count: usize) -> Result<()
     >(&mut linker, |ctx| ctx)?;
     yield_::local::local::yield_::add_to_linker::<_, Ctx>(&mut linker, |ctx| ctx)?;
 
-    let mut store = Store::new(
-        &engine,
-        Ctx {
-            wasi: WasiCtxBuilder::new().inherit_stdio().build(),
-            table: ResourceTable::default(),
-            continue_: false,
-        },
-    );
+    let mut store = Store::new(&engine, Ctx::default());
 
     if env::var_os("MIRI_TEST_CWASM_DIR").is_none() {
         store.set_epoch_deadline(1);

@@ -14,11 +14,9 @@ use futures::{
 };
 use wasmtime::component::{
     Accessor, Component, Destination, FutureConsumer, FutureProducer, FutureReader, HasSelf,
-    Instance, Linker, ResourceTable, Source, StreamConsumer, StreamProducer, StreamReader,
-    StreamResult, Val,
+    Instance, Linker, Source, StreamConsumer, StreamProducer, StreamReader, StreamResult, Val,
 };
 use wasmtime::{AsContextMut, Engine, Result, Store, StoreContextMut, format_err};
-use wasmtime_wasi::WasiCtxBuilder;
 
 struct BufferStreamProducer {
     buffer: Vec<u8>,
@@ -342,14 +340,7 @@ pub async fn async_readiness() -> Result<()> {
 
     wasmtime_wasi::p2::add_to_linker_async(&mut linker)?;
 
-    let mut store = Store::new(
-        &engine,
-        Ctx {
-            wasi: WasiCtxBuilder::new().inherit_stdio().build(),
-            table: ResourceTable::default(),
-            continue_: false,
-        },
-    );
+    let mut store = Store::new(&engine, Ctx::default());
 
     let readiness_guest =
         readiness::ReadinessGuest::instantiate_async(&mut store, &component, &linker).await?;
@@ -472,14 +463,7 @@ async fn test_cancel(mode: Mode) -> Result<()> {
     wasmtime_wasi::p2::add_to_linker_async(&mut linker)?;
     yield_::local::local::yield_::add_to_linker::<_, Ctx>(&mut linker, |ctx| ctx)?;
 
-    let mut store = Store::new(
-        &engine,
-        Ctx {
-            wasi: WasiCtxBuilder::new().inherit_stdio().build(),
-            table: ResourceTable::default(),
-            continue_: false,
-        },
-    );
+    let mut store = Store::new(&engine, Ctx::default());
 
     let cancel_host =
         cancel::CancelHost::instantiate_async(&mut store, &component, &linker).await?;
@@ -715,14 +699,7 @@ async fn test_transmit_with<Test: TransmitTest + 'static>(component: &str) -> Re
 
     wasmtime_wasi::p2::add_to_linker_async(&mut linker)?;
 
-    let mut store = Store::new(
-        &engine,
-        Ctx {
-            wasi: WasiCtxBuilder::new().inherit_stdio().build(),
-            table: ResourceTable::default(),
-            continue_: false,
-        },
-    );
+    let mut store = Store::new(&engine, Ctx::default());
 
     let test = Test::instantiate(&mut store, &component, &linker).await?;
 
@@ -916,14 +893,7 @@ async fn test_synchronous_transmit(component: &str, procrastinate: bool) -> Resu
 
     wasmtime_wasi::p2::add_to_linker_async(&mut linker)?;
 
-    let mut store = Store::new(
-        &engine,
-        Ctx {
-            wasi: WasiCtxBuilder::new().inherit_stdio().build(),
-            table: ResourceTable::default(),
-            continue_: false,
-        },
-    );
+    let mut store = Store::new(&engine, Ctx::default());
 
     let instance = linker.instantiate_async(&mut store, &component).await?;
     let guest = synchronous_transmit::SynchronousTransmitGuest::new(&mut store, &instance)?;

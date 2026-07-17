@@ -1168,7 +1168,7 @@ impl<T> StoreContextMut<'_, T> {
             self.0.concurrency_support(),
             "cannot use `run_concurrent` when Config::concurrency_support disabled",
         );
-        self.do_run_concurrent(fun, false, false).await
+        self.do_run_concurrent(fun, false, false, None).await
     }
 
     pub(super) async fn run_concurrent_trap_on_idle<R>(
@@ -1178,7 +1178,61 @@ impl<T> StoreContextMut<'_, T> {
     where
         T: Send + 'static,
     {
-        self.do_run_concurrent(fun, true, false).await
+        self.do_run_concurrent(fun, true, false, None).await
+    }
+
+    /// Like [`StoreContextMut::run_concurrent_and_drain`], but instead of
+    /// requiring full quiescence (no pending host futures at all), the event
+    /// loop keeps running after `fun` completes only until the store reaches
+    /// an *idle observation point* at which the embedder-provided `settled`
+    /// predicate returns `true`.
+    ///
+    /// An idle observation point is reached when, within a single poll of the
+    /// event loop:
+    ///
+    /// * the result of `fun` has already been captured,
+    /// * every currently-runnable host task future has been polled to
+    ///   `Pending` (no host task is ready),
+    /// * there are no queued work items, and
+    /// * no "interesting" guest task remains (every guest task has exited).
+    ///
+    /// Only then is `settled` consulted; if it returns `true` the captured
+    /// result is returned, leaving any still-pending (parked) host task
+    /// futures in the store — they will resume the next time the store's
+    /// event loop runs. If it returns `false` the loop keeps running until
+    /// the next idle observation point.
+    ///
+    /// This is intended for embedders whose host tasks may legitimately park
+    /// forever (e.g. waiting for guest demand that only a future event-loop
+    /// scope can produce): `run_concurrent_and_drain` would hang on such
+    /// tasks, while this variant lets the embedder distinguish "parked but
+    /// safe to leave behind" from "still doing work that must finish".
+    ///
+    /// Evaluating the predicate only at idle observation points guarantees
+    /// that any host task woken by an already-queued event (e.g. a channel
+    /// message sent just before the guest task exited) is polled before the
+    /// predicate can declare the store settled.
+    ///
+    /// Like `run_concurrent_and_drain`, the event loop traps with
+    /// [`Trap::AsyncDeadlock`] if it goes fully idle (no pending host futures
+    /// and no queued work) while unable to finish: either before `fun`
+    /// completes, or after it completes while an interesting guest task is
+    /// parked with nothing that could let it make progress, or when the
+    /// store is fully idle but `settled` still returns `false` (nothing could
+    /// ever make it become `true`).
+    pub async fn run_concurrent_and_settle<R>(
+        self,
+        fun: impl AsyncFnOnce(&Accessor<T>) -> R,
+        settled: &mut (dyn FnMut(StoreContextMut<'_, T>) -> bool + Send),
+    ) -> Result<R>
+    where
+        T: Send + 'static,
+    {
+        ensure!(
+            self.0.concurrency_support(),
+            "cannot use `run_concurrent_and_settle` when Config::concurrency_support disabled",
+        );
+        self.do_run_concurrent(fun, true, true, Some(settled)).await
     }
 
     /// Like [`StoreContextMut::run_concurrent`], but after `fun` completes the
@@ -1210,7 +1264,7 @@ impl<T> StoreContextMut<'_, T> {
             self.0.concurrency_support(),
             "cannot use `run_concurrent_and_drain` when Config::concurrency_support disabled",
         );
-        self.do_run_concurrent(fun, true, true).await
+        self.do_run_concurrent(fun, true, true, None).await
     }
 
     async fn do_run_concurrent<R>(
@@ -1218,6 +1272,7 @@ impl<T> StoreContextMut<'_, T> {
         fun: impl AsyncFnOnce(&Accessor<T>) -> R,
         trap_on_idle: bool,
         drain_after_complete: bool,
+        settled: Option<&mut (dyn FnMut(StoreContextMut<'_, T>) -> bool + Send)>,
     ) -> Result<R>
     where
         T: Send + 'static,
@@ -1258,7 +1313,7 @@ impl<T> StoreContextMut<'_, T> {
         dropper
             .store
             .as_context_mut()
-            .poll_until(future, trap_on_idle, drain_after_complete)
+            .poll_until(future, trap_on_idle, drain_after_complete, settled)
             .await
     }
 
@@ -1277,11 +1332,18 @@ impl<T> StoreContextMut<'_, T> {
     /// requires `trap_on_idle`: a tail task that becomes parked after completion
     /// with no way to make progress is reported as [`Trap::AsyncDeadlock`]
     /// rather than hanging.
+    ///
+    /// If `settled` is provided (which requires `drain_after_complete`), the
+    /// captured result is returned early — with pending host task futures
+    /// still parked in the store — at the first idle observation point where
+    /// no interesting guest task remains and the predicate returns `true`:
+    /// see [`StoreContextMut::run_concurrent_and_settle`].
     async fn poll_until<R>(
         mut self,
         mut future: Pin<&mut impl Future<Output = R>>,
         trap_on_idle: bool,
         drain_after_complete: bool,
+        mut settled: Option<&mut (dyn FnMut(StoreContextMut<'_, T>) -> bool + Send)>,
     ) -> Result<R>
     where
         T: Send + 'static,
@@ -1421,11 +1483,16 @@ impl<T> StoreContextMut<'_, T> {
                             }
                         } else if completed.is_some()
                             && reset.store.0.concurrent_state_mut().interesting_tasks == 0
+                            && match settled.as_mut() {
+                                Some(settled) => settled(reset.store.as_context_mut()),
+                                None => true,
+                            }
                         {
                             // We are draining tail work, the future already
                             // completed, and the guest task has fully exited
                             // (no interesting tasks remain), so the store is
-                            // quiescent: return the stashed result.
+                            // quiescent (and, in settle mode, the embedder
+                            // predicate agrees): return the stashed result.
                             Poll::Ready(Ok(PollResult::Complete(completed.take().unwrap())))
                         } else if trap_on_idle {
                             // Either the future never completed (a pre-return
@@ -1446,9 +1513,25 @@ impl<T> StoreContextMut<'_, T> {
                     }
                     // There is at least one pending future in
                     // `ConcurrentState::futures` and we have nothing
-                    // else to do but wait for now, so we return
-                    // `Pending`.
-                    Poll::Pending => Poll::Pending,
+                    // else to do but wait for now. This is an idle
+                    // observation point: every currently-runnable host task
+                    // has been polled to `Pending` and there are no queued
+                    // work items. In settle mode, if the passed future has
+                    // completed, no interesting guest task remains, and the
+                    // embedder predicate reports the store settled, return
+                    // the stashed result and leave the parked host futures
+                    // behind. Otherwise return `Pending` and wait.
+                    Poll::Pending => {
+                        if let Some(settled) = settled.as_mut()
+                            && completed.is_some()
+                            && reset.store.0.concurrent_state_mut().interesting_tasks == 0
+                            && settled(reset.store.as_context_mut())
+                        {
+                            Poll::Ready(Ok(PollResult::Complete(completed.take().unwrap())))
+                        } else {
+                            Poll::Pending
+                        }
+                    }
                 };
             })
             .await;
