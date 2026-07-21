@@ -639,6 +639,17 @@ fn find_rustls_error<'a>(err: &'a (dyn std::error::Error + 'static)) -> Option<&
         if let Some(r) = cur.downcast_ref::<rustls::Error>() {
             return Some(r);
         }
+        // `io::Error::source()` returns the *wrapped* error's source, skipping
+        // the wrapped error itself, so a rustls error inside (possibly nested)
+        // `io::Error` wrappers — as produced by tokio-rustls handshake failures
+        // going through the hyper-rustls connector — is invisible to a plain
+        // source() walk. Descend into the io::Error's payload instead.
+        if let Some(io_err) = cur.downcast_ref::<std::io::Error>()
+            && let Some(inner) = io_err.get_ref()
+        {
+            cur = inner;
+            continue;
+        }
         cur = cur.source()?;
     }
     None
