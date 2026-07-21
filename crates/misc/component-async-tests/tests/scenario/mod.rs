@@ -10,6 +10,7 @@ pub mod round_trip_direct;
 pub mod round_trip_many;
 pub mod settle;
 pub mod streams;
+pub mod terminal_observer;
 pub mod transmit;
 pub mod unit_stream;
 pub mod yield_;

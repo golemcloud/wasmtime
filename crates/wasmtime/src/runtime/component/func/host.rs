@@ -392,6 +392,18 @@ where
             );
         } else {
             self.call_sync_lower(store.as_context_mut(), instance, ty, options, storage)?;
+
+            // The result has been lowered into the guest's stack/linear memory, so the guest has
+            // actually received it; only now notify the terminal observer, if any (a lowering
+            // failure must not be misreported as a successful delivery). See
+            // `Accessor::register_terminal_observer`.
+            #[cfg(feature = "component-model-async")]
+            if let Some(task) = host_task
+                && let Some(observer) = store.0.concurrent_state_mut().take_terminal_observer(task)
+            {
+                observer(concurrent::TerminalConsumption::Delivered);
+            }
+
             true
         };
 

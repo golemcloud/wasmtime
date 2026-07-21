@@ -1,6 +1,8 @@
 use super::table::{TableDebug, TableId};
 use super::{Event, GlobalErrorContextRefCount, Waitable, WaitableCommon};
-use crate::component::concurrent::{ConcurrentState, QualifiedThreadId, WorkItem, tls};
+use crate::component::concurrent::{
+    ConcurrentState, QualifiedThreadId, Status, TerminalConsumption, WorkItem, tls,
+};
 use crate::component::func::{self, LiftContext, LowerContext};
 use crate::component::matching::InstanceType;
 use crate::component::types;
@@ -4834,6 +4836,16 @@ impl Waitable {
         instance: Instance,
         event: Event,
     ) -> Result<()> {
+        // Note: a host task's terminal observer (see `Accessor::register_terminal_observer`) is
+        // deliberately NOT notified here. `on_delivery` runs when the event is *about* to be
+        // delivered, but delivery can still fail afterwards (writing the event payload to guest
+        // memory can trap, and a guest callback can trap while processing the event). The
+        // delivery sites call `Waitable::notify_terminal_observer` only after the delivery
+        // actually succeeded.
+        if let Waitable::Host(_) = self {
+            return Ok(());
+        }
+
         let instance = instance.id().get_mut(store);
         let (rep, state, code) = match event {
             Event::FutureRead {
@@ -4896,6 +4908,34 @@ impl Waitable {
             _ => {}
         }
         Ok(())
+    }
+
+    /// Notify the terminal observer, if any, that a host task's terminal event has actually been
+    /// received by the guest; see `Accessor::register_terminal_observer`.
+    ///
+    /// Must be called only *after* the delivery fully succeeded — after the event payload has
+    /// been written to the guest's memory (`waitable-set.wait` / `waitable-set.poll`) or after
+    /// the guest callback processed the event without trapping. Invoking the observer earlier
+    /// (e.g. in [`Self::on_delivery`]) would misreport a payload-write trap or a callback trap as
+    /// a successful delivery.
+    pub(super) fn notify_terminal_observer(&self, store: &mut StoreOpaque, event: Event) {
+        if let (
+            Waitable::Host(host_task),
+            Event::Subtask {
+                status: status @ (Status::Returned | Status::ReturnCancelled),
+            },
+        ) = (self, event)
+        {
+            if let Some(observer) = store
+                .concurrent_state_mut()
+                .take_terminal_observer(*host_task)
+            {
+                observer(match status {
+                    Status::Returned => TerminalConsumption::Delivered,
+                    _ => TerminalConsumption::Cancelled,
+                });
+            }
+        }
     }
 }
 
