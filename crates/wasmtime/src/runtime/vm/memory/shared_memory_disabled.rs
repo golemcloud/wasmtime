@@ -1,7 +1,8 @@
 use crate::Engine;
 use crate::prelude::*;
-use crate::runtime::vm::memory::LocalMemory;
+use crate::runtime::vm::memory::{LocalMemory, SharedMemoryGrowthObserver};
 use crate::runtime::vm::{VMMemoryDefinition, WaitResult};
+use alloc::sync::Arc;
 use core::ops::Range;
 use core::ptr::NonNull;
 use core::time::Duration;
@@ -28,6 +29,10 @@ impl SharedMemory {
     }
 
     pub fn grow(&self, _delta_pages: u64) -> Result<Option<(usize, usize)>> {
+        match *self {}
+    }
+
+    pub fn subscribe_to_growth(&self, _observer: &Arc<SharedMemoryGrowthObserver>) {
         match *self {}
     }
 

@@ -85,6 +85,8 @@ use alloc::sync::Arc;
 use core::{ops::Range, ptr::NonNull};
 use wasmtime_environ::{MemoryKind, MemoryTunables};
 
+pub(crate) type SharedMemoryGrowthObserver = dyn Fn(usize, usize) + Send + Sync + 'static;
+
 #[cfg(feature = "threads")]
 use wasmtime_environ::Trap;
 

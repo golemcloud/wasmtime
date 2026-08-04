@@ -97,7 +97,7 @@ use crate::trampoline::VMHostGlobalContext;
 #[cfg(feature = "debug")]
 use crate::{BreakpointState, DebugHandler, FrameDataCache};
 use crate::{Engine, Module, Val, ValRaw, module::ModuleRegistry};
-use crate::{Global, Instance, Table};
+use crate::{Global, Instance, SharedMemory, StoreMemory, Table};
 use core::convert::Infallible;
 use core::fmt;
 #[cfg(any(feature = "async", feature = "gc"))]
@@ -998,6 +998,22 @@ impl<T> Store<T> {
     /// Returns the [`Engine`] that this store is associated with.
     pub fn engine(&self) -> &Engine {
         self.inner.engine()
+    }
+
+    /// Returns every unique linear-memory backing allocated in this store.
+    ///
+    /// This includes non-exported memories and host-created memories. Imported
+    /// aliases and multiple exports of one backing are returned only once.
+    pub fn linear_memories(&self) -> Vec<StoreMemory> {
+        self.inner
+            .all_memories()
+            .map(|memory| match memory {
+                ExportMemory::Unshared(memory) => StoreMemory::Unshared(memory),
+                ExportMemory::Shared(memory, _) => {
+                    StoreMemory::Shared(SharedMemory::from_raw(memory, self.engine().clone()))
+                }
+            })
+            .collect()
     }
 
     /// Returns the amount fuel in this [`Store`]. When fuel is enabled, it must

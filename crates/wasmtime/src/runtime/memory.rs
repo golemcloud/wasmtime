@@ -6,6 +6,7 @@ use crate::trampoline::generate_memory_export;
 #[cfg(feature = "async")]
 use crate::vm::VMStore;
 use crate::{AsContext, AsContextMut, Engine, MemoryType, StoreContext, StoreContextMut};
+use alloc::sync::Arc;
 use core::cell::UnsafeCell;
 use core::fmt;
 use core::slice;
@@ -13,6 +14,19 @@ use core::time::Duration;
 use wasmtime_environ::DefinedMemoryIndex;
 
 pub use crate::runtime::vm::WaitResult;
+
+/// A unique linear-memory backing allocated in a [`Store`](crate::Store).
+///
+/// Values returned by [`Store::linear_memories`](crate::Store::linear_memories)
+/// include memories that are not exported. Imports and multiple exports that
+/// refer to the same backing do not produce duplicate values.
+#[derive(Clone, Debug)]
+pub enum StoreMemory {
+    /// An unshared linear memory owned by the store.
+    Unshared(Memory),
+    /// A shared linear memory visible to the store.
+    Shared(SharedMemory),
+}
 
 /// Error for out of bounds [`Memory`] access.
 #[derive(Debug)]
@@ -861,6 +875,21 @@ pub struct SharedMemory {
     engine: Engine,
 }
 
+/// Keeps a shared-memory growth observer registered.
+///
+/// Dropping this value unregisters the observer. The observer is called after a
+/// growth has successfully committed and receives the old and new byte sizes.
+pub struct SharedMemoryGrowthSubscription {
+    _observer: Arc<crate::runtime::vm::SharedMemoryGrowthObserver>,
+}
+
+impl fmt::Debug for SharedMemoryGrowthSubscription {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SharedMemoryGrowthSubscription")
+            .finish_non_exhaustive()
+    }
+}
+
 impl SharedMemory {
     /// Construct a [`SharedMemory`] by providing both the `minimum` and
     /// `maximum` number of 64K-sized pages. This call allocates the necessary
@@ -975,6 +1004,22 @@ impl SharedMemory {
                 Ok(u64::try_from(old_size).unwrap() / self.page_size())
             }
             None => bail!("failed to grow memory by `{delta}`"),
+        }
+    }
+
+    /// Registers an observer for successful growth of this shared memory.
+    ///
+    /// The observer runs synchronously after the new size is committed. It must
+    /// not block or attempt to grow this memory. Dropping the returned
+    /// subscription unregisters the observer.
+    pub fn subscribe_to_growth(
+        &self,
+        observer: impl Fn(usize, usize) + Send + Sync + 'static,
+    ) -> SharedMemoryGrowthSubscription {
+        let observer: Arc<crate::runtime::vm::SharedMemoryGrowthObserver> = Arc::new(observer);
+        self.vm.subscribe_to_growth(&observer);
+        SharedMemoryGrowthSubscription {
+            _observer: observer,
         }
     }
 
@@ -1098,6 +1143,123 @@ impl fmt::Debug for SharedMemory {
 #[cfg(test)]
 mod tests {
     use crate::*;
+    use alloc::sync::Arc;
+    use alloc::vec::Vec;
+    use core::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn linear_memories_include_unique_non_exported_backings() -> Result<()> {
+        let engine = Engine::default();
+        let module = Module::new(
+            &engine,
+            r#"(module
+                (memory $aliased 2 3)
+                (export "a" (memory $aliased))
+                (export "b" (memory $aliased))
+                (memory 4 5)
+            )"#,
+        )?;
+        let mut store = Store::new(&engine, ());
+        Instance::new(&mut store, &module, &[])?;
+
+        let mut sizes = store
+            .linear_memories()
+            .into_iter()
+            .map(|memory| match memory {
+                StoreMemory::Unshared(memory) => memory.data_size(&store),
+                StoreMemory::Shared(_) => unreachable!(),
+            })
+            .collect::<Vec<_>>();
+        sizes.sort_unstable();
+
+        assert_eq!(sizes, [2 * 65536, 4 * 65536]);
+        Ok(())
+    }
+
+    #[cfg(feature = "threads")]
+    #[test]
+    fn linear_memories_include_shared_and_imported_backings_once() -> Result<()> {
+        let mut config = Config::new();
+        config.wasm_threads(true).shared_memory(true);
+        let engine = Engine::new(&config)?;
+        let module = Module::new(
+            &engine,
+            r#"(module
+                (import "env" "imported" (memory $imported 5 10 shared))
+                (memory $owned 2 3)
+                (export "a" (memory $owned))
+                (export "b" (memory $owned))
+                (memory 1 2 shared)
+            )"#,
+        )?;
+        let mut store = Store::new(&engine, ());
+        let imported = SharedMemory::new(&engine, MemoryType::shared(5, 10))?;
+        Instance::new(&mut store, &module, &[imported.into()])?;
+
+        let memories = store.linear_memories();
+        assert_eq!(memories.len(), 3);
+        assert_eq!(
+            memories
+                .iter()
+                .filter(|memory| matches!(memory, StoreMemory::Unshared(_)))
+                .count(),
+            1
+        );
+        let mut shared_sizes = memories
+            .iter()
+            .filter_map(|memory| match memory {
+                StoreMemory::Shared(memory) => Some(memory.data_size()),
+                StoreMemory::Unshared(_) => None,
+            })
+            .collect::<Vec<_>>();
+        shared_sizes.sort_unstable();
+        assert_eq!(shared_sizes, [65536, 5 * 65536]);
+        Ok(())
+    }
+
+    #[cfg(feature = "threads")]
+    #[test]
+    fn shared_memory_growth_subscriptions_observe_successful_growth() -> Result<()> {
+        let mut config = Config::new();
+        config.wasm_threads(true).shared_memory(true);
+        let engine = Engine::new(&config)?;
+        let memory = SharedMemory::new(&engine, MemoryType::shared(1, 2))?;
+        let module = Module::new(
+            &engine,
+            r#"(module
+                (import "env" "memory" (memory 1 2 shared))
+                (func (export "grow") (result i32) (memory.grow (i32.const 1)))
+            )"#,
+        )?;
+        let mut store = Store::new(&engine, ());
+        let instance = Instance::new(&mut store, &module, &[memory.clone().into()])?;
+        let grow = instance.get_typed_func::<(), i32>(&mut store, "grow")?;
+        let old_size = Arc::new(AtomicUsize::new(0));
+        let new_size = Arc::new(AtomicUsize::new(0));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let subscription = memory.subscribe_to_growth({
+            let old_size = old_size.clone();
+            let new_size = new_size.clone();
+            let calls = calls.clone();
+            move |old, new| {
+                old_size.store(old, Ordering::SeqCst);
+                new_size.store(new, Ordering::SeqCst);
+                calls.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+
+        assert_eq!(grow.call(&mut store, ())?, 1);
+        assert!(memory.grow(1).is_err());
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(old_size.load(Ordering::SeqCst), 65536);
+        assert_eq!(new_size.load(Ordering::SeqCst), 2 * 65536);
+
+        drop(subscription);
+        assert!(memory.grow(0).is_ok());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        Ok(())
+    }
 
     // Assert that creating a memory via `Memory::new` respects the limits/tunables
     // in `Config`.
