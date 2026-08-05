@@ -85,8 +85,6 @@ use alloc::sync::Arc;
 use core::{ops::Range, ptr::NonNull};
 use wasmtime_environ::{MemoryKind, MemoryTunables};
 
-pub(crate) type SharedMemoryGrowthObserver = dyn Fn(usize, usize) + Send + Sync + 'static;
-
 #[cfg(feature = "threads")]
 use wasmtime_environ::Trap;
 
@@ -710,6 +708,10 @@ impl LocalMemory {
                 // didn't move if it shouldn't have.
                 if required_to_not_move_memory {
                     assert_eq!(base_ptr_before, self.alloc.base().as_mut_ptr());
+                }
+
+                if let Some(limiter) = limiter {
+                    limiter.memory_grown(old_byte_size, new_byte_size)?;
                 }
 
                 Ok(Some((old_byte_size, new_byte_size)))

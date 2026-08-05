@@ -346,6 +346,14 @@ impl StoreResourceLimiter<'_> {
         }
     }
 
+    pub(crate) fn memory_grown(&mut self, current: usize, desired: usize) -> Result<()> {
+        match self {
+            Self::Sync(s) => s.memory_grown(current, desired),
+            #[cfg(feature = "async")]
+            Self::Async(s) => s.memory_grown(current, desired),
+        }
+    }
+
     pub(crate) async fn table_growing(
         &mut self,
         current: usize,
