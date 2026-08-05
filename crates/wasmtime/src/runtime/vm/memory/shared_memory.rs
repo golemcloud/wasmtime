@@ -147,11 +147,9 @@ impl SharedMemory {
 
     pub fn subscribe_to_growth(&self, observer: &Arc<SharedMemoryGrowthObserver>) -> usize {
         let memory = self.0.memory.read().unwrap();
-        self.0
-            .growth_observers
-            .write()
-            .unwrap()
-            .push(Arc::downgrade(observer));
+        let mut observers = self.0.growth_observers.write().unwrap();
+        observers.retain(|observer| observer.strong_count() > 0);
+        observers.push(Arc::downgrade(observer));
         memory.byte_size()
     }
 
