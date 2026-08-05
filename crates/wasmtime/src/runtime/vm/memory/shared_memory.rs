@@ -1,15 +1,13 @@
 use crate::Engine;
 use crate::prelude::*;
-use crate::runtime::vm::memory::{
-    LocalMemory, MmapMemory, SharedMemoryGrowthObserver, validate_atomic_addr,
-};
+use crate::runtime::vm::memory::{LocalMemory, MmapMemory, validate_atomic_addr};
 use crate::runtime::vm::parking_spot::{ParkingSpot, Waiter};
 use crate::runtime::vm::{self, Memory, VMMemoryDefinition, WaitResult};
 use std::cell::RefCell;
 use std::ops::Range;
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock, Weak};
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 use wasmtime_environ::Trap;
 
@@ -26,8 +24,6 @@ pub struct SharedMemory(Arc<SharedMemoryInner>);
 
 struct SharedMemoryInner {
     memory: RwLock<LocalMemory>,
-    growth_observers: RwLock<Vec<Weak<SharedMemoryGrowthObserver>>>,
-    growth_notification: Mutex<()>,
     spot: ParkingSpot,
     ty: wasmtime_environ::Memory,
     def: LongTermVMMemoryDefinition,
@@ -83,8 +79,6 @@ impl SharedMemory {
             spot: ParkingSpot::default(),
             def: LongTermVMMemoryDefinition(memory.vmmemory()),
             memory: RwLock::new(memory),
-            growth_observers: RwLock::new(Vec::new()),
-            growth_notification: Mutex::new(()),
         })?))
     }
 
@@ -105,48 +99,18 @@ impl SharedMemory {
 
     /// Same as `RuntimeLinearMemory::grow`, except with `&self`.
     pub fn grow(&self, delta_pages: u64) -> Result<Option<(usize, usize)>, Error> {
-        let _notification = self.0.growth_notification.lock().unwrap();
-        let result = {
-            let mut memory = self.0.memory.write().unwrap();
-            // Without a limiter being passed in this shouldn't have an await point,
-            // so it should be safe to assert that it's ready.
-            let result = vm::assert_ready(memory.grow(delta_pages, None))?;
-            if let Some((_old_size_in_bytes, new_size_in_bytes)) = result {
-                self.0
-                    .def
-                    .0
-                    .current_length
-                    .store(new_size_in_bytes, Ordering::SeqCst);
-            }
-            result
-        };
-        if let Some((old_size_in_bytes, new_size_in_bytes)) = result {
-            let observers = {
-                let mut registered = self.0.growth_observers.write().unwrap();
-                let mut observers = Vec::with_capacity(registered.len());
-                registered.retain(|observer| {
-                    if let Some(observer) = observer.upgrade() {
-                        observers.push(observer);
-                        true
-                    } else {
-                        false
-                    }
-                });
-                observers
-            };
-            for observer in observers {
-                observer(old_size_in_bytes, new_size_in_bytes);
-            }
+        let mut memory = self.0.memory.write().unwrap();
+        // Without a limiter being passed in this shouldn't have an await point,
+        // so it should be safe to assert that it's ready.
+        let result = vm::assert_ready(memory.grow(delta_pages, None))?;
+        if let Some((_old_size_in_bytes, new_size_in_bytes)) = result {
+            self.0
+                .def
+                .0
+                .current_length
+                .store(new_size_in_bytes, Ordering::SeqCst);
         }
         Ok(result)
-    }
-
-    pub fn subscribe_to_growth(&self, observer: &Arc<SharedMemoryGrowthObserver>) -> usize {
-        let memory = self.0.memory.read().unwrap();
-        let mut observers = self.0.growth_observers.write().unwrap();
-        observers.retain(|observer| observer.strong_count() > 0);
-        observers.push(Arc::downgrade(observer));
-        memory.byte_size()
     }
 
     /// Implementation of `memory.atomic.notify` for this shared memory.
