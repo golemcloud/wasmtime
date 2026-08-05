@@ -32,7 +32,7 @@ impl SharedMemory {
         match *self {}
     }
 
-    pub fn subscribe_to_growth(&self, _observer: &Arc<SharedMemoryGrowthObserver>) {
+    pub fn subscribe_to_growth(&self, _observer: &Arc<SharedMemoryGrowthObserver>) -> usize {
         match *self {}
     }
 

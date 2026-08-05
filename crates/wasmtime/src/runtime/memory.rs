@@ -1016,11 +1016,24 @@ impl SharedMemory {
         &self,
         observer: impl Fn(usize, usize) + Send + Sync + 'static,
     ) -> SharedMemoryGrowthSubscription {
+        self.subscribe_to_growth_with_current_size(observer).0
+    }
+
+    /// Registers a growth observer and atomically samples the current byte size.
+    ///
+    /// No growth can commit between registration and the returned size sample.
+    pub fn subscribe_to_growth_with_current_size(
+        &self,
+        observer: impl Fn(usize, usize) + Send + Sync + 'static,
+    ) -> (SharedMemoryGrowthSubscription, usize) {
         let observer: Arc<crate::runtime::vm::SharedMemoryGrowthObserver> = Arc::new(observer);
-        self.vm.subscribe_to_growth(&observer);
-        SharedMemoryGrowthSubscription {
-            _observer: observer,
-        }
+        let current_size = self.vm.subscribe_to_growth(&observer);
+        (
+            SharedMemoryGrowthSubscription {
+                _observer: observer,
+            },
+            current_size,
+        )
     }
 
     /// Equivalent of the WebAssembly `memory.atomic.notify` instruction for
@@ -1237,7 +1250,7 @@ mod tests {
         let old_size = Arc::new(AtomicUsize::new(0));
         let new_size = Arc::new(AtomicUsize::new(0));
         let calls = Arc::new(AtomicUsize::new(0));
-        let subscription = memory.subscribe_to_growth({
+        let (subscription, initial_size) = memory.subscribe_to_growth_with_current_size({
             let old_size = old_size.clone();
             let new_size = new_size.clone();
             let calls = calls.clone();
@@ -1247,6 +1260,7 @@ mod tests {
                 calls.fetch_add(1, Ordering::SeqCst);
             }
         });
+        assert_eq!(initial_size, 65536);
 
         assert_eq!(grow.call(&mut store, ())?, 1);
         assert!(memory.grow(1).is_err());

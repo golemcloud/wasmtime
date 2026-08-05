@@ -143,12 +143,14 @@ impl SharedMemory {
         Ok(result)
     }
 
-    pub fn subscribe_to_growth(&self, observer: &Arc<SharedMemoryGrowthObserver>) {
+    pub fn subscribe_to_growth(&self, observer: &Arc<SharedMemoryGrowthObserver>) -> usize {
+        let memory = self.0.memory.read().unwrap();
         self.0
             .growth_observers
             .write()
             .unwrap()
             .push(Arc::downgrade(observer));
+        memory.byte_size()
     }
 
     /// Implementation of `memory.atomic.notify` for this shared memory.
