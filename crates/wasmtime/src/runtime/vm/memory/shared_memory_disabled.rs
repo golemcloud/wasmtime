@@ -11,6 +11,10 @@ use wasmtime_environ::Trap;
 pub enum SharedMemory {}
 
 impl SharedMemory {
+    pub(crate) fn same_backing(&self, other: &Self) -> bool {
+        match (*self, *other) {}
+    }
+
     pub fn wrap(_: &Engine, _ty: &wasmtime_environ::Memory, _memory: LocalMemory) -> Result<Self> {
         bail!("support for shared memories was disabled at compile time");
     }

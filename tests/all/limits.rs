@@ -728,9 +728,8 @@ impl ResourceLimiter for FailureDetector {
         self.memory_error = Some(err.to_string());
         Ok(())
     }
-    fn memory_grown(&mut self, current: usize, desired: usize) -> Result<()> {
+    fn memory_grown(&mut self, current: usize, desired: usize) {
         self.memory_grown = Some((current, desired));
-        Ok(())
     }
     fn table_growing(
         &mut self,
@@ -843,9 +842,8 @@ impl ResourceLimiterAsync for FailureDetector {
         self.memory_error = Some(err.to_string());
         Ok(())
     }
-    fn memory_grown(&mut self, current: usize, desired: usize) -> Result<()> {
+    fn memory_grown(&mut self, current: usize, desired: usize) {
         self.memory_grown = Some((current, desired));
-        Ok(())
     }
 
     async fn table_growing(

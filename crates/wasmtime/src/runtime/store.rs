@@ -346,7 +346,7 @@ impl StoreResourceLimiter<'_> {
         }
     }
 
-    pub(crate) fn memory_grown(&mut self, current: usize, desired: usize) -> Result<()> {
+    pub(crate) fn memory_grown(&mut self, current: usize, desired: usize) {
         match self {
             Self::Sync(s) => s.memory_grown(current, desired),
             #[cfg(feature = "async")]
@@ -1013,15 +1013,22 @@ impl<T> Store<T> {
     /// This includes non-exported memories and host-created memories. Imported
     /// aliases and multiple exports of one backing are returned only once.
     pub fn linear_memories(&self) -> Vec<StoreMemory> {
-        self.inner
-            .all_memories()
-            .map(|memory| match memory {
-                ExportMemory::Unshared(memory) => StoreMemory::Unshared(memory),
+        let mut memories = Vec::new();
+        for memory in self.inner.all_memories() {
+            match memory {
+                ExportMemory::Unshared(memory) => memories.push(StoreMemory::Unshared(memory)),
                 ExportMemory::Shared(memory, _) => {
-                    StoreMemory::Shared(SharedMemory::from_raw(memory, self.engine().clone()))
+                    let memory = SharedMemory::from_raw(memory, self.engine().clone());
+                    if !memories.iter().any(|existing| match existing {
+                        StoreMemory::Shared(existing) => existing.same_backing(&memory),
+                        StoreMemory::Unshared(_) => false,
+                    }) {
+                        memories.push(StoreMemory::Shared(memory));
+                    }
                 }
-            })
-            .collect()
+            }
+        }
+        memories
     }
 
     /// Returns the amount fuel in this [`Store`]. When fuel is enabled, it must

@@ -96,9 +96,7 @@ pub trait ResourceLimiter: Send {
     /// This is not called for a memory's initial allocation or for shared
     /// memories. `current` and `desired` are the memory's old and new sizes in
     /// bytes.
-    fn memory_grown(&mut self, _current: usize, _desired: usize) -> Result<()> {
-        Ok(())
-    }
+    fn memory_grown(&mut self, _current: usize, _desired: usize) {}
 
     /// Notifies the resource limiter that an instance's table has been
     /// requested to grow.
@@ -196,9 +194,7 @@ pub trait ResourceLimiterAsync: Send {
     }
 
     /// Identical to [`ResourceLimiter::memory_grown`].
-    fn memory_grown(&mut self, _current: usize, _desired: usize) -> Result<()> {
-        Ok(())
-    }
+    fn memory_grown(&mut self, _current: usize, _desired: usize) {}
 
     /// Asynchronous version of [`ResourceLimiter::table_growing`]
     async fn table_growing(

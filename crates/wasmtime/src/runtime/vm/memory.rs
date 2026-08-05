@@ -251,7 +251,7 @@ impl Memory {
         let memory_tunables = MemoryTunables::new(tunables, kind);
         let allocation = creator.new_memory(ty, &memory_tunables, minimum, maximum)?;
 
-        let memory = LocalMemory::new(ty, &memory_tunables, allocation, memory_image)?;
+        let memory = LocalMemory::new(ty, &memory_tunables, allocation, memory_image, kind)?;
         Ok(if ty.shared {
             Memory::Shared(SharedMemory::wrap(engine, ty, memory)?)
         } else {
@@ -277,7 +277,13 @@ impl Memory {
         // `LocalMemory` structure created, notably we already have
         // `memory_image` and regardless of configuration settings this memory
         // can't move its base pointer since it's a fixed allocation.
-        let mut memory = LocalMemory::new(ty, memory_tunables, allocation, None)?;
+        let mut memory = LocalMemory::new(
+            ty,
+            memory_tunables,
+            allocation,
+            None,
+            MemoryKind::LinearMemory,
+        )?;
         assert!(memory.memory_image.is_none());
         memory.memory_image = Some(memory_image);
         memory.memory_may_move = false;
@@ -536,6 +542,7 @@ impl Memory {
 pub struct LocalMemory {
     alloc: Box<dyn RuntimeLinearMemory>,
     ty: wasmtime_environ::Memory,
+    kind: MemoryKind,
     memory_may_move: bool,
     memory_guard_size: usize,
     memory_reservation: usize,
@@ -551,6 +558,7 @@ impl LocalMemory {
         memory_tunables: &MemoryTunables<'_>,
         alloc: Box<dyn RuntimeLinearMemory>,
         memory_image: Option<&Arc<MemoryImage>>,
+        kind: MemoryKind,
     ) -> Result<LocalMemory> {
         // If a memory image was specified, try to create the MemoryImageSlot on
         // top of our mmap.
@@ -584,6 +592,7 @@ impl LocalMemory {
         };
         Ok(LocalMemory {
             ty: *ty,
+            kind,
             alloc,
             memory_may_move: ty.memory_may_move(memory_tunables),
             memory_image,
@@ -710,8 +719,10 @@ impl LocalMemory {
                     assert_eq!(base_ptr_before, self.alloc.base().as_mut_ptr());
                 }
 
-                if let Some(limiter) = limiter {
-                    limiter.memory_grown(old_byte_size, new_byte_size)?;
+                if matches!(self.kind, MemoryKind::LinearMemory)
+                    && let Some(limiter) = limiter
+                {
+                    limiter.memory_grown(old_byte_size, new_byte_size);
                 }
 
                 Ok(Some((old_byte_size, new_byte_size)))

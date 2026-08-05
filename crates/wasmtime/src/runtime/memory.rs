@@ -875,6 +875,10 @@ pub struct SharedMemory {
 }
 
 impl SharedMemory {
+    pub(crate) fn same_backing(&self, other: &Self) -> bool {
+        self.vm.same_backing(&other.vm)
+    }
+
     /// Construct a [`SharedMemory`] by providing both the `minimum` and
     /// `maximum` number of 64K-sized pages. This call allocates the necessary
     /// pages on the system.
@@ -1126,9 +1130,8 @@ mod tests {
             Ok(true)
         }
 
-        fn memory_grown(&mut self, current: usize, desired: usize) -> Result<()> {
+        fn memory_grown(&mut self, current: usize, desired: usize) {
             self.0.push((current, desired));
-            Ok(())
         }
 
         fn table_growing(
@@ -1206,16 +1209,17 @@ mod tests {
         )?;
         let mut store = Store::new(&engine, ());
         let imported = SharedMemory::new(&engine, MemoryType::shared(5, 10))?;
+        Instance::new(&mut store, &module, &[imported.clone().into()])?;
         Instance::new(&mut store, &module, &[imported.into()])?;
 
         let memories = store.linear_memories();
-        assert_eq!(memories.len(), 3);
+        assert_eq!(memories.len(), 5);
         assert_eq!(
             memories
                 .iter()
                 .filter(|memory| matches!(memory, StoreMemory::Unshared(_)))
                 .count(),
-            1
+            2
         );
         let mut shared_sizes = memories
             .iter()
@@ -1225,7 +1229,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         shared_sizes.sort_unstable();
-        assert_eq!(shared_sizes, [65536, 5 * 65536]);
+        assert_eq!(shared_sizes, [65536, 65536, 5 * 65536]);
         Ok(())
     }
 
