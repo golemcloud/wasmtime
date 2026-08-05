@@ -6,6 +6,7 @@ use crate::trampoline::generate_memory_export;
 #[cfg(feature = "async")]
 use crate::vm::VMStore;
 use crate::{AsContext, AsContextMut, Engine, MemoryType, StoreContext, StoreContextMut};
+use alloc::sync::Arc;
 use core::cell::UnsafeCell;
 use core::fmt;
 use core::slice;
@@ -874,6 +875,21 @@ pub struct SharedMemory {
     engine: Engine,
 }
 
+/// Keeps a shared-memory growth observer registered.
+///
+/// Dropping this value unregisters the observer. The observer is called after a
+/// growth has successfully committed and receives the old and new byte sizes.
+pub struct SharedMemoryGrowthSubscription {
+    _observer: Arc<crate::runtime::vm::SharedMemoryGrowthObserver>,
+}
+
+impl fmt::Debug for SharedMemoryGrowthSubscription {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SharedMemoryGrowthSubscription")
+            .finish_non_exhaustive()
+    }
+}
+
 impl SharedMemory {
     pub(crate) fn same_backing(&self, other: &Self) -> bool {
         self.vm.same_backing(&other.vm)
@@ -993,6 +1009,35 @@ impl SharedMemory {
             }
             None => bail!("failed to grow memory by `{delta}`"),
         }
+    }
+
+    /// Registers an observer for successful growth of this shared memory.
+    ///
+    /// The observer runs synchronously after the new size is committed. It must
+    /// not block or attempt to grow this memory. Dropping the returned
+    /// subscription unregisters the observer.
+    pub fn subscribe_to_growth(
+        &self,
+        observer: impl Fn(usize, usize) + Send + Sync + 'static,
+    ) -> SharedMemoryGrowthSubscription {
+        self.subscribe_to_growth_with_current_size(observer).0
+    }
+
+    /// Registers a growth observer and atomically samples the current byte size.
+    ///
+    /// No growth can commit between registration and the returned size sample.
+    pub fn subscribe_to_growth_with_current_size(
+        &self,
+        observer: impl Fn(usize, usize) + Send + Sync + 'static,
+    ) -> (SharedMemoryGrowthSubscription, usize) {
+        let observer: Arc<crate::runtime::vm::SharedMemoryGrowthObserver> = Arc::new(observer);
+        let current_size = self.vm.subscribe_to_growth(&observer);
+        (
+            SharedMemoryGrowthSubscription {
+                _observer: observer,
+            },
+            current_size,
+        )
     }
 
     /// Equivalent of the WebAssembly `memory.atomic.notify` instruction for
@@ -1115,7 +1160,9 @@ impl fmt::Debug for SharedMemory {
 #[cfg(test)]
 mod tests {
     use crate::*;
+    use alloc::sync::Arc;
     use alloc::vec::Vec;
+    use core::sync::atomic::{AtomicUsize, Ordering};
 
     #[derive(Default)]
     struct SuccessfulGrowths(Vec<(usize, usize)>);
@@ -1230,6 +1277,40 @@ mod tests {
             .collect::<Vec<_>>();
         shared_sizes.sort_unstable();
         assert_eq!(shared_sizes, [65536, 65536, 5 * 65536]);
+        Ok(())
+    }
+
+    #[cfg(feature = "threads")]
+    #[test]
+    fn shared_memory_growth_subscriptions_observe_successful_growth() -> Result<()> {
+        let mut config = Config::new();
+        config.wasm_threads(true).shared_memory(true);
+        let engine = Engine::new(&config)?;
+        let memory = SharedMemory::new(&engine, MemoryType::shared(1, 3))?;
+        let old_size = Arc::new(AtomicUsize::new(0));
+        let new_size = Arc::new(AtomicUsize::new(0));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (subscription, initial_size) = memory.subscribe_to_growth_with_current_size({
+            let old_size = old_size.clone();
+            let new_size = new_size.clone();
+            let calls = calls.clone();
+            move |old, new| {
+                old_size.store(old, Ordering::SeqCst);
+                new_size.store(new, Ordering::SeqCst);
+                calls.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+        assert_eq!(initial_size, 65536);
+
+        assert_eq!(memory.grow(1)?, 1);
+        assert!(memory.grow(3).is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(old_size.load(Ordering::SeqCst), 65536);
+        assert_eq!(new_size.load(Ordering::SeqCst), 2 * 65536);
+
+        drop(subscription);
+        assert_eq!(memory.grow(1)?, 2);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
         Ok(())
     }
 

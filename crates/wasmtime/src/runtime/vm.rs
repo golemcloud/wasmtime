@@ -110,6 +110,7 @@ pub use crate::runtime::vm::instance::{
     PoolingInstanceAllocatorConfig,
 };
 pub use crate::runtime::vm::interpreter::*;
+pub(crate) use crate::runtime::vm::memory::SharedMemoryGrowthObserver;
 pub use crate::runtime::vm::memory::{
     Memory, MemoryBase, RuntimeLinearMemory, RuntimeMemoryCreator, SharedMemory,
 };
