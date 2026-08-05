@@ -264,6 +264,7 @@ impl Memory {
     pub async fn new_static(
         ty: &wasmtime_environ::Memory,
         memory_tunables: &MemoryTunables<'_>,
+        kind: MemoryKind,
         base: MemoryBase,
         base_capacity: usize,
         memory_image: MemoryImageSlot,
@@ -277,13 +278,7 @@ impl Memory {
         // `LocalMemory` structure created, notably we already have
         // `memory_image` and regardless of configuration settings this memory
         // can't move its base pointer since it's a fixed allocation.
-        let mut memory = LocalMemory::new(
-            ty,
-            memory_tunables,
-            allocation,
-            None,
-            MemoryKind::LinearMemory,
-        )?;
+        let mut memory = LocalMemory::new(ty, memory_tunables, allocation, None, kind)?;
         assert!(memory.memory_image.is_none());
         memory.memory_image = Some(memory_image);
         memory.memory_may_move = false;
