@@ -1291,10 +1291,12 @@ mod tests {
         let new_size = Arc::new(AtomicUsize::new(0));
         let calls = Arc::new(AtomicUsize::new(0));
         let (subscription, initial_size) = memory.subscribe_to_growth_with_current_size({
+            let memory = memory.clone();
             let old_size = old_size.clone();
             let new_size = new_size.clone();
             let calls = calls.clone();
             move |old, new| {
+                assert_eq!(memory.data_size(), new);
                 old_size.store(old, Ordering::SeqCst);
                 new_size.store(new, Ordering::SeqCst);
                 calls.fetch_add(1, Ordering::SeqCst);
