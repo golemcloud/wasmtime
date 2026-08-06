@@ -104,6 +104,25 @@ impl SharedMemory {
         // so it should be safe to assert that it's ready.
         let result = vm::assert_ready(memory.grow(delta_pages, None))?;
         if let Some((_old_size_in_bytes, new_size_in_bytes)) = result {
+            // Store the new size to the `VMMemoryDefinition` for JIT-generated
+            // code (and runtime functions) to access. No other code can be
+            // growing this memory due to the write lock, but code in other
+            // threads could have access to this shared memory and we want them
+            // to see the most consistent version of the `current_length`; a
+            // weaker consistency is possible if we accept them seeing an older,
+            // smaller memory size (assumption: memory only grows) but presently
+            // we are aiming for accuracy.
+            //
+            // Note that it could be possible to access a memory address that is
+            // now-valid due to changes to the page flags in `grow` above but
+            // beyond the `memory.size` that we are about to assign to. In these
+            // and similar cases, discussion in the thread proposal concluded
+            // that: "multiple accesses in one thread racing with another
+            // thread's `memory.grow` that are in-bounds only after the grow
+            // commits may independently succeed or trap" (see
+            // https://github.com/WebAssembly/threads/issues/26#issuecomment-433930711).
+            // In other words, some non-determinism is acceptable when using
+            // `memory.size` on work being done by `memory.grow`.
             self.0
                 .def
                 .0
