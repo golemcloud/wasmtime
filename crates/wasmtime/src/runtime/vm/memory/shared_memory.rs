@@ -30,6 +30,10 @@ struct SharedMemoryInner {
 }
 
 impl SharedMemory {
+    pub(crate) fn same_backing(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+
     /// Construct a new [`SharedMemory`].
     pub fn new(engine: &Engine, ty: &wasmtime_environ::Memory) -> Result<Self> {
         let tunables = engine.tunables();
@@ -46,7 +50,13 @@ impl SharedMemory {
         Self::wrap(
             engine,
             ty,
-            LocalMemory::new(ty, &memory_tunables, boxed, None)?,
+            LocalMemory::new(
+                ty,
+                &memory_tunables,
+                boxed,
+                None,
+                wasmtime_environ::MemoryKind::LinearMemory,
+            )?,
         )
     }
 

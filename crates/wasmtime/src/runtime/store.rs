@@ -97,7 +97,7 @@ use crate::trampoline::VMHostGlobalContext;
 #[cfg(feature = "debug")]
 use crate::{BreakpointState, DebugHandler, FrameDataCache};
 use crate::{Engine, Module, Val, ValRaw, module::ModuleRegistry};
-use crate::{Global, Instance, Table};
+use crate::{Global, Instance, SharedMemory, StoreMemory, Table};
 use core::convert::Infallible;
 use core::fmt;
 #[cfg(any(feature = "async", feature = "gc"))]
@@ -343,6 +343,14 @@ impl StoreResourceLimiter<'_> {
             Self::Sync(s) => s.memory_grow_failed(error),
             #[cfg(feature = "async")]
             Self::Async(s) => s.memory_grow_failed(error),
+        }
+    }
+
+    pub(crate) fn memory_grown(&mut self, current: usize, desired: usize) {
+        match self {
+            Self::Sync(s) => s.memory_grown(current, desired),
+            #[cfg(feature = "async")]
+            Self::Async(s) => s.memory_grown(current, desired),
         }
     }
 
@@ -998,6 +1006,29 @@ impl<T> Store<T> {
     /// Returns the [`Engine`] that this store is associated with.
     pub fn engine(&self) -> &Engine {
         self.inner.engine()
+    }
+
+    /// Returns every unique linear-memory backing allocated in this store.
+    ///
+    /// This includes non-exported memories and host-created memories. Imported
+    /// aliases and multiple exports of one backing are returned only once.
+    pub fn linear_memories(&self) -> Vec<StoreMemory> {
+        let mut memories = Vec::new();
+        for memory in self.inner.all_memories() {
+            match memory {
+                ExportMemory::Unshared(memory) => memories.push(StoreMemory::Unshared(memory)),
+                ExportMemory::Shared(memory, _) => {
+                    let memory = SharedMemory::from_raw(memory, self.engine().clone());
+                    if !memories.iter().any(|existing| match existing {
+                        StoreMemory::Shared(existing) => existing.same_backing(&memory),
+                        StoreMemory::Unshared(_) => false,
+                    }) {
+                        memories.push(StoreMemory::Shared(memory));
+                    }
+                }
+            }
+        }
+        memories
     }
 
     /// Returns the amount fuel in this [`Store`]. When fuel is enabled, it must

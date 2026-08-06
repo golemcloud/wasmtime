@@ -14,6 +14,19 @@ use wasmtime_environ::DefinedMemoryIndex;
 
 pub use crate::runtime::vm::WaitResult;
 
+/// A unique linear-memory backing allocated in a [`Store`](crate::Store).
+///
+/// Values returned by [`Store::linear_memories`](crate::Store::linear_memories)
+/// include memories that are not exported. Imports and multiple exports that
+/// refer to the same backing do not produce duplicate values.
+#[derive(Clone, Debug)]
+pub enum StoreMemory {
+    /// An unshared linear memory owned by the store.
+    Unshared(Memory),
+    /// A shared linear memory visible to the store.
+    Shared(SharedMemory),
+}
+
 /// Error for out of bounds [`Memory`] access.
 #[derive(Debug)]
 #[non_exhaustive]
@@ -862,6 +875,10 @@ pub struct SharedMemory {
 }
 
 impl SharedMemory {
+    pub(crate) fn same_backing(&self, other: &Self) -> bool {
+        self.vm.same_backing(&other.vm)
+    }
+
     /// Construct a [`SharedMemory`] by providing both the `minimum` and
     /// `maximum` number of 64K-sized pages. This call allocates the necessary
     /// pages on the system.
@@ -1098,6 +1115,123 @@ impl fmt::Debug for SharedMemory {
 #[cfg(test)]
 mod tests {
     use crate::*;
+    use alloc::vec::Vec;
+
+    #[derive(Default)]
+    struct SuccessfulGrowths(Vec<(usize, usize)>);
+
+    impl ResourceLimiter for SuccessfulGrowths {
+        fn memory_growing(
+            &mut self,
+            _current: usize,
+            _desired: usize,
+            _maximum: Option<usize>,
+        ) -> Result<bool> {
+            Ok(true)
+        }
+
+        fn memory_grown(&mut self, current: usize, desired: usize) {
+            self.0.push((current, desired));
+        }
+
+        fn table_growing(
+            &mut self,
+            _current: usize,
+            _desired: usize,
+            _maximum: Option<usize>,
+        ) -> Result<bool> {
+            Ok(true)
+        }
+    }
+
+    #[test]
+    fn limiter_observes_only_successful_post_instantiation_growth() -> Result<()> {
+        let engine = Engine::default();
+        let module = Module::new(&engine, r#"(module (memory (export "m") 1 2))"#)?;
+        let mut store = Store::new(&engine, SuccessfulGrowths::default());
+        store.limiter(|state| state);
+        let instance = Instance::new(&mut store, &module, &[])?;
+        assert!(store.data().0.is_empty());
+
+        let memory = instance.get_memory(&mut store, "m").unwrap();
+        assert_eq!(memory.grow(&mut store, 1)?, 1);
+        assert_eq!(store.data().0, [(65536, 2 * 65536)]);
+
+        assert!(memory.grow(&mut store, 1).is_err());
+        assert_eq!(store.data().0, [(65536, 2 * 65536)]);
+        Ok(())
+    }
+
+    #[test]
+    fn linear_memories_include_unique_non_exported_backings() -> Result<()> {
+        let engine = Engine::default();
+        let module = Module::new(
+            &engine,
+            r#"(module
+                (memory $aliased 2 3)
+                (export "a" (memory $aliased))
+                (export "b" (memory $aliased))
+                (memory 4 5)
+            )"#,
+        )?;
+        let mut store = Store::new(&engine, ());
+        Instance::new(&mut store, &module, &[])?;
+
+        let mut sizes = store
+            .linear_memories()
+            .into_iter()
+            .map(|memory| match memory {
+                StoreMemory::Unshared(memory) => memory.data_size(&store),
+                StoreMemory::Shared(_) => unreachable!(),
+            })
+            .collect::<Vec<_>>();
+        sizes.sort_unstable();
+
+        assert_eq!(sizes, [2 * 65536, 4 * 65536]);
+        Ok(())
+    }
+
+    #[cfg(feature = "threads")]
+    #[test]
+    fn linear_memories_include_shared_and_imported_backings_once() -> Result<()> {
+        let mut config = Config::new();
+        config.wasm_threads(true).shared_memory(true);
+        let engine = Engine::new(&config)?;
+        let module = Module::new(
+            &engine,
+            r#"(module
+                (import "env" "imported" (memory $imported 5 10 shared))
+                (memory $owned 2 3)
+                (export "a" (memory $owned))
+                (export "b" (memory $owned))
+                (memory 1 2 shared)
+            )"#,
+        )?;
+        let mut store = Store::new(&engine, ());
+        let imported = SharedMemory::new(&engine, MemoryType::shared(5, 10))?;
+        Instance::new(&mut store, &module, &[imported.clone().into()])?;
+        Instance::new(&mut store, &module, &[imported.into()])?;
+
+        let memories = store.linear_memories();
+        assert_eq!(memories.len(), 5);
+        assert_eq!(
+            memories
+                .iter()
+                .filter(|memory| matches!(memory, StoreMemory::Unshared(_)))
+                .count(),
+            2
+        );
+        let mut shared_sizes = memories
+            .iter()
+            .filter_map(|memory| match memory {
+                StoreMemory::Shared(memory) => Some(memory.data_size()),
+                StoreMemory::Unshared(_) => None,
+            })
+            .collect::<Vec<_>>();
+        shared_sizes.sort_unstable();
+        assert_eq!(shared_sizes, [65536, 65536, 5 * 65536]);
+        Ok(())
+    }
 
     // Assert that creating a memory via `Memory::new` respects the limits/tunables
     // in `Config`.
