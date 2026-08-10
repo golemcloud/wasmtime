@@ -110,6 +110,7 @@ async fn test_limits_async() -> Result<()> {
             _current: usize,
             desired: usize,
             _maximum: Option<usize>,
+            _kind: MemoryKind,
         ) -> Result<bool> {
             Ok(desired <= self.memory_size)
         }
@@ -401,6 +402,7 @@ impl ResourceLimiter for MemoryContext {
         current: usize,
         desired: usize,
         maximum: Option<usize>,
+        _kind: MemoryKind,
     ) -> Result<bool> {
         // Check if the desired exceeds a maximum (either from Wasm or from the host)
         assert!(desired < maximum.unwrap_or(usize::MAX));
@@ -513,6 +515,7 @@ impl ResourceLimiterAsync for MemoryContext {
         current: usize,
         desired: usize,
         maximum: Option<usize>,
+        _kind: MemoryKind,
     ) -> Result<bool> {
         // Show we can await in this async context:
         tokio::time::sleep(std::time::Duration::from_millis(1)).await;
@@ -633,6 +636,7 @@ impl ResourceLimiter for TableContext {
         _current: usize,
         _desired: usize,
         _maximum: Option<usize>,
+        _kind: MemoryKind,
     ) -> Result<bool> {
         Ok(true)
     }
@@ -703,7 +707,7 @@ struct FailureDetector {
     memory_current: usize,
     memory_desired: usize,
     /// Arguments of most recent call to memory_grown
-    memory_grown: Option<(usize, usize)>,
+    memory_grown: Option<(usize, usize, MemoryKind)>,
     /// Display impl of most recent call to memory_grow_failed
     memory_error: Option<String>,
     /// Arguments of most recent call to table_growing
@@ -719,17 +723,18 @@ impl ResourceLimiter for FailureDetector {
         current: usize,
         desired: usize,
         _maximum: Option<usize>,
+        _kind: MemoryKind,
     ) -> Result<bool> {
         self.memory_current = current;
         self.memory_desired = desired;
         Ok(true)
     }
-    fn memory_grow_failed(&mut self, err: wasmtime::Error) -> Result<()> {
+    fn memory_grow_failed(&mut self, err: wasmtime::Error, _kind: MemoryKind) -> Result<()> {
         self.memory_error = Some(err.to_string());
         Ok(())
     }
-    fn memory_grown(&mut self, current: usize, desired: usize) {
-        self.memory_grown = Some((current, desired));
+    fn memory_grown(&mut self, current: usize, desired: usize, kind: MemoryKind) {
+        self.memory_grown = Some((current, desired, kind));
     }
     fn table_growing(
         &mut self,
@@ -777,7 +782,10 @@ fn custom_limiter_detect_grow_failure() -> Result<()> {
     assert!(store.data().memory_error.is_none());
     assert_eq!(store.data().memory_current, 0);
     assert_eq!(store.data().memory_desired, 10 * 64 * 1024);
-    assert_eq!(store.data().memory_grown, Some((0, 10 * 64 * 1024)));
+    assert_eq!(
+        store.data().memory_grown,
+        Some((0, 10 * 64 * 1024, MemoryKind::LinearMemory))
+    );
 
     // Grow past the static limit set by ModuleLimits.
     // The ResourceLimiter will permit this, but the grow will fail.
@@ -792,7 +800,10 @@ fn custom_limiter_detect_grow_failure() -> Result<()> {
         store.data().memory_error.as_ref().unwrap(),
         "Memory maximum size exceeded"
     );
-    assert_eq!(store.data().memory_grown, Some((0, 10 * 64 * 1024)));
+    assert_eq!(
+        store.data().memory_grown,
+        Some((0, 10 * 64 * 1024, MemoryKind::LinearMemory))
+    );
 
     let table = instance.get_table(&mut store, "t").unwrap();
     // Grow the table 10 elements
@@ -831,6 +842,7 @@ impl ResourceLimiterAsync for FailureDetector {
         current: usize,
         desired: usize,
         _maximum: Option<usize>,
+        _kind: MemoryKind,
     ) -> Result<bool> {
         // Show we can await in this async context:
         tokio::time::sleep(std::time::Duration::from_millis(1)).await;
@@ -838,12 +850,12 @@ impl ResourceLimiterAsync for FailureDetector {
         self.memory_desired = desired;
         Ok(true)
     }
-    fn memory_grow_failed(&mut self, err: wasmtime::Error) -> Result<()> {
+    fn memory_grow_failed(&mut self, err: wasmtime::Error, _kind: MemoryKind) -> Result<()> {
         self.memory_error = Some(err.to_string());
         Ok(())
     }
-    fn memory_grown(&mut self, current: usize, desired: usize) {
-        self.memory_grown = Some((current, desired));
+    fn memory_grown(&mut self, current: usize, desired: usize, kind: MemoryKind) {
+        self.memory_grown = Some((current, desired, kind));
     }
 
     async fn table_growing(
@@ -951,6 +963,7 @@ impl ResourceLimiter for Panic {
         _current: usize,
         _desired: usize,
         _maximum: Option<usize>,
+        _kind: MemoryKind,
     ) -> Result<bool> {
         panic!("resource limiter memory growing");
     }
@@ -970,6 +983,7 @@ impl ResourceLimiterAsync for Panic {
         _current: usize,
         _desired: usize,
         _maximum: Option<usize>,
+        _kind: MemoryKind,
     ) -> Result<bool> {
         panic!("async resource limiter memory growing");
     }

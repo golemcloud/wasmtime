@@ -18,6 +18,7 @@ impl ResourceLimiterAsync for MyAsyncLimiter {
         _current: usize,
         _desired: usize,
         _maximum: Option<usize>,
+        _kind: MemoryKind,
     ) -> Result<bool> {
         Ok(true)
     }

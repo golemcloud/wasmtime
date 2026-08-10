@@ -385,6 +385,7 @@ fn massive_64_bit_still_limited() -> Result<()> {
             _current: usize,
             _request: usize,
             _max: Option<usize>,
+            _kind: MemoryKind,
         ) -> Result<bool> {
             self.hit = true;
             Ok(true)

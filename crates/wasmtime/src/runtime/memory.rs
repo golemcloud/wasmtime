@@ -1118,7 +1118,7 @@ mod tests {
     use alloc::vec::Vec;
 
     #[derive(Default)]
-    struct SuccessfulGrowths(Vec<(usize, usize)>);
+    struct SuccessfulGrowths(Vec<(usize, usize, MemoryKind)>);
 
     impl ResourceLimiter for SuccessfulGrowths {
         fn memory_growing(
@@ -1126,12 +1126,13 @@ mod tests {
             _current: usize,
             _desired: usize,
             _maximum: Option<usize>,
+            _kind: MemoryKind,
         ) -> Result<bool> {
             Ok(true)
         }
 
-        fn memory_grown(&mut self, current: usize, desired: usize) {
-            self.0.push((current, desired));
+        fn memory_grown(&mut self, current: usize, desired: usize, kind: MemoryKind) {
+            self.0.push((current, desired, kind));
         }
 
         fn table_growing(
@@ -1155,10 +1156,16 @@ mod tests {
 
         let memory = instance.get_memory(&mut store, "m").unwrap();
         assert_eq!(memory.grow(&mut store, 1)?, 1);
-        assert_eq!(store.data().0, [(65536, 2 * 65536)]);
+        assert_eq!(
+            store.data().0,
+            [(65536, 2 * 65536, MemoryKind::LinearMemory)]
+        );
 
         assert!(memory.grow(&mut store, 1).is_err());
-        assert_eq!(store.data().0, [(65536, 2 * 65536)]);
+        assert_eq!(
+            store.data().0,
+            [(65536, 2 * 65536, MemoryKind::LinearMemory)]
+        );
         Ok(())
     }
 
