@@ -67,8 +67,9 @@ use crate::{
 };
 use alloc::borrow::ToOwned;
 use alloc::collections::{BTreeMap, VecDeque};
+use alloc::sync::Arc;
 use core::any::Any;
-use core::cell::UnsafeCell;
+use core::cell::{RefCell, UnsafeCell};
 use core::fmt;
 use core::future;
 use core::future::Future;
@@ -100,6 +101,89 @@ pub use futures_and_streams::{
     FutureReader, GuardedFutureReader, GuardedStreamReader, ReadBuffer, Source, StreamConsumer,
     StreamProducer, StreamReader, StreamResult, VecBuffer, WriteBuffer,
 };
+
+type OpaqueGuestTaskContext = Arc<dyn Any + Send + Sync>;
+
+fn downcast_guest_task_context<C: Any + Send + Sync>(
+    context: Option<OpaqueGuestTaskContext>,
+) -> Result<Option<Arc<C>>> {
+    context
+        .map(|context| {
+            context
+                .downcast::<C>()
+                .map_err(|_| crate::Error::msg("guest task context has a different type"))
+        })
+        .transpose()
+}
+
+std::thread_local! {
+    // The outer option distinguishes "outside a host call" from an explicitly context-free host
+    // call. Each guest-to-host entry shadows its caller so recursive guest calls observe the
+    // innermost guest task rather than the legacy async future which entered them.
+    static ACTIVE_GUEST_TASK_CONTEXT: RefCell<Option<Option<OpaqueGuestTaskContext>>> =
+        const { RefCell::new(None) };
+}
+
+struct GuestTaskContextGuard(Option<Option<OpaqueGuestTaskContext>>);
+
+impl GuestTaskContextGuard {
+    fn enter(context: Option<OpaqueGuestTaskContext>) -> Self {
+        Self(ACTIVE_GUEST_TASK_CONTEXT.with(|current| current.replace(Some(context))))
+    }
+}
+
+impl Drop for GuestTaskContextGuard {
+    fn drop(&mut self) {
+        ACTIVE_GUEST_TASK_CONTEXT.with(|current| {
+            current.replace(self.0.take());
+        });
+    }
+}
+
+pub(crate) fn with_guest_task_context<R>(
+    context: Option<OpaqueGuestTaskContext>,
+    fun: impl FnOnce() -> R,
+) -> R {
+    let _guard = GuestTaskContextGuard::enter(context);
+    fun()
+}
+
+pub(crate) async fn poll_with_guest_task_context<F: Future>(
+    context: Option<OpaqueGuestTaskContext>,
+    future: F,
+) -> F::Output {
+    let mut future = pin!(future);
+    future::poll_fn(move |cx| with_guest_task_context(context.clone(), || future.as_mut().poll(cx)))
+        .await
+}
+
+/// Returns the embedder context captured for the guest-to-host call currently being initiated.
+///
+/// This is intended for synchronous use at the start of a non-accessor host function, before its
+/// first asynchronous yield. It returns `None` when called outside component execution or when the
+/// current guest task has no context. A context of a different type is reported as an error.
+pub fn current_guest_task_context<C: Any + Send + Sync>() -> Result<Option<Arc<C>>> {
+    let context = match ACTIVE_GUEST_TASK_CONTEXT.with(|current| current.borrow().clone()) {
+        Some(context) => context,
+        None => tls::try_get(|store| match store {
+            tls::TryGet::Some(store) => {
+                let state = store.concurrent_state_mut();
+                match state.current_thread {
+                    CurrentThread::Guest(thread) => {
+                        Ok(state.get_mut(thread.task)?.embedder_context.clone())
+                    }
+                    CurrentThread::Host(task) => Ok(state.get_mut(task)?.embedder_context.clone()),
+                    CurrentThread::None => Ok(None),
+                }
+            }
+            tls::TryGet::None => Ok(None),
+            tls::TryGet::Taken => Err(crate::Error::msg(
+                "guest task context is unavailable during recursive store access",
+            )),
+        })?,
+    };
+    downcast_guest_task_context(context)
+}
 pub(crate) use futures_and_streams::{ResourcePair, lower_error_context_to_index};
 
 mod abort;
@@ -245,6 +329,7 @@ where
             // A spawned task outlives the host call it was spawned from, so its accessor
             // carries no host-subtask identity.
             host_task: None,
+            embedder_context: None,
         };
         self.store
             .as_context_mut()
@@ -353,6 +438,11 @@ where
     /// call's host task at that point. Accessors created outside a host import call (e.g. via
     /// `run_concurrent` or `Accessor::spawn`) carry `None`.
     host_task: Option<TableId<HostTask>>,
+
+    /// Context captured when this accessor's host call starts. Unlike `host_task`, this is also
+    /// populated for resource destructors, which currently use the concurrent API without a
+    /// guest-visible host subtask.
+    embedder_context: Option<OpaqueGuestTaskContext>,
 }
 
 /// How the guest consumed the terminal completion of a host subtask.
@@ -467,16 +557,34 @@ impl<T> Accessor<T> {
             token,
             get_data: |x| x,
             host_task: None,
+            embedder_context: None,
         }
     }
 
     /// Creates a new `Accessor` for a concurrent host import call, carrying the identity of
     /// the guest-visible host subtask the call runs as.
-    pub(crate) fn new_for_host_task(token: StoreToken<T>, host_task: TableId<HostTask>) -> Self {
+    fn new_for_host_task(
+        token: StoreToken<T>,
+        host_task: TableId<HostTask>,
+        embedder_context: Option<OpaqueGuestTaskContext>,
+    ) -> Self {
         Self {
             token,
             get_data: |x| x,
             host_task: Some(host_task),
+            embedder_context,
+        }
+    }
+
+    pub(crate) fn new_with_guest_task_context(
+        token: StoreToken<T>,
+        embedder_context: Option<OpaqueGuestTaskContext>,
+    ) -> Self {
+        Self {
+            token,
+            get_data: |x| x,
+            host_task: None,
+            embedder_context,
         }
     }
 }
@@ -485,6 +593,14 @@ impl<T, D> Accessor<T, D>
 where
     D: HasData + ?Sized,
 {
+    /// Returns the context inherited by the guest task which called this host function.
+    ///
+    /// Accessors created outside a guest-to-host call return `None`. A context of a different
+    /// type is reported as an error.
+    pub fn guest_task_context<C: Any + Send + Sync>(&self) -> Result<Option<Arc<C>>> {
+        downcast_guest_task_context(self.embedder_context.clone())
+    }
+
     /// Run the specified closure, passing it mutable access to the store.
     ///
     /// This function is one of the main building blocks of the [`Accessor`]
@@ -504,10 +620,28 @@ where
     /// this does not happen.
     pub fn with<R>(&self, fun: impl FnOnce(Access<'_, T, D>) -> R) -> R {
         tls::get(|vmstore| {
-            fun(Access {
-                store: self.token.as_context_mut(vmstore),
-                get_data: self.get_data,
-            })
+            let Some(host_task) = self.host_task else {
+                return fun(Access {
+                    store: self.token.as_context_mut(vmstore),
+                    get_data: self.get_data,
+                });
+            };
+            let previous_thread = vmstore
+                .set_thread(CurrentThread::Host(host_task))
+                .expect("an accessor's host task remains live while its future is polled");
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                fun(Access {
+                    store: self.token.as_context_mut(vmstore),
+                    get_data: self.get_data,
+                })
+            }));
+            vmstore
+                .set_thread(previous_thread)
+                .expect("the thread active before Accessor::with remains live");
+            match result {
+                Ok(result) => result,
+                Err(panic) => std::panic::resume_unwind(panic),
+            }
         })
     }
 
@@ -541,6 +675,7 @@ where
             token: self.token,
             get_data,
             host_task: self.host_task,
+            embedder_context: self.embedder_context.clone(),
         }
     }
 
@@ -655,6 +790,7 @@ where
             // A spawned task outlives the host call it was spawned from (and its host task's
             // table slot may be reused), so the spawned accessor carries no subtask identity.
             host_task: None,
+            embedder_context: None,
         }
     }
 
@@ -1141,6 +1277,62 @@ impl<T> Store<T> {
 }
 
 impl<T> StoreContextMut<'_, T> {
+    fn guest_task(&mut self) -> Result<Option<TableId<GuestTask>>> {
+        if !self.0.concurrency_support() {
+            return Ok(None);
+        }
+        let state = self.0.concurrent_state_mut();
+        Ok(state
+            .nearest_guest(state.current_thread)?
+            .map(|guest| guest.task))
+    }
+
+    pub(crate) fn guest_task_context_opaque(&mut self) -> Result<Option<OpaqueGuestTaskContext>> {
+        let Some(guest) = self.guest_task()? else {
+            return Ok(None);
+        };
+        let state = self.0.concurrent_state_mut();
+        Ok(state.get_mut(guest)?.embedder_context.clone())
+    }
+
+    /// Returns the context associated with the nearest guest task in the current call stack.
+    ///
+    /// A context of a different type is reported as an error.
+    pub fn guest_task_context<C: Any + Send + Sync>(&mut self) -> Result<Option<Arc<C>>> {
+        downcast_guest_task_context(self.guest_task_context_opaque()?)
+    }
+
+    /// Replaces the context associated with the nearest guest task in the current call stack.
+    ///
+    /// A child guest task snapshots its parent's context when the child is created, so replacing
+    /// this value does not affect children which already exist.
+    pub fn set_guest_task_context<C: Any + Send + Sync>(&mut self, context: Arc<C>) -> Result<()> {
+        let guest = self
+            .guest_task()?
+            .ok_or_else(|| crate::Error::msg("there is no current guest task"))?;
+        let previous = {
+            let state = self.0.concurrent_state_mut();
+            state.get_mut(guest)?.embedder_context.replace(context)
+        };
+        drop(previous);
+        Ok(())
+    }
+
+    /// Clears the context associated with the nearest guest task in the current call stack.
+    ///
+    /// Existing child tasks retain the context they inherited when they were created.
+    pub fn clear_guest_task_context(&mut self) -> Result<()> {
+        let guest = self
+            .guest_task()?
+            .ok_or_else(|| crate::Error::msg("there is no current guest task"))?;
+        let previous = {
+            let state = self.0.concurrent_state_mut();
+            state.get_mut(guest)?.embedder_context.take()
+        };
+        drop(previous);
+        Ok(())
+    }
+
     /// Assert that all the relevant tables and queues in the concurrent state
     /// for this store are empty.
     ///
@@ -1868,9 +2060,14 @@ impl<T> StoreContextMut<'_, T> {
             // created for this import call. Capture that identity here — before any embedder
             // code runs — so the accessor can carry it across `.await` points, where the
             // store's notion of a current thread is no longer guaranteed to reference it.
-            let host_task = tls::get(|store| store.concurrent_state_mut().current_host_thread());
+            let host_task = tls::get(|store| {
+                let state = store.concurrent_state_mut();
+                let task = state.current_host_thread()?;
+                let context = state.get_mut(task)?.embedder_context.clone();
+                Ok::<_, crate::Error>((task, context))
+            });
             let accessor = match host_task {
-                Ok(task) => Accessor::new_for_host_task(token, task),
+                Ok((task, context)) => Accessor::new_for_host_task(token, task, context),
                 Err(_) => Accessor::new(token),
             };
             closure(&accessor).await
@@ -2002,7 +2199,12 @@ impl StoreOpaque {
         }
         let state = self.concurrent_state_mut();
         let caller = state.current_guest_thread()?;
-        let task = state.push(HostTask::new(caller, HostTaskState::CalleeStarted))?;
+        let embedder_context = state.get_mut(caller.task)?.embedder_context.clone();
+        let task = state.push(HostTask::new(
+            caller,
+            HostTaskState::CalleeStarted,
+            embedder_context,
+        ))?;
         log::trace!("new host task {task:?}");
         self.set_thread(task)?;
         Ok(Some(task))
@@ -4787,6 +4989,10 @@ pub(crate) struct HostTask {
 
     state: HostTaskState,
 
+    /// Embedder context captured from the calling guest task when this host task starts. Accessor
+    /// continuations and callback guest tasks inherit this immutable initiation-time snapshot.
+    embedder_context: Option<OpaqueGuestTaskContext>,
+
     /// Observer invoked exactly once when the guest consumes this task's terminal event; see
     /// [`Accessor::register_terminal_observer`]. Dropped without being invoked if the terminal
     /// is never consumed (trap, lowering failure, or store teardown).
@@ -4817,12 +5023,17 @@ enum HostTaskState {
 }
 
 impl HostTask {
-    fn new(caller: QualifiedThreadId, state: HostTaskState) -> Self {
+    fn new(
+        caller: QualifiedThreadId,
+        state: HostTaskState,
+        embedder_context: Option<OpaqueGuestTaskContext>,
+    ) -> Self {
         Self {
             common: WaitableCommon::default(),
             call_context: CallContext::default(),
             caller,
             state,
+            embedder_context,
             terminal_observer: None,
         }
     }
@@ -5061,10 +5272,30 @@ pub(crate) struct GuestTask {
     /// export.
     async_function: bool,
 
+    /// Embedder data inherited by guest subtasks at task creation time.
+    embedder_context: Option<OpaqueGuestTaskContext>,
+
     decremented_interesting_task_count: bool,
 }
 
 impl GuestTask {
+    fn inherited_embedder_context(
+        state: &mut ConcurrentState,
+        caller: &Caller,
+    ) -> Result<Option<OpaqueGuestTaskContext>> {
+        match caller {
+            Caller::Guest { thread } => Ok(state.get_mut(thread.task)?.embedder_context.clone()),
+            Caller::Host { caller, .. } => match caller {
+                CurrentThread::Host(task) => Ok(state.get_mut(*task)?.embedder_context.clone()),
+                _ => Ok(state
+                    .nearest_guest(*caller)?
+                    .map(|thread| state.get_mut(thread.task))
+                    .transpose()?
+                    .and_then(|task| task.embedder_context.clone())),
+            },
+        }
+    }
+
     fn already_lowered_parameters(&self) -> bool {
         // We reset `lower_params` after we lower the parameters
         self.lower_params.is_none()
@@ -5107,6 +5338,7 @@ impl GuestTask {
         instance: RuntimeInstance,
         async_function: bool,
     ) -> Result<QualifiedThreadId> {
+        let embedder_context = Self::inherited_embedder_context(state, &caller)?;
         let host_future_state = match &caller {
             Caller::Guest { .. } => HostFutureState::NotApplicable,
             Caller::Host {
@@ -5137,6 +5369,7 @@ impl GuestTask {
             threads: HashSet::new(),
             host_future_state,
             async_function,
+            embedder_context,
             decremented_interesting_task_count: false,
         })?;
         let new_thread = GuestThread::new_implicit(state, task)?;
@@ -5840,6 +6073,17 @@ impl ConcurrentState {
         self.table.get_mut()
     }
 
+    /// Returns the nearest guest in `cur`'s ancestry, propagating stale table errors.
+    fn nearest_guest(&mut self, mut cur: CurrentThread) -> Result<Option<QualifiedThreadId>> {
+        loop {
+            match cur {
+                CurrentThread::Guest(thread) => return Ok(Some(thread)),
+                CurrentThread::Host(id) => cur = self.get_mut(id)?.caller.into(),
+                CurrentThread::None => return Ok(None),
+            }
+        }
+    }
+
     /// Returns the parent thread, if any, of `cur`.
     fn parent(&mut self, cur: CurrentThread) -> Option<CurrentThread> {
         match cur {
@@ -6174,3 +6418,6 @@ fn queue_call0<T: 'static>(
         )
     }
 }
+
+#[cfg(test)]
+mod context_tests;

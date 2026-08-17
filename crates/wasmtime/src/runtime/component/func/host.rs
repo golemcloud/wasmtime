@@ -67,6 +67,21 @@ enum HostResult<T> {
     Future(Pin<Box<dyn Future<Output = Result<T>> + Send>>),
 }
 
+fn with_current_guest_task_context<'a, T: 'static, R>(
+    mut store: StoreContextMut<'a, T>,
+    fun: impl FnOnce(StoreContextMut<'a, T>) -> R,
+) -> Result<R> {
+    #[cfg(feature = "component-model-async")]
+    {
+        let context = store.guest_task_context_opaque()?;
+        Ok(concurrent::with_guest_task_context(context, || fun(store)))
+    }
+    #[cfg(not(feature = "component-model-async"))]
+    {
+        Ok(fun(store))
+    }
+}
+
 impl HostFunc {
     /// Creates a new host function based on the implementation of `func`.
     ///
@@ -101,7 +116,10 @@ impl HostFunc {
         Self::new(
             Asyncness::No,
             StaticHostFn::<_, false>::new(move |store, params| {
-                HostResult::Done(func(store, params))
+                HostResult::Done(
+                    with_current_guest_task_context(store, |store| func(store, params))
+                        .and_then(|result| result),
+                )
             }),
         )
     }
@@ -120,10 +138,20 @@ impl HostFunc {
     {
         Self::new(
             Asyncness::Yes,
-            StaticHostFn::<_, false>::new(move |store, params| {
+            StaticHostFn::<_, false>::new(move |mut store, params| {
+                let context = match store.guest_task_context_opaque() {
+                    Ok(context) => context,
+                    Err(error) => return HostResult::Done(Err(error)),
+                };
                 HostResult::Done(
                     store
-                        .block_on(|store| Pin::from(func(store, params)))
+                        .block_on(|store| {
+                            let future =
+                                concurrent::with_guest_task_context(context.clone(), || {
+                                    Pin::from(func(store, params))
+                                });
+                            Box::pin(concurrent::poll_with_guest_task_context(context, future))
+                        })
                         .and_then(|r| r),
                 )
             }),
@@ -168,7 +196,11 @@ impl HostFunc {
             DynamicHostFn::<_, false>::new(
                 move |store, ty, mut params_and_results, result_start| {
                     let (params, results) = params_and_results.split_at_mut(result_start);
-                    let result = func(store, ty, params, results).map(move |()| params_and_results);
+                    let result = with_current_guest_task_context(store, |store| {
+                        func(store, ty, params, results)
+                    })
+                    .and_then(|result| result)
+                    .map(move |()| params_and_results);
                     HostResult::Done(result)
                 },
             ),
@@ -193,11 +225,19 @@ impl HostFunc {
         Self::new(
             Asyncness::Yes,
             DynamicHostFn::<_, false>::new(
-                move |store, ty, mut params_and_results, result_start| {
+                move |mut store, ty, mut params_and_results, result_start| {
+                    let context = match store.guest_task_context_opaque() {
+                        Ok(context) => context,
+                        Err(error) => return HostResult::Done(Err(error)),
+                    };
                     let (params, results) = params_and_results.split_at_mut(result_start);
                     let result = store
                         .with_blocking(|store, cx| {
-                            cx.block_on(Pin::from(func(store, ty, params, results)))
+                            let future =
+                                concurrent::with_guest_task_context(context.clone(), || {
+                                    Pin::from(func(store, ty, params, results))
+                                });
+                            cx.block_on(concurrent::poll_with_guest_task_context(context, future))
                         })
                         .and_then(|r| r);
                     let result = result.map(move |()| params_and_results);

@@ -810,7 +810,20 @@ impl<T: 'static> LinkerInstance<'_, T> {
     ) -> Result<()> {
         let dtor = try_new::<Arc<_>>(crate::func::HostFunc::wrap(
             &self.engine,
-            move |mut cx: crate::Caller<'_, T>, (param,): (u32,)| dtor(cx.as_context_mut(), param),
+            move |mut cx: crate::Caller<'_, T>, (param,): (u32,)| {
+                #[cfg(feature = "component-model-async")]
+                {
+                    let mut store = cx.as_context_mut();
+                    let context = store.guest_task_context_opaque()?;
+                    crate::component::concurrent::with_guest_task_context(context, || {
+                        dtor(store, param)
+                    })
+                }
+                #[cfg(not(feature = "component-model-async"))]
+                {
+                    dtor(cx.as_context_mut(), param)
+                }
+            },
         )?)?;
         self.insert(name, Definition::Resource(ty, dtor))?;
         Ok(())
@@ -828,7 +841,27 @@ impl<T: 'static> LinkerInstance<'_, T> {
     {
         let dtor = try_new::<Arc<_>>(crate::func::HostFunc::wrap_async(
             &self.engine,
-            move |cx: crate::Caller<'_, T>, (param,): (u32,)| dtor(cx.into(), param),
+            move |cx: crate::Caller<'_, T>, (param,): (u32,)| {
+                #[cfg(feature = "component-model-async")]
+                {
+                    let mut store = StoreContextMut::from(cx);
+                    let context = match store.guest_task_context_opaque() {
+                        Ok(context) => context,
+                        Err(error) => return Box::new(core::future::ready(Err(error))),
+                    };
+                    let future = crate::component::concurrent::with_guest_task_context(
+                        context.clone(),
+                        || Pin::from(dtor(store, param)),
+                    );
+                    Box::new(crate::component::concurrent::poll_with_guest_task_context(
+                        context, future,
+                    ))
+                }
+                #[cfg(not(feature = "component-model-async"))]
+                {
+                    dtor(cx.into(), param)
+                }
+            },
         )?)?;
         self.insert(name, Definition::Resource(ty, dtor))?;
         Ok(())
@@ -859,8 +892,11 @@ impl<T: 'static> LinkerInstance<'_, T> {
                 let dtor = dtor.clone();
                 Box::new(async move {
                     let mut store = cx.as_context_mut();
-                    let accessor =
-                        &Accessor::new(crate::store::StoreToken::new(store.as_context_mut()));
+                    let context = store.guest_task_context_opaque()?;
+                    let accessor = &Accessor::new_with_guest_task_context(
+                        crate::store::StoreToken::new(store.as_context_mut()),
+                        context,
+                    );
                     let mut future = core::pin::pin!(dtor(accessor, param));
                     core::future::poll_fn(|cx| {
                         crate::component::concurrent::tls::set(store.0, || future.as_mut().poll(cx))
