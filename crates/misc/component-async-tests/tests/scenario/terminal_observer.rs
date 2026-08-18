@@ -383,6 +383,57 @@ const CALLBACK_TRAP_COMPONENT: &str = r#"(component
         (canon lift (core func $i "run") async (callback (func $i "cb"))))
 )"#;
 
+/// Callback-based async lift whose callback drops the completed host subtask before returning.
+/// The terminal handoff must still be observed: notifying only after callback return loses the
+/// observer because `subtask.drop` removes it with the host task.
+const CALLBACK_DROP_SUBTASK_COMPONENT: &str = r#"(component
+    (import "f" (func $f async))
+
+    (core module $m
+        (import "" "f" (func $f (result i32)))
+        (import "" "subtask.drop" (func $subtask.drop (param i32)))
+        (import "" "waitable.join" (func $waitable.join (param i32 i32)))
+        (import "" "waitable-set.new" (func $waitable-set.new (result i32)))
+        (func (export "run") (result i32)
+            (local $s i32) (local $ws i32)
+
+            call $f
+            local.tee $s
+            i32.const 0xf
+            i32.and
+            i32.const 1 ;; STARTED
+            i32.ne
+            if unreachable end
+
+            (local.set $s (i32.shr_u (local.get $s) (i32.const 4)))
+            (local.set $ws (call $waitable-set.new))
+            (call $waitable.join (local.get $s) (local.get $ws))
+            (i32.or (i32.shl (local.get $ws) (i32.const 4)) (i32.const 2)) ;; WAIT
+        )
+
+        ;; The second callback argument is the delivered waitable's guest handle.
+        (func (export "cb") (param i32 i32 i32) (result i32)
+            (call $subtask.drop (local.get 1))
+            i32.const 0 ;; EXIT
+        )
+    )
+    (core func $f (canon lower (func $f) async))
+    (core func $subtask.drop (canon subtask.drop))
+    (core func $waitable.join (canon waitable.join))
+    (core func $waitable-set.new (canon waitable-set.new))
+    (core instance $i (instantiate $m
+        (with "" (instance
+            (export "f" (func $f))
+            (export "subtask.drop" (func $subtask.drop))
+            (export "waitable.join" (func $waitable.join))
+            (export "waitable-set.new" (func $waitable-set.new))
+        ))
+    ))
+
+    (func (export "run") async
+        (canon lift (core func $i "run") async (callback (func $i "cb"))))
+)"#;
+
 /// Component whose `run` export sync-lowers the imported (concurrent)
 /// string-returning `f` with a trapping `realloc`, so lowering the host's
 /// successful result into guest memory fails.
@@ -575,11 +626,11 @@ async fn terminal_observer_suppressed_on_event_payload_trap() -> Result<()> {
     Ok(())
 }
 
-/// A host task whose completion event is dispatched to a guest callback that
-/// traps while processing it is not treated as delivered: the observer is
-/// dropped without being invoked.
+/// A host task whose completion event is dispatched to a guest callback is
+/// treated as delivered when the callback is entered, even if the callback
+/// subsequently traps while processing it.
 #[tokio::test]
-async fn terminal_observer_suppressed_on_callback_trap() -> Result<()> {
+async fn terminal_observer_delivered_on_callback_entry_before_trap() -> Result<()> {
     let probe = ObserverProbe::default();
     let probe2 = probe.clone();
     let result = run(CALLBACK_TRAP_COMPONENT, move |(), accessor| {
@@ -592,7 +643,25 @@ async fn terminal_observer_suppressed_on_callback_trap() -> Result<()> {
     })
     .await;
     assert!(result.is_err());
-    probe.assert_suppressed();
+    probe.assert_invoked_once(TerminalConsumption::Delivered);
+    Ok(())
+}
+
+#[tokio::test]
+async fn terminal_observer_delivered_before_callback_drops_subtask() -> Result<()> {
+    let probe = ObserverProbe::default();
+    let probe2 = probe.clone();
+    let result = run(CALLBACK_DROP_SUBTASK_COMPONENT, move |(), accessor| {
+        let probe = probe2.clone();
+        Box::pin(async move {
+            accessor.register_terminal_observer(probe.observer())?;
+            tokio::task::yield_now().await;
+            Ok(())
+        })
+    })
+    .await;
+    assert!(result.is_err());
+    probe.assert_invoked_once(TerminalConsumption::Delivered);
     Ok(())
 }
 

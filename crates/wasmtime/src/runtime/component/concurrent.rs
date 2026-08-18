@@ -361,8 +361,8 @@ where
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TerminalConsumption {
     /// The subtask's successful (`Returned`) terminal event was received by the guest: it was
-    /// delivered through `waitable-set.wait`/`waitable-set.poll`/callback dispatch, or — for a
-    /// sync-lowered import — the host result was handed back to the blocked guest caller.
+    /// delivered through `waitable-set.wait`/`waitable-set.poll`, handed to a guest callback, or
+    /// — for a sync-lowered import — returned to the blocked guest caller.
     Delivered,
     /// The subtask completed successfully, but the guest consumed the pending `Returned`
     /// terminal via `subtask.cancel`: the result was lowered, yet the guest application
@@ -552,9 +552,10 @@ where
     ///
     /// - [`TerminalConsumption::Delivered`]: the successful terminal was actually received by
     ///   the guest — the event payload was written to guest memory (waitable-set wait/poll), the
-    ///   guest callback processed the event without trapping (callback dispatch), or the result
-    ///   was lowered into the guest's stack/linear memory (a sync-lowered return). It is never
-    ///   reported before the receiving step succeeded.
+    ///   event was handed to a guest callback (callback dispatch), or the result was lowered into
+    ///   the guest's stack/linear memory (a sync-lowered return). For callback dispatch the
+    ///   observer runs immediately before the callback is entered because the callback may resume
+    ///   arbitrary guest code and drop the subtask before returning.
     /// - [`TerminalConsumption::Discarded`]: the subtask completed successfully, but the guest
     ///   consumed the pending `Returned` terminal via `subtask.cancel` and never observes the
     ///   result.
@@ -1052,14 +1053,16 @@ fn handle_guest_call(store: &mut dyn VMStore, call: GuestCall) -> Result<()> {
                     bail_bug!("guest task callback field not present")
                 };
 
-                let code = callback(store, event, handle)?;
-
-                // The guest callback processed the event without trapping, so the guest has
-                // actually received it; only now notify the terminal observer, if any (a trap in
-                // the callback must not be misreported as a successful delivery).
+                // The callback invocation hands the event to the guest and may resume arbitrary
+                // guest code before returning. Notify the observer immediately before entering
+                // it: that is the terminal-delivery boundary, and waiting until the callback
+                // returns is both too late to observe ordering relative to the resumed guest and
+                // unsafe because that guest may drop the subtask during the callback.
                 if let Some((waitable, _)) = waitable {
                     waitable.notify_terminal_observer(store, event);
                 }
+
+                let code = callback(store, event, handle)?;
 
                 store
                     .concurrent_state_mut()

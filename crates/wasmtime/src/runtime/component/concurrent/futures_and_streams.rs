@@ -4837,11 +4837,10 @@ impl Waitable {
         event: Event,
     ) -> Result<()> {
         // Note: a host task's terminal observer (see `Accessor::register_terminal_observer`) is
-        // deliberately NOT notified here. `on_delivery` runs when the event is *about* to be
-        // delivered, but delivery can still fail afterwards (writing the event payload to guest
-        // memory can trap, and a guest callback can trap while processing the event). The
-        // delivery sites call `Waitable::notify_terminal_observer` only after the delivery
-        // actually succeeded.
+        // deliberately NOT notified here. `on_delivery` runs before the concrete delivery
+        // boundary: the event payload still has to be written to guest memory or passed as the
+        // arguments of a guest callback. The delivery sites call
+        // `Waitable::notify_terminal_observer` at those boundaries.
         if let Waitable::Host(_) = self {
             return Ok(());
         }
@@ -4913,11 +4912,11 @@ impl Waitable {
     /// Notify the terminal observer, if any, that a host task's terminal event has actually been
     /// received by the guest; see `Accessor::register_terminal_observer`.
     ///
-    /// Must be called only *after* the delivery fully succeeded — after the event payload has
-    /// been written to the guest's memory (`waitable-set.wait` / `waitable-set.poll`) or after
-    /// the guest callback processed the event without trapping. Invoking the observer earlier
-    /// (e.g. in [`Self::on_delivery`]) would misreport a payload-write trap or a callback trap as
-    /// a successful delivery.
+    /// Must be called at the point the event is handed to the guest — after the event payload has
+    /// been written to the guest's memory (`waitable-set.wait` / `waitable-set.poll`) or
+    /// immediately before invoking a guest callback with the event arguments. A callback may
+    /// resume arbitrary guest code and drop the host subtask before returning, so notifying after
+    /// it returns is too late.
     pub(super) fn notify_terminal_observer(&self, store: &mut StoreOpaque, event: Event) {
         if let (
             Waitable::Host(host_task),
