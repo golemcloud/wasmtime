@@ -367,7 +367,7 @@ impl HostDescriptor for WasiFilesystemCtxView<'_> {
         Ok(())
     }
 
-    fn read_via_stream(
+    async fn read_via_stream(
         &mut self,
         fd: Resource<types::Descriptor>,
         offset: types::Filesize,
@@ -388,7 +388,7 @@ impl HostDescriptor for WasiFilesystemCtxView<'_> {
         Ok(index)
     }
 
-    fn write_via_stream(
+    async fn write_via_stream(
         &mut self,
         fd: Resource<types::Descriptor>,
         offset: types::Filesize,
@@ -410,7 +410,7 @@ impl HostDescriptor for WasiFilesystemCtxView<'_> {
         Ok(index)
     }
 
-    fn append_via_stream(
+    async fn append_via_stream(
         &mut self,
         fd: Resource<types::Descriptor>,
     ) -> FsResult<Resource<DynOutputStream>> {
