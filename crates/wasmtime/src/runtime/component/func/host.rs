@@ -438,10 +438,11 @@ where
             // failure must not be misreported as a successful delivery). See
             // `Accessor::register_terminal_observer`.
             #[cfg(feature = "component-model-async")]
-            if let Some(task) = host_task
-                && let Some(observer) = store.0.concurrent_state_mut().take_terminal_observer(task)
-            {
-                observer(concurrent::TerminalConsumption::Delivered);
+            if let Some(task) = host_task {
+                store
+                    .0
+                    .concurrent_state_mut()
+                    .consume_terminal(task, concurrent::TerminalConsumption::Delivered);
             }
 
             true

@@ -123,7 +123,7 @@ pub use self::concurrent::{
     ErrorContext, FuncCallConcurrent, FutureAny, FutureConsumer, FutureProducer, FutureReader,
     GuardedFutureReader, GuardedStreamReader, GuestTaskId, JoinHandle, ReadBuffer, Source,
     StreamAny, StreamConsumer, StreamProducer, StreamReader, StreamResult, TerminalConsumption,
-    TerminalObserver, TypedFuncCallConcurrent, VMComponentAsyncStore, VecBuffer, WriteBuffer,
+    TypedFuncCallConcurrent, VMComponentAsyncStore, VecBuffer, WriteBuffer,
     current_guest_task_context,
 };
 pub use self::func::{
