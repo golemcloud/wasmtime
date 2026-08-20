@@ -306,7 +306,7 @@ impl<U> stderr::HostWithStore<U> for WasiCli {
 impl stderr::Host for WasiCliCtxView<'_> {}
 
 impl environment::Host for WasiCliCtxView<'_> {
-    fn get_environment(&mut self) -> wasmtime::Result<Vec<(String, String)>> {
+    async fn get_environment(&mut self) -> wasmtime::Result<Vec<(String, String)>> {
         Ok(self.ctx.environment.clone())
     }
 

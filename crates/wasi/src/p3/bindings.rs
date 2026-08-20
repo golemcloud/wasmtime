@@ -87,6 +87,7 @@ mod generated {
             "wasi:random/insecure.get-insecure-random-bytes": async | tracing | trappable,
             "wasi:random/insecure.get-insecure-random-u64": async | tracing | trappable,
             "wasi:random/insecure-seed.get-insecure-seed": async | tracing | trappable,
+            "wasi:cli/environment.get-environment": async | tracing | trappable,
             "wasi:cli/stdin": store | async | tracing | trappable,
             "wasi:cli/stdout": store | async | tracing | trappable,
             "wasi:cli/stderr": store | async | tracing | trappable,
