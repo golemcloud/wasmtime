@@ -445,24 +445,17 @@ where
     embedder_context: Option<OpaqueGuestTaskContext>,
 }
 
-/// How the guest consumed the terminal completion of a host subtask.
+/// How the guest consumed a terminal completion observed by the host.
 ///
-/// Passed to observers registered via [`Accessor::register_terminal_observer`].
+/// Passed to observers registered via [`Accessor::register_terminal_observer`] or
+/// [`FutureReader::register_terminal_observer`](crate::component::FutureReader::register_terminal_observer).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TerminalConsumption {
-    /// The subtask's successful (`Returned`) terminal event was received by the guest: it was
-    /// delivered through `waitable-set.wait`/`waitable-set.poll`, handed to a guest callback, or
-    /// — for a sync-lowered import — returned to the blocked guest caller.
+    /// The successful terminal was received by the guest.
     Delivered,
-    /// The subtask's terminal event was consumed without the guest observing a successful
-    /// result: either the guest consumed a pending `Returned` terminal via `subtask.cancel`
-    /// (the result was lowered, yet the guest application abandoned the call), or the call was
-    /// cancelled before it completed (`ReturnCancelled` consumed by the guest).
+    /// The terminal was consumed without the guest observing a successful result.
     NotDelivered,
-    /// The observer was replaced by a newer one registered for the same host subtask via
-    /// [`Accessor::register_terminal_observer`]. The embedder performed a further observable
-    /// sub-operation on the same subtask, so the superseded observer's completion is considered
-    /// internally consumed on behalf of the guest rather than delivered to it.
+    /// The observer was replaced by a newer observer for the same terminal.
     Superseded,
 }
 
@@ -2084,9 +2077,7 @@ impl<T> StoreContextMut<'_, T> {
                 let context = state.get_mut(task)?.embedder_context.clone();
                 Ok::<_, crate::Error>((task, context))
             })
-            .expect(
-                "wrap_call's first poll must run on the host task created for its import call",
-            );
+            .expect("wrap_call's first poll must run on the host task created for its import call");
             let accessor = Accessor::new_for_host_task(token, host_task, context);
             closure(&accessor).await
         }

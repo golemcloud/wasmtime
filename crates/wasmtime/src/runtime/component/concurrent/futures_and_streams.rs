@@ -1,7 +1,8 @@
 use super::table::{TableDebug, TableId};
 use super::{Event, GlobalErrorContextRefCount, Waitable, WaitableCommon};
 use crate::component::concurrent::{
-    ConcurrentState, QualifiedThreadId, Status, TerminalConsumption, WorkItem, tls,
+    ConcurrentState, QualifiedThreadId, Status, TerminalConsumption, TerminalObserver, WorkItem,
+    tls,
 };
 use crate::component::func::{self, LiftContext, LowerContext};
 use crate::component::matching::InstanceType;
@@ -1339,6 +1340,42 @@ impl<T> FutureReader<T> {
         self.id
     }
 
+    /// Registers an observer invoked exactly once when the guest consumes this future's
+    /// terminal value or drops the future without consuming it.
+    ///
+    /// Producer completion alone does not invoke the observer. A completed asynchronous read
+    /// must first be delivered through a waitable set or callback. Registering a new observer
+    /// invokes a previously registered observer with [`TerminalConsumption::Superseded`]. If
+    /// the future disappears without a guest consumption boundary, the observer is dropped
+    /// without being invoked.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if this future has already been closed.
+    ///
+    /// # Panics
+    ///
+    /// Panics if this future does not belong to `store`.
+    pub fn register_terminal_observer<S: AsContextMut>(
+        &mut self,
+        mut store: S,
+        observer: impl FnOnce(TerminalConsumption) + Send + 'static,
+    ) -> Result<()> {
+        let observer: TerminalObserver = Box::new(observer);
+        let previous = {
+            let state = store.as_context_mut().0.concurrent_state_mut();
+            let transmit = state.get_mut(self.id)?.state;
+            state
+                .get_mut(transmit)?
+                .terminal_observer
+                .replace(AlwaysMut::new(observer))
+        };
+        if let Some(previous) = previous {
+            previous.into_inner()(TerminalConsumption::Superseded);
+        }
+        Ok(())
+    }
+
     /// Set the consumer that accepts the result of this future.
     ///
     /// # Errors
@@ -2161,6 +2198,8 @@ struct TransmitState {
     read: ReadState,
     /// Whether further values may be transmitted via this stream or future.
     done: bool,
+    /// Observer invoked when a host-created future's terminal is consumed by the guest.
+    terminal_observer: Option<AlwaysMut<TerminalObserver>>,
     /// The original creator of this stream, used for type-checking with
     /// `{Future,Stream}Any`.
     pub(super) origin: TransmitOrigin,
@@ -2181,6 +2220,7 @@ impl TransmitState {
             read: ReadState::Open,
             write: WriteState::Open,
             done: false,
+            terminal_observer: None,
             origin,
         }
     }
@@ -3962,6 +4002,16 @@ impl Instance {
             "guest_read result for {transmit_handle:?} (handle {handle}; state {transmit_id:?}): {result:?}",
         );
 
+        if matches!(
+            (ty, result),
+            (TransmitIndex::Future(_), ReturnCode::Completed(_))
+        ) {
+            store
+                .0
+                .concurrent_state_mut()
+                .consume_future_terminal(transmit_handle, TerminalConsumption::Delivered);
+        }
+
         Ok(result)
     }
 
@@ -4091,6 +4141,21 @@ impl Instance {
                 bail_bug!("expected either a stream or future read event")
             };
             waitable.on_delivery(store, self, event)?;
+            if matches!(
+                event,
+                Event::FutureRead {
+                    code: ReturnCode::Completed(_),
+                    ..
+                }
+            ) {
+                store.concurrent_state_mut().consume_future_terminal(
+                    match waitable {
+                        Waitable::Transmit(handle) => handle,
+                        _ => unreachable!("future read waitable is a transmit handle"),
+                    },
+                    TerminalConsumption::NotDelivered,
+                );
+            }
             match (code, event) {
                 (ReturnCode::Completed(count), Event::StreamRead { .. }) => {
                     ReturnCode::Cancelled(count)
@@ -4241,6 +4306,11 @@ impl Instance {
         };
         let id = TableId::<TransmitHandle>::new(rep);
         log::trace!("guest_drop_readable: drop reader {id:?}");
+        if matches!(kind, TransmitKind::Future) {
+            store
+                .concurrent_state_mut()
+                .consume_future_terminal(id, TerminalConsumption::NotDelivered);
+        }
         store.host_drop_reader(id, kind)
     }
 
@@ -4674,6 +4744,28 @@ impl ComponentInstance {
 }
 
 impl ConcurrentState {
+    fn take_future_terminal_observer(
+        &mut self,
+        handle: TableId<TransmitHandle>,
+    ) -> Option<TerminalObserver> {
+        let transmit = self.get_mut(handle).ok()?.state;
+        self.get_mut(transmit)
+            .ok()?
+            .terminal_observer
+            .take()
+            .map(AlwaysMut::into_inner)
+    }
+
+    fn consume_future_terminal(
+        &mut self,
+        handle: TableId<TransmitHandle>,
+        consumption: TerminalConsumption,
+    ) {
+        if let Some(observer) = self.take_future_terminal_observer(handle) {
+            observer(consumption);
+        }
+    }
+
     fn send_write_result(
         &mut self,
         ty: TransmitIndex,
@@ -4909,8 +5001,8 @@ impl Waitable {
         Ok(())
     }
 
-    /// Notify the terminal observer, if any, that a host task's terminal event has actually been
-    /// received by the guest; see `Accessor::register_terminal_observer`.
+    /// Notify the terminal observer, if any, that a terminal event has actually been received by
+    /// the guest.
     ///
     /// Must be called at the point the event is handed to the guest — after the event payload has
     /// been written to the guest's memory (`waitable-set.wait` / `waitable-set.poll`) or
@@ -4918,20 +5010,29 @@ impl Waitable {
     /// resume arbitrary guest code and drop the host subtask before returning, so notifying after
     /// it returns is too late.
     pub(super) fn notify_terminal_observer(&self, store: &mut StoreOpaque, event: Event) {
-        if let (
-            Waitable::Host(host_task),
-            Event::Subtask {
-                status: status @ (Status::Returned | Status::ReturnCancelled),
-            },
-        ) = (self, event)
-        {
-            store.concurrent_state_mut().consume_terminal(
+        match (self, event) {
+            (
+                Waitable::Host(host_task),
+                Event::Subtask {
+                    status: status @ (Status::Returned | Status::ReturnCancelled),
+                },
+            ) => store.concurrent_state_mut().consume_terminal(
                 *host_task,
                 match status {
                     Status::Returned => TerminalConsumption::Delivered,
                     _ => TerminalConsumption::NotDelivered,
                 },
-            );
+            ),
+            (
+                Waitable::Transmit(handle),
+                Event::FutureRead {
+                    code: ReturnCode::Completed(_),
+                    ..
+                },
+            ) => store
+                .concurrent_state_mut()
+                .consume_future_terminal(*handle, TerminalConsumption::Delivered),
+            _ => {}
         }
     }
 }
