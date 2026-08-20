@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use component_async_tests::Ctx;
-use wasmtime::component::{Accessor, Component, Linker, TerminalConsumption, TerminalObserver};
+use wasmtime::component::{Accessor, Component, Linker, TerminalConsumption};
 use wasmtime::{Engine, Result, Store, format_err};
 
 use crate::scenario::util::config;
@@ -26,8 +26,8 @@ struct ObserverLog {
 struct ObserverProbe(Arc<Mutex<ObserverLog>>);
 
 impl ObserverProbe {
-    /// Creates a `TerminalObserver` whose fate is recorded in this probe.
-    fn observer(&self) -> TerminalObserver {
+    /// Creates a terminal observer whose fate is recorded in this probe.
+    fn observer(&self) -> impl FnOnce(TerminalConsumption) + Send + 'static {
         struct Guard(Arc<Mutex<ObserverLog>>, bool);
         impl Drop for Guard {
             fn drop(&mut self) {
@@ -37,10 +37,10 @@ impl ObserverProbe {
             }
         }
         let mut guard = Guard(self.0.clone(), false);
-        Box::new(move |consumption| {
+        move |consumption| {
             guard.1 = true;
             guard.0.lock().unwrap().invocations.push(consumption);
-        })
+        }
     }
 
     fn assert_invoked_once(&self, expected: TerminalConsumption) {
@@ -546,9 +546,9 @@ async fn terminal_observer_delivered_sync_lower() -> Result<()> {
 
 /// A host task which completes successfully but whose queued `RETURNED` event
 /// is consumed by `subtask.cancel` (i.e. the guest abandoned the call) reports
-/// `Discarded`.
+/// `NotDelivered`.
 #[tokio::test]
-async fn terminal_observer_discarded_on_cancel_after_completion() -> Result<()> {
+async fn terminal_observer_not_delivered_on_cancel_after_completion() -> Result<()> {
     let probe = ObserverProbe::default();
     let probe2 = probe.clone();
     run(CANCEL_COMPLETED_COMPONENT, move |(), accessor| {
@@ -560,13 +560,14 @@ async fn terminal_observer_discarded_on_cancel_after_completion() -> Result<()> 
         })
     })
     .await?;
-    probe.assert_invoked_once(TerminalConsumption::Discarded);
+    probe.assert_invoked_once(TerminalConsumption::NotDelivered);
     Ok(())
 }
 
-/// A host task cancelled by the guest before it completes reports `Cancelled`.
+/// A host task cancelled by the guest before it completes reports
+/// `NotDelivered`.
 #[tokio::test]
-async fn terminal_observer_cancelled_before_completion() -> Result<()> {
+async fn terminal_observer_not_delivered_when_cancelled_before_completion() -> Result<()> {
     let probe = ObserverProbe::default();
     let probe2 = probe.clone();
     run(CANCEL_RUNNING_COMPONENT, move |(), accessor| {
@@ -578,7 +579,7 @@ async fn terminal_observer_cancelled_before_completion() -> Result<()> {
         })
     })
     .await?;
-    probe.assert_invoked_once(TerminalConsumption::Cancelled);
+    probe.assert_invoked_once(TerminalConsumption::NotDelivered);
     Ok(())
 }
 
@@ -753,8 +754,8 @@ async fn terminal_observer_suppressed_on_store_teardown() -> Result<()> {
 }
 
 /// Registering a second observer replaces the first: the superseded observer
-/// is dropped without being invoked, and only the last registered observer
-/// sees the terminal consumption.
+/// is invoked with `Superseded`, and only the last registered observer sees
+/// the terminal consumption.
 #[tokio::test]
 async fn terminal_observer_registration_replaces_previous() -> Result<()> {
     let first = ObserverProbe::default();
@@ -769,8 +770,33 @@ async fn terminal_observer_registration_replaces_previous() -> Result<()> {
         })
     })
     .await?;
-    first.assert_suppressed();
+    first.assert_invoked_once(TerminalConsumption::Superseded);
     second.assert_invoked_once(TerminalConsumption::Delivered);
+    Ok(())
+}
+
+/// Each observer in a chain of replacements is superseded in registration
+/// order; only the last one sees the real terminal consumption.
+#[tokio::test]
+async fn terminal_observer_supersession_chain() -> Result<()> {
+    let first = ObserverProbe::default();
+    let second = ObserverProbe::default();
+    let third = ObserverProbe::default();
+    let (first2, second2, third2) = (first.clone(), second.clone(), third.clone());
+    run(WAIT_COMPONENT, move |(), accessor| {
+        let (first, second, third) = (first2.clone(), second2.clone(), third2.clone());
+        Box::pin(async move {
+            accessor.register_terminal_observer(first.observer())?;
+            accessor.register_terminal_observer(second.observer())?;
+            tokio::task::yield_now().await;
+            accessor.register_terminal_observer(third.observer())?;
+            Ok(())
+        })
+    })
+    .await?;
+    first.assert_invoked_once(TerminalConsumption::Superseded);
+    second.assert_invoked_once(TerminalConsumption::Superseded);
+    third.assert_invoked_once(TerminalConsumption::Delivered);
     Ok(())
 }
 
@@ -784,7 +810,7 @@ async fn terminal_observer_cleared_before_terminal() -> Result<()> {
         let probe = probe2.clone();
         Box::pin(async move {
             accessor.register_terminal_observer(probe.observer())?;
-            accessor.clear_terminal_observer()?;
+            assert!(accessor.clear_terminal_observer()?);
             tokio::task::yield_now().await;
             Ok(())
         })
@@ -794,12 +820,14 @@ async fn terminal_observer_cleared_before_terminal() -> Result<()> {
     Ok(())
 }
 
-/// Clearing when no observer is registered is a no-op.
+/// Clearing when no observer is registered is a no-op reporting that nothing
+/// was removed.
 #[tokio::test]
 async fn terminal_observer_clear_without_observer() -> Result<()> {
     run(IMMEDIATE_COMPONENT, move |(), accessor| {
         Box::pin(async move {
-            accessor.clear_terminal_observer()?;
+            assert!(accessor.has_guest_visible_subtask());
+            assert!(!accessor.clear_terminal_observer()?);
             Ok(())
         })
     })
@@ -815,7 +843,8 @@ async fn terminal_observer_clear_without_host_task() -> Result<()> {
     let mut store = Store::new(&engine, Ctx::default());
     store
         .run_concurrent(async |accessor| {
-            accessor.clear_terminal_observer()?;
+            assert!(!accessor.has_guest_visible_subtask());
+            assert!(!accessor.clear_terminal_observer()?);
             Ok::<_, wasmtime::Error>(())
         })
         .await??;
@@ -834,7 +863,7 @@ async fn terminal_observer_replacement_after_clear() -> Result<()> {
         let (first, second) = (first2.clone(), second2.clone());
         Box::pin(async move {
             accessor.register_terminal_observer(first.observer())?;
-            accessor.clear_terminal_observer()?;
+            assert!(accessor.clear_terminal_observer()?);
             accessor.register_terminal_observer(second.observer())?;
             tokio::task::yield_now().await;
             Ok(())
@@ -854,11 +883,7 @@ async fn terminal_observer_requires_host_task() -> Result<()> {
     let mut store = Store::new(&engine, Ctx::default());
     store
         .run_concurrent(async |accessor| {
-            assert!(
-                accessor
-                    .register_terminal_observer(Box::new(|_| {}))
-                    .is_err()
-            );
+            assert!(accessor.register_terminal_observer(|_| {}).is_err());
             Ok::<_, wasmtime::Error>(())
         })
         .await??;

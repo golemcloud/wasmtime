@@ -364,21 +364,21 @@ pub enum TerminalConsumption {
     /// delivered through `waitable-set.wait`/`waitable-set.poll`, handed to a guest callback, or
     /// — for a sync-lowered import — returned to the blocked guest caller.
     Delivered,
-    /// The subtask completed successfully, but the guest consumed the pending `Returned`
-    /// terminal via `subtask.cancel`: the result was lowered, yet the guest application
-    /// abandoned the call and never observes it.
-    Discarded,
-    /// The subtask was cancelled before it completed (`ReturnCancelled` consumed by the guest).
-    Cancelled,
+    /// The subtask's terminal event was consumed without the guest observing a successful
+    /// result: either the guest consumed a pending `Returned` terminal via `subtask.cancel`
+    /// (the result was lowered, yet the guest application abandoned the call), or the call was
+    /// cancelled before it completed (`ReturnCancelled` consumed by the guest).
+    NotDelivered,
+    /// The observer was replaced by a newer one registered for the same host subtask via
+    /// [`Accessor::register_terminal_observer`]. The embedder performed a further observable
+    /// sub-operation on the same subtask, so the superseded observer's completion is considered
+    /// internally consumed on behalf of the guest rather than delivered to it.
+    Superseded,
 }
 
-/// An observer invoked exactly once when the guest consumes the terminal event of a host
-/// subtask; see [`Accessor::register_terminal_observer`].
-///
-/// If the terminal is never consumed by the guest — the guest or an intra-store operation
-/// traps, lowering the host result fails, or the store is torn down — the observer is dropped
-/// without being invoked.
-pub type TerminalObserver = Box<dyn FnOnce(TerminalConsumption) + Send>;
+/// Boxed form of an observer registered via [`Accessor::register_terminal_observer`], as stored
+/// on the host task.
+pub(crate) type TerminalObserver = Box<dyn FnOnce(TerminalConsumption) + Send>;
 
 /// A helper trait to take any type of accessor-with-data in functions.
 ///
@@ -556,10 +556,9 @@ where
     ///   the guest's stack/linear memory (a sync-lowered return). For callback dispatch the
     ///   observer runs immediately before the callback is entered because the callback may resume
     ///   arbitrary guest code and drop the subtask before returning.
-    /// - [`TerminalConsumption::Discarded`]: the subtask completed successfully, but the guest
-    ///   consumed the pending `Returned` terminal via `subtask.cancel` and never observes the
-    ///   result.
-    /// - [`TerminalConsumption::Cancelled`]: the subtask was cancelled before completion.
+    /// - [`TerminalConsumption::NotDelivered`]: the guest consumed the terminal without
+    ///   observing a successful result — a pending `Returned` terminal consumed via
+    ///   `subtask.cancel`, or a cancellation before completion.
     ///
     /// If the terminal is never consumed by the guest — a trap, a failure lowering the host
     /// result, or store teardown — the observer is dropped without being invoked.
@@ -569,9 +568,10 @@ where
     /// signal a channel or spawn work onto an executor).
     ///
     /// Registering a new observer replaces a previously registered one: the superseded observer
-    /// is dropped without being invoked, exactly as if the terminal were never consumed. This
+    /// is invoked with [`TerminalConsumption::Superseded`] before this method returns. This
     /// lets a host call that performs several observable sub-operations keep only the last —
-    /// and therefore guest-facing — one armed.
+    /// and therefore guest-facing — one armed, while still letting the embedder settle the
+    /// bookkeeping of each earlier, internally consumed sub-operation.
     ///
     /// # Errors
     ///
@@ -583,10 +583,14 @@ where
     ///
     /// Panics if called outside the scope of a `Future::poll` on a future given to Wasmtime
     /// (like [`Accessor::with`]).
-    pub fn register_terminal_observer(&self, observer: TerminalObserver) -> Result<()> {
+    pub fn register_terminal_observer(
+        &self,
+        observer: impl FnOnce(TerminalConsumption) + Send + 'static,
+    ) -> Result<()> {
         let Some(task) = self.host_task else {
             bail!("this accessor does not belong to a guest-visible host subtask");
         };
+        let observer: TerminalObserver = Box::new(observer);
         let previous = tls::get(|store| {
             let host_task = store.concurrent_state_mut().get_mut(task)?;
             Ok::<_, crate::Error>(
@@ -595,35 +599,46 @@ where
                     .replace(AlwaysMut::new(observer)),
             )
         })?;
-        // Drop any superseded observer outside the store borrow: observers may run arbitrary
-        // embedder drop logic, which must not observe concurrent state mid-mutation.
-        drop(previous);
+        // Invoke any superseded observer outside the store borrow: observers may run arbitrary
+        // embedder logic, which must not observe concurrent state mid-mutation.
+        if let Some(previous) = previous {
+            previous.into_inner()(TerminalConsumption::Superseded);
+        }
         Ok(())
+    }
+
+    /// Whether this accessor belongs to a guest-visible host subtask, i.e. whether
+    /// [`Self::register_terminal_observer`] can register an observer. `false` for accessors
+    /// that do not belong to a concurrent host import call (for example an accessor obtained
+    /// from [`StoreContextMut::run_concurrent`] or [`Accessor::spawn`]).
+    pub fn has_guest_visible_subtask(&self) -> bool {
+        self.host_task.is_some()
     }
 
     /// Removes and drops any terminal observer previously registered for this accessor's
     /// guest-visible host subtask via [`Self::register_terminal_observer`], without invoking
-    /// it.
+    /// it. Returns whether an observer was actually removed.
     ///
-    /// A no-op if this accessor has no guest-visible host subtask (e.g. a spawned background
-    /// task) or no observer is currently registered.
+    /// Returns `false` without doing anything if this accessor has no guest-visible host
+    /// subtask (e.g. a spawned background task) or no observer is currently registered.
     ///
     /// # Panics
     ///
     /// Panics if called outside the scope of a `Future::poll` on a future given to Wasmtime
     /// (like [`Accessor::with`]).
-    pub fn clear_terminal_observer(&self) -> Result<()> {
+    pub fn clear_terminal_observer(&self) -> Result<bool> {
         let Some(task) = self.host_task else {
-            return Ok(());
+            return Ok(false);
         };
         let previous = tls::get(|store| {
             let host_task = store.concurrent_state_mut().get_mut(task)?;
             Ok::<_, crate::Error>(host_task.terminal_observer.take())
         })?;
+        let cleared = previous.is_some();
         // Drop the removed observer outside the store borrow: observers may run arbitrary
         // embedder drop logic, which must not observe concurrent state mid-mutation.
         drop(previous);
-        Ok(())
+        Ok(cleared)
     }
 
     /// Spawn a background task which will receive an `&Accessor<T, D>` and
@@ -1871,11 +1886,11 @@ impl<T> StoreContextMut<'_, T> {
             // created for this import call. Capture that identity here — before any embedder
             // code runs — so the accessor can carry it across `.await` points, where the
             // store's notion of a current thread is no longer guaranteed to reference it.
-            let host_task = tls::get(|store| store.concurrent_state_mut().current_host_thread());
-            let accessor = match host_task {
-                Ok(task) => Accessor::new_for_host_task(token, task),
-                Err(_) => Accessor::new(token),
-            };
+            let host_task = tls::get(|store| store.concurrent_state_mut().current_host_thread())
+                .expect(
+                    "wrap_call's first poll must run on the host task created for its import call",
+                );
+            let accessor = Accessor::new_for_host_task(token, host_task);
             closure(&accessor).await
         }
     }
@@ -3388,11 +3403,11 @@ impl Instance {
                 lower(store.as_context_mut(), result)?;
                 // The lowered result is returned directly to the guest caller as part of this
                 // call, which counts as the guest consuming this task's successful terminal.
-                if returned
-                    && let Some(observer) =
-                        store.0.concurrent_state_mut().take_terminal_observer(task)
-                {
-                    observer(TerminalConsumption::Delivered);
+                if returned {
+                    store
+                        .0
+                        .concurrent_state_mut()
+                        .consume_terminal(task, TerminalConsumption::Delivered);
                 }
                 return Ok(None);
             }
@@ -4277,16 +4292,12 @@ impl Instance {
             // The pending terminal event was consumed by `subtask.cancel` rather than being
             // delivered to the guest: a successful (`Returned`) terminal was discarded — the
             // result was lowered but the guest abandoned the call — while `ReturnCancelled`
-            // means the callee never completed.
-            if let Waitable::Host(host_task) = waitable
-                && let Some(observer) = store
+            // means the callee never completed. Either way the guest never observes a
+            // successful result.
+            if let Waitable::Host(host_task) = waitable {
+                store
                     .concurrent_state_mut()
-                    .take_terminal_observer(host_task)
-            {
-                observer(match status {
-                    Status::Returned => TerminalConsumption::Discarded,
-                    _ => TerminalConsumption::Cancelled,
-                });
+                    .consume_terminal(host_task, TerminalConsumption::NotDelivered);
             }
             Ok(status as u32)
         } else {
@@ -5822,14 +5833,28 @@ impl ConcurrentState {
     /// Consumption sites of a host task's terminal event call this and then invoke the observer
     /// after releasing all borrows of concurrent state; see
     /// [`Accessor::register_terminal_observer`].
-    pub(crate) fn take_terminal_observer(
-        &mut self,
-        task: TableId<HostTask>,
-    ) -> Option<TerminalObserver> {
+    fn take_terminal_observer(&mut self, task: TableId<HostTask>) -> Option<TerminalObserver> {
         self.get_mut(task)
             .ok()
             .and_then(|task| task.terminal_observer.take())
             .map(AlwaysMut::into_inner)
+    }
+
+    /// Takes and invokes the terminal observer registered for `task`, if any, reporting
+    /// `consumption`.
+    ///
+    /// Every site that consumes a host task's terminal event on behalf of the guest must call
+    /// this exactly once, at the point the event is actually handed over; see
+    /// [`Accessor::register_terminal_observer`]. The observer is taken before it is invoked, so
+    /// the embedder callback runs without any borrow of the task's entry.
+    pub(crate) fn consume_terminal(
+        &mut self,
+        task: TableId<HostTask>,
+        consumption: TerminalConsumption,
+    ) {
+        if let Some(observer) = self.take_terminal_observer(task) {
+            observer(consumption);
+        }
     }
 
     fn futures_mut(&mut self) -> Result<&mut FuturesUnordered<HostTaskFuture>> {

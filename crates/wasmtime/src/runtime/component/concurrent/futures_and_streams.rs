@@ -4925,15 +4925,13 @@ impl Waitable {
             },
         ) = (self, event)
         {
-            if let Some(observer) = store
-                .concurrent_state_mut()
-                .take_terminal_observer(*host_task)
-            {
-                observer(match status {
+            store.concurrent_state_mut().consume_terminal(
+                *host_task,
+                match status {
                     Status::Returned => TerminalConsumption::Delivered,
-                    _ => TerminalConsumption::Cancelled,
-                });
-            }
+                    _ => TerminalConsumption::NotDelivered,
+                },
+            );
         }
     }
 }
