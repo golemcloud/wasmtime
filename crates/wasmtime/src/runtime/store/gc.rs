@@ -224,7 +224,7 @@ impl StoreOpaque {
     /// Returns an error if growing the GC heap fails.
     pub(crate) async fn grow_gc_heap(
         &mut self,
-        limiter: Option<&mut StoreResourceLimiter<'_>>,
+        mut limiter: Option<&mut StoreResourceLimiter<'_>>,
         bytes_needed: u64,
         asyncness: Asyncness,
     ) -> Result<()> {
@@ -289,13 +289,13 @@ impl StoreOpaque {
         // Safety: we pair growing the GC heap with updating its associated
         // `VMMemoryDefinition` in the `VMStoreContext` immediately
         // afterwards.
-        unsafe {
+        let (old_byte_size, new_byte_size) = unsafe {
             heap.memory
-                .grow(delta_pages_for_alloc, limiter)
+                .grow(delta_pages_for_alloc, limiter.as_deref_mut())
                 .await
                 .context(GcHeapGrowthFailed)?
-                .ok_or(GcHeapGrowthFailed)?;
-        }
+                .ok_or(GcHeapGrowthFailed)?
+        };
         *heap.store.vm_store_context.gc_heap.get_mut() = heap.memory.vmmemory();
 
         let new_size_in_bytes = u64::try_from(heap.memory.byte_size())?;
@@ -311,6 +311,25 @@ impl StoreOpaque {
             "  -> grew GC heap by {:#x} bytes: new size is {new_size_in_bytes:#x} bytes",
             heap.delta_bytes_grown
         );
+
+        // Put the grown memory, and the size delta the collector needs in order
+        // to use the new capacity, back into the `GcStore` before notifying the
+        // embedder. Running the notification while `heap` is still alive would
+        // hand control to embedder code at a point where the store's GC heap has
+        // no memory at all and its free list has not been extended.
+        drop(heap);
+
+        // Resolve the `memory_growing` that permitted this growth. See
+        // `ResourceLimiter::memory_grown` for the contract; the ordering above
+        // is what upholds its unwind-safety guarantee. This reports the kind
+        // directly rather than going through `Memory::notify_grown` because the
+        // memory now lives inside the `GcStore`. Growth here is always nonzero:
+        // a `bytes_needed` of zero returned early and the delta was asserted
+        // above.
+        if let Some(limiter) = limiter {
+            limiter.memory_grown(old_byte_size, new_byte_size, crate::MemoryKind::GcHeap);
+        }
+
         return Ok(());
 
         struct TakenGcHeap<'a> {

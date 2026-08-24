@@ -162,6 +162,7 @@ impl ResourceLimiter for StoreLimits {
         current: usize,
         desired: usize,
         _maximum: Option<usize>,
+        _kind: MemoryKind,
     ) -> Result<bool> {
         Ok(self.alloc(desired - current))
     }

@@ -787,7 +787,7 @@ impl Instance {
     /// successful.
     pub(crate) async fn memory_grow(
         mut self: Pin<&mut Self>,
-        limiter: Option<&mut StoreResourceLimiter<'_>>,
+        mut limiter: Option<&mut StoreResourceLimiter<'_>>,
         idx: DefinedMemoryIndex,
         delta: u64,
     ) -> Result<Option<usize>, Error> {
@@ -796,16 +796,28 @@ impl Instance {
         // SAFETY: this is the safe wrapper around `Memory::grow` because it
         // automatically updates the `VMMemoryDefinition` in this instance after
         // a growth operation below.
-        let result = unsafe { memory.grow(delta, limiter).await };
+        let result = unsafe { memory.grow(delta, limiter.as_deref_mut()).await };
 
         // Update the state used by a non-shared Wasm memory in case the base
         // pointer and/or the length changed.
         if memory.as_shared_memory().is_none() {
             let vmmemory = memory.vmmemory();
-            self.set_memory(idx, vmmemory);
+            self.as_mut().set_memory(idx, vmmemory);
         }
 
-        result
+        // Only now that the `VMContext` holds the committed base pointer and
+        // length is it safe to hand control to the embedder's post-growth
+        // notification. It may panic, and if that panic is caught this instance
+        // must still be consistent and reusable.
+        match result {
+            Ok(Some((old, new))) => {
+                let memory = &self.as_mut().memories_mut()[idx].1;
+                memory.notify_grown(limiter, old, new);
+                Ok(Some(old))
+            }
+            Ok(None) => Ok(None),
+            Err(e) => Err(e),
+        }
     }
 
     /// Performs a grow operation on the `table_index` specified using `grow`.

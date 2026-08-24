@@ -330,27 +330,32 @@ impl StoreResourceLimiter<'_> {
         current: usize,
         desired: usize,
         maximum: Option<usize>,
+        kind: crate::MemoryKind,
     ) -> Result<bool, Error> {
         match self {
-            Self::Sync(s) => s.memory_growing(current, desired, maximum),
+            Self::Sync(s) => s.memory_growing(current, desired, maximum, kind),
             #[cfg(feature = "async")]
-            Self::Async(s) => s.memory_growing(current, desired, maximum).await,
+            Self::Async(s) => s.memory_growing(current, desired, maximum, kind).await,
         }
     }
 
-    pub(crate) fn memory_grow_failed(&mut self, error: crate::Error) -> Result<()> {
+    pub(crate) fn memory_grow_failed(
+        &mut self,
+        error: crate::Error,
+        kind: crate::MemoryKind,
+    ) -> Result<()> {
         match self {
-            Self::Sync(s) => s.memory_grow_failed(error),
+            Self::Sync(s) => s.memory_grow_failed(error, kind),
             #[cfg(feature = "async")]
-            Self::Async(s) => s.memory_grow_failed(error),
+            Self::Async(s) => s.memory_grow_failed(error, kind),
         }
     }
 
-    pub(crate) fn memory_grown(&mut self, current: usize, desired: usize) {
+    pub(crate) fn memory_grown(&mut self, current: usize, desired: usize, kind: crate::MemoryKind) {
         match self {
-            Self::Sync(s) => s.memory_grown(current, desired),
+            Self::Sync(s) => s.memory_grown(current, desired, kind),
             #[cfg(feature = "async")]
-            Self::Async(s) => s.memory_grown(current, desired),
+            Self::Async(s) => s.memory_grown(current, desired, kind),
         }
     }
 
