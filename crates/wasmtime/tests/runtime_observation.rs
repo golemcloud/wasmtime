@@ -76,6 +76,203 @@ impl StreamProducer<()> for Producer {
 
 struct Consumer;
 
+#[test]
+fn consumer_poll_activity_is_live_and_not_reused_after_drop() -> wasmtime::Result<()> {
+    struct BufferedProducer;
+    impl StreamProducer<()> for BufferedProducer {
+        type Item = u8;
+        type Buffer = Option<u8>;
+
+        fn poll_produce<'a>(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            _: StoreContextMut<'a, ()>,
+            mut destination: Destination<'a, u8, Option<u8>>,
+            finish: bool,
+        ) -> Poll<wasmtime::Result<StreamResult>> {
+            if finish {
+                Poll::Ready(Ok(StreamResult::Cancelled))
+            } else {
+                destination.set_buffer(Some(42));
+                Poll::Ready(Ok(StreamResult::Completed))
+            }
+        }
+    }
+
+    struct ObservedConsumer {
+        events: Arc<Mutex<Vec<RuntimeObservation>>>,
+        seen: Arc<Mutex<Vec<RuntimeActivityId>>>,
+        dropped: Arc<AtomicUsize>,
+    }
+    impl Drop for ObservedConsumer {
+        fn drop(&mut self) {
+            self.dropped.fetch_add(1, SeqCst);
+        }
+    }
+    impl StreamConsumer<()> for ObservedConsumer {
+        type Item = u8;
+
+        fn poll_consume(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            store: StoreContextMut<'_, ()>,
+            _: Source<'_, u8>,
+            _: bool,
+        ) -> Poll<wasmtime::Result<StreamResult>> {
+            let activity = store.runtime_activity().expect("consumer poll has an ID");
+            let events = self.events.lock().unwrap();
+            assert!(events.iter().any(|event| matches!(event,
+                RuntimeObservation::ActivityStarted {
+                    activity: started, kind: RuntimeActivityKind::Transfer,
+                } if *started == activity)));
+            assert!(!events.iter().any(|event| matches!(event,
+                RuntimeObservation::ActivityFinished { activity: finished }
+                    if *finished == activity)));
+            self.seen.lock().unwrap().push(activity);
+            Poll::Pending
+        }
+    }
+
+    let mut config = Config::new();
+    config.wasm_component_model_async(true);
+    let engine = Engine::new(&config)?;
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let dropped = Arc::new(AtomicUsize::new(0));
+    let wakes = Arc::new(WakeCount::default());
+    let mut previous = None;
+    for iteration in 0..2 {
+        let mut store = Store::new(&engine, ());
+        let observed = events.clone();
+        store
+            .as_context_mut()
+            .set_runtime_observer(Arc::new(move |event| {
+                observed.lock().unwrap().push(event);
+            }));
+        let before = seen.lock().unwrap().len();
+        StreamReader::new(&mut store, BufferedProducer)?.pipe(
+            &mut store,
+            ObservedConsumer {
+                events: events.clone(),
+                seen: seen.clone(),
+                dropped: dropped.clone(),
+            },
+        )?;
+        assert_eq!(store.as_context_mut().runtime_activity(), None);
+        let mut driver = Box::pin(store.run_concurrent(async |_| pending::<()>().await));
+        assert!(poll(driver.as_mut(), &wakes).is_pending());
+        let activity = seen.lock().unwrap()[before];
+        assert_ne!(Some(activity), previous);
+        assert!(
+            seen.lock().unwrap()[before..]
+                .iter()
+                .all(|id| *id == activity)
+        );
+        drop(driver);
+        assert_eq!(store.as_context_mut().runtime_activity(), None);
+        assert_eq!(dropped.load(SeqCst), iteration);
+        assert!(!events.lock().unwrap().iter().any(|event| matches!(event,
+            RuntimeObservation::ActivityFinished { activity: finished }
+                if *finished == activity)));
+        drop(store);
+        assert_eq!(dropped.load(SeqCst), iteration + 1);
+        assert_eq!(
+            events
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|event| matches!(event,
+            RuntimeObservation::ActivityFinished { activity: finished }
+                if *finished == activity))
+                .count(),
+            1
+        );
+        previous = Some(activity);
+    }
+    Ok(())
+}
+
+#[test]
+fn transfer_poll_activity_is_scoped_and_store_local() -> wasmtime::Result<()> {
+    struct ObservedProducer {
+        seen: Arc<Mutex<Vec<RuntimeActivityId>>>,
+        nested: Store<()>,
+        panic: bool,
+    }
+    impl StreamProducer<()> for ObservedProducer {
+        type Item = u8;
+        type Buffer = Option<u8>;
+
+        fn poll_produce<'a>(
+            mut self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            store: StoreContextMut<'a, ()>,
+            _: Destination<'a, u8, Option<u8>>,
+            _: bool,
+        ) -> Poll<wasmtime::Result<StreamResult>> {
+            let activity = store.runtime_activity().expect("transfer poll has an ID");
+            self.seen.lock().unwrap().push(activity);
+            assert_eq!(self.nested.as_context_mut().runtime_activity(), None);
+            assert_eq!(store.runtime_activity(), Some(activity));
+            assert!(!self.panic, "producer panic");
+            Poll::Pending
+        }
+    }
+
+    let mut config = Config::new();
+    config.wasm_component_model_async(true);
+    let engine = Engine::new(&config)?;
+    let mut ids = Vec::new();
+    for panic in [false, false, true] {
+        let mut store = Store::new(&engine, ());
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let observed = events.clone();
+        store
+            .as_context_mut()
+            .set_runtime_observer(Arc::new(move |event| {
+                observed.lock().unwrap().push(event);
+            }));
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        StreamReader::new(
+            &mut store,
+            ObservedProducer {
+                seen: seen.clone(),
+                nested: Store::new(&engine, ()),
+                panic,
+            },
+        )?
+        .pipe(&mut store, Consumer)?;
+        assert_eq!(store.as_context_mut().runtime_activity(), None);
+        let transfer = events
+            .lock()
+            .unwrap()
+            .iter()
+            .find_map(|event| match event {
+                RuntimeObservation::ActivityStarted {
+                    activity,
+                    kind: RuntimeActivityKind::Transfer,
+                } => Some(*activity),
+                _ => None,
+            })
+            .unwrap();
+        assert!(!ids.contains(&transfer));
+        ids.push(transfer);
+        let wakes = Arc::new(WakeCount::default());
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut driver = Box::pin(store.run_concurrent(async |_| pending::<()>().await));
+            assert!(poll(driver.as_mut(), &wakes).is_pending());
+        }));
+        assert_eq!(outcome.is_err(), panic);
+        assert!(!seen.lock().unwrap().is_empty());
+        assert!(seen.lock().unwrap().iter().all(|id| *id == transfer));
+        assert_eq!(store.as_context_mut().runtime_activity(), None);
+        drop(store);
+        assert!(events.lock().unwrap().iter().any(|event| matches!(event,
+            RuntimeObservation::ActivityFinished { activity } if *activity == transfer)));
+    }
+    Ok(())
+}
+
 impl StreamConsumer<()> for Consumer {
     type Item = u8;
 
@@ -123,7 +320,7 @@ const GUEST_FUTURE_COMPONENT: &str = r#"
     (canon lift (core func $i "run") (memory $libc "memory"))))
 "#;
 
-struct YieldFuture(bool);
+struct YieldFuture(bool, Arc<Mutex<Vec<Option<RuntimeActivityId>>>>);
 
 impl FutureProducer<()> for YieldFuture {
     type Item = u32;
@@ -131,9 +328,10 @@ impl FutureProducer<()> for YieldFuture {
     fn poll_produce(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
-        _: StoreContextMut<'_, ()>,
+        store: StoreContextMut<'_, ()>,
         finish: bool,
     ) -> Poll<wasmtime::Result<Option<Self::Item>>> {
+        self.1.lock().unwrap().push(store.runtime_activity());
         if finish {
             Poll::Ready(Ok(None))
         } else if std::mem::replace(&mut self.0, true) {
@@ -398,11 +596,13 @@ async fn guest_future_transfer_is_observed_from_admission_through_dispatch() -> 
     let instance = Linker::new(&engine)
         .instantiate_async(&mut store, &component)
         .await?;
-    let reader = FutureReader::new(&mut store, YieldFuture(false))?;
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let reader = FutureReader::new(&mut store, YieldFuture(false, seen.clone()))?;
     instance
         .get_typed_func::<(FutureReader<u32>,), ()>(&mut store, "run")?
         .call_async(&mut store, (reader,))
         .await?;
+    assert_eq!(store.as_context_mut().runtime_activity(), None);
     drop(store);
 
     let events = events.lock().unwrap();
@@ -414,6 +614,13 @@ async fn guest_future_transfer_is_observed_from_admission_through_dispatch() -> 
         _ => None,
     });
     let transfer = transfer.expect("guest future read registers transfer activity");
+    assert!(seen.lock().unwrap().len() >= 2);
+    assert_eq!(seen.lock().unwrap()[0], None);
+    assert!(
+        seen.lock().unwrap()[1..]
+            .iter()
+            .all(|id| *id == Some(transfer))
+    );
     assert!(events.iter().any(|event| matches!(
         event,
         RuntimeObservation::ActivityFinished { activity }

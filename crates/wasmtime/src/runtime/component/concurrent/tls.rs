@@ -16,10 +16,40 @@
 //! internal implementation details private and reduce the surface area that
 //! must be audited for the `unsafe` blocks contained within.
 
+use super::RuntimeActivityId;
 use crate::runtime::vm::VMStore;
+use crate::store::StoreId;
 use crate::vm::{component_async_tls_get, component_async_tls_set};
 use core::mem;
 use core::ptr::NonNull;
+use std::cell::Cell;
+
+std::thread_local! {
+    static ACTIVITY: Cell<Option<(StoreId, RuntimeActivityId)>> = const { Cell::new(None) };
+}
+
+pub(super) struct ActivityScope(Option<(StoreId, RuntimeActivityId)>);
+
+impl ActivityScope {
+    pub(super) fn enter(activity: Option<(StoreId, RuntimeActivityId)>) -> Self {
+        Self(ACTIVITY.with(|current| current.replace(activity)))
+    }
+}
+
+impl Drop for ActivityScope {
+    fn drop(&mut self) {
+        ACTIVITY.with(|current| current.set(self.0));
+    }
+}
+
+pub(super) fn runtime_activity(store: StoreId) -> Option<RuntimeActivityId> {
+    ACTIVITY.with(|current| {
+        current
+            .get()
+            .filter(|(id, _)| *id == store)
+            .map(|(_, id)| id)
+    })
+}
 
 fn tls_get() -> Option<NonNull<SetStorage>> {
     NonNull::new(component_async_tls_get().cast())
@@ -45,6 +75,7 @@ enum SetStorage {
 /// intentionally borrows `store` for the entire duration of `f` meaning that
 /// `f` is not allowed to access `store` via Rust's borrow checker.
 pub fn set<R>(store: &mut dyn VMStore, f: impl FnOnce() -> R) -> R {
+    let _activity = ActivityScope::enter(None);
     let mut storage = SetStorage::Present(NonNull::from(store));
     let _reset = ResetTls(component_async_tls_get());
     tls_set(Some(NonNull::from(&mut storage)));
@@ -168,6 +199,34 @@ pub fn try_get<R>(f: impl FnOnce(TryGet<'_>) -> R) -> R {
 mod tests {
     use super::{TryGet, get, set, try_get};
     use crate::{AsContextMut, Engine, Store};
+
+    #[test]
+    fn activity_scope_restores_nested_polls_and_panics() {
+        use super::{ActivityScope, RuntimeActivityId};
+        let engine = Engine::default();
+        let mut store = Store::new(&engine, ());
+        let id = store.as_context_mut().0.id();
+        let outer = RuntimeActivityId(1);
+        let inner = RuntimeActivityId(2);
+        assert_eq!(store.as_context_mut().runtime_activity(), None);
+        {
+            let _outer = ActivityScope::enter(Some((id, outer)));
+            assert_eq!(store.as_context_mut().runtime_activity(), Some(outer));
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                set(store.as_context_mut().0, || {
+                    get(|store| {
+                        assert_eq!(super::runtime_activity(store.id()), None);
+                        let _inner = ActivityScope::enter(Some((store.id(), inner)));
+                        assert_eq!(super::runtime_activity(store.id()), Some(inner));
+                        panic!("nested poll");
+                    });
+                });
+            }));
+            assert!(result.is_err());
+            assert_eq!(store.as_context_mut().runtime_activity(), Some(outer));
+        }
+        assert_eq!(store.as_context_mut().runtime_activity(), None);
+    }
 
     #[test]
     fn test_simple() {

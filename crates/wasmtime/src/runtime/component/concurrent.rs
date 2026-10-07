@@ -1527,6 +1527,17 @@ impl<T> StoreContextMut<'_, T> {
         state.runtime_observer = Some(observer);
     }
 
+    /// Returns the runtime activity enclosing the current transfer poll for this store.
+    ///
+    /// During observed host future and stream producer or consumer callbacks, this is the transfer ID
+    /// reported by [`RuntimeObservation::ActivityStarted`] and
+    /// [`RuntimeObservation::ActivityFinished`]. Outside the poll it returns `None`.
+    /// An initial synchronous poll before transfer activity is admitted also returns `None`.
+    /// Nested store execution shadows the enclosing poll, and other stores never inherit its ID.
+    pub fn runtime_activity(&self) -> Option<RuntimeActivityId> {
+        tls::runtime_activity(self.0.id())
+    }
+
     /// Spawn a background task to run as part of this instance's event loop.
     ///
     /// The task will receive an `&Accessor<U>` and run concurrently with
@@ -6249,7 +6260,13 @@ impl ConcurrentState {
         let activity = self.start_activity(kind);
         let future = Box::pin(async move {
             let _activity = activity;
-            future.await
+            let mut future = future;
+            future::poll_fn(move |cx| {
+                let store = tls::get(|store| store.id());
+                let _scope = tls::ActivityScope::enter(Some((store, _activity.activity)));
+                future.as_mut().poll(cx)
+            })
+            .await
         });
         self.push_future_observed(future);
     }
