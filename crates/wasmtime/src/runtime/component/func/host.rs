@@ -182,6 +182,73 @@ impl HostFunc {
         )
     }
 
+    /// Equivalent for `Linker::func_wrap_dispatch`
+    #[cfg(feature = "component-model-async")]
+    pub(crate) fn func_wrap_dispatch<T, P, R, S, B, C>(
+        select: S,
+        borrowed: B,
+        concurrent: C,
+    ) -> Result<Arc<HostFunc>>
+    where
+        T: 'static,
+        P: ComponentNamedList + Lift + 'static,
+        R: ComponentNamedList + Lower + 'static,
+        S: Fn(&mut T, &P) -> Result<bool> + Send + Sync + 'static,
+        B: Fn(StoreContextMut<'_, T>, P) -> Box<dyn Future<Output = Result<R>> + Send + '_>
+            + Send
+            + Sync
+            + 'static,
+        C: Fn(&Accessor<T>, P) -> Pin<Box<dyn Future<Output = Result<R>> + Send + '_>>
+            + Send
+            + Sync
+            + 'static,
+    {
+        let concurrent = Arc::new(concurrent);
+        Self::new(
+            Asyncness::Yes,
+            StaticHostFn::<_, false>::new(move |mut store: StoreContextMut<'_, T>, params| {
+                let use_concurrent = match select(store.data_mut(), &params) {
+                    Err(error) => return HostResult::Done(Err(error)),
+                    // Concurrent dispatch is a preference constrained by whether the nearest
+                    // guest task can release the Store. Synchronous guest tasks must keep using
+                    // the borrowed handler, even when the selector prefers concurrency.
+                    Ok(true) => match store.nearest_guest_task_may_block() {
+                        Ok(use_concurrent) => use_concurrent,
+                        Err(error) => return HostResult::Done(Err(error)),
+                    },
+                    Ok(false) => false,
+                };
+                match use_concurrent {
+                    true => {
+                        let concurrent = concurrent.clone();
+                        HostResult::Future(Box::pin(
+                            store.wrap_call(move |accessor| concurrent(accessor, params)),
+                        ))
+                    }
+                    false => {
+                        let context = match store.guest_task_context_opaque() {
+                            Ok(context) => context,
+                            Err(error) => return HostResult::Done(Err(error)),
+                        };
+                        HostResult::Done(
+                            store
+                                .block_on(|store| {
+                                    let future = concurrent::with_guest_task_context(
+                                        context.clone(),
+                                        || Pin::from(borrowed(store, params)),
+                                    );
+                                    Box::pin(concurrent::poll_with_guest_task_context(
+                                        context, future,
+                                    ))
+                                })
+                                .and_then(|result| result),
+                        )
+                    }
+                }
+            }),
+        )
+    }
+
     /// Equivalent of `Linker::func_new`
     pub(crate) fn func_new<T, F>(func: F) -> Result<Arc<HostFunc>>
     where

@@ -1,8 +1,8 @@
 use super::table::{TableDebug, TableId};
 use super::{Event, GlobalErrorContextRefCount, Waitable, WaitableCommon};
 use crate::component::concurrent::{
-    ConcurrentState, QualifiedThreadId, Status, TerminalConsumption, TerminalObserver, WorkItem,
-    tls,
+    ConcurrentState, QualifiedThreadId, RuntimeActivityKind, Status, TerminalConsumption,
+    TerminalObserver, WorkItem, tls,
 };
 use crate::component::func::{self, LiftContext, LowerContext};
 use crate::component::matching::InstanceType;
@@ -2385,7 +2385,8 @@ impl StoreOpaque {
             })
         };
 
-        self.concurrent_state_mut().push_future(future.boxed());
+        self.concurrent_state_mut()
+            .push_future(future.boxed(), RuntimeActivityKind::Transfer);
     }
 
     fn pipe_to_guest(
@@ -2429,7 +2430,8 @@ impl StoreOpaque {
             })
         };
 
-        self.concurrent_state_mut().push_future(future.boxed());
+        self.concurrent_state_mut()
+            .push_future(future.boxed(), RuntimeActivityKind::Transfer);
     }
 
     /// Drop the read end of a stream or future read from the host.
@@ -2997,7 +2999,7 @@ impl<T> StoreContextMut<'_, T> {
                     result
                 });
 
-                state.push_future(Box::pin(future));
+                state.push_future(Box::pin(future), RuntimeActivityKind::Transfer);
             }
             WriteState::Dropped => {
                 let reader = transmit.read_handle;
