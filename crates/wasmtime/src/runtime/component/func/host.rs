@@ -138,23 +138,38 @@ impl HostFunc {
     {
         Self::new(
             Asyncness::Yes,
-            StaticHostFn::<_, false>::new(move |mut store, params| {
-                let context = match store.guest_task_context_opaque() {
-                    Ok(context) => context,
-                    Err(error) => return HostResult::Done(Err(error)),
-                };
-                HostResult::Done(
-                    store
-                        .block_on(|store| {
-                            let future =
-                                concurrent::with_guest_task_context(context.clone(), || {
-                                    Pin::from(func(store, params))
-                                });
-                            Box::pin(concurrent::poll_with_guest_task_context(context, future))
-                        })
-                        .and_then(|r| r),
-                )
+            StaticHostFn::<_, false>::new(move |store, params| {
+                Self::borrowed_host_call(&func, store, params)
             }),
+        )
+    }
+
+    /// Runs a borrowed-store async host function to completion on the calling
+    /// guest task, propagating the guest task context into the future.
+    #[cfg(feature = "async")]
+    fn borrowed_host_call<T, F, P, R>(
+        func: &F,
+        mut store: StoreContextMut<'_, T>,
+        params: P,
+    ) -> HostResult<R>
+    where
+        T: 'static,
+        F: Fn(StoreContextMut<'_, T>, P) -> Box<dyn Future<Output = Result<R>> + Send + '_>,
+        R: 'static,
+    {
+        let context = match store.guest_task_context_opaque() {
+            Ok(context) => context,
+            Err(error) => return HostResult::Done(Err(error)),
+        };
+        HostResult::Done(
+            store
+                .block_on(|store| {
+                    let future = concurrent::with_guest_task_context(context.clone(), || {
+                        Pin::from(func(store, params))
+                    });
+                    Box::pin(concurrent::poll_with_guest_task_context(context, future))
+                })
+                .and_then(|r| r),
         )
     }
 
@@ -225,25 +240,7 @@ impl HostFunc {
                             store.wrap_call(move |accessor| concurrent(accessor, params)),
                         ))
                     }
-                    false => {
-                        let context = match store.guest_task_context_opaque() {
-                            Ok(context) => context,
-                            Err(error) => return HostResult::Done(Err(error)),
-                        };
-                        HostResult::Done(
-                            store
-                                .block_on(|store| {
-                                    let future = concurrent::with_guest_task_context(
-                                        context.clone(),
-                                        || Pin::from(borrowed(store, params)),
-                                    );
-                                    Box::pin(concurrent::poll_with_guest_task_context(
-                                        context, future,
-                                    ))
-                                })
-                                .and_then(|result| result),
-                        )
-                    }
+                    false => Self::borrowed_host_call(&borrowed, store, params),
                 }
             }),
         )

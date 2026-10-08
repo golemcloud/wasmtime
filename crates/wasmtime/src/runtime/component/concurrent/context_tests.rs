@@ -112,7 +112,9 @@ fn context_follows_direct_guest_and_host_ancestry() {
         7
     );
 
-    let activity = state.start_activity(RuntimeActivityKind::Import);
+    let activity = state
+        .start_activity(RuntimeActivityKind::Import)
+        .map(Arc::new);
     let host = state
         .push(HostTask::new(
             root,

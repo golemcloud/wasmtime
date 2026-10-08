@@ -148,7 +148,7 @@ fn consumer_poll_activity_is_live_and_not_reused_after_drop() -> wasmtime::Resul
             .as_context_mut()
             .set_runtime_observer(Arc::new(move |event| {
                 observed.lock().unwrap().push(event);
-            }));
+            }))?;
         let before = seen.lock().unwrap().len();
         StreamReader::new(&mut store, BufferedProducer)?.pipe(
             &mut store,
@@ -231,7 +231,7 @@ fn transfer_poll_activity_is_scoped_and_store_local() -> wasmtime::Result<()> {
             .as_context_mut()
             .set_runtime_observer(Arc::new(move |event| {
                 observed.lock().unwrap().push(event);
-            }));
+            }))?;
         let seen = Arc::new(Mutex::new(Vec::new()));
         StreamReader::new(
             &mut store,
@@ -363,7 +363,7 @@ fn background_activity_outlives_driver_until_store_drop() -> wasmtime::Result<()
         .as_context_mut()
         .set_runtime_observer(Arc::new(move |event| {
             observed.lock().unwrap().push(event);
-        }));
+        }))?;
     let seen = Arc::new(Mutex::new(None));
     store.as_context_mut().spawn(PendingTask(seen.clone()));
     let activity = match events.lock().unwrap().as_slice() {
@@ -404,7 +404,7 @@ fn provisional_transfer_activities_outlive_driver_until_store_drop() -> wasmtime
         .as_context_mut()
         .set_runtime_observer(Arc::new(move |event| {
             observed.lock().unwrap().push(event);
-        }));
+        }))?;
 
     StreamReader::new(&mut store, Producer(Arc::new(AtomicUsize::new(0))))?
         .pipe(&mut store, Consumer)?;
@@ -461,7 +461,7 @@ fn observation_distinguishes_runnable_work_from_blocking() -> wasmtime::Result<(
     let observed = events.clone();
     store
         .as_context_mut()
-        .set_runtime_observer(Arc::new(move |event| observed.lock().unwrap().push(event)));
+        .set_runtime_observer(Arc::new(move |event| observed.lock().unwrap().push(event)))?;
 
     // The root queues work during the final poll after queue inspection. The driver must take
     // another turn instead of publishing blocked and relying on a wake which does not exist.
@@ -489,7 +489,7 @@ fn observation_distinguishes_runnable_work_from_blocking() -> wasmtime::Result<(
     let observed = events.clone();
     store
         .as_context_mut()
-        .set_runtime_observer(Arc::new(move |event| observed.lock().unwrap().push(event)));
+        .set_runtime_observer(Arc::new(move |event| observed.lock().unwrap().push(event)))?;
     let started = Arc::new(AtomicUsize::new(0));
     for _ in 0..128 {
         store
@@ -536,7 +536,7 @@ fn observation_distinguishes_runnable_work_from_blocking() -> wasmtime::Result<(
     let observed = events.clone();
     store
         .as_context_mut()
-        .set_runtime_observer(Arc::new(move |event| observed.lock().unwrap().push(event)));
+        .set_runtime_observer(Arc::new(move |event| observed.lock().unwrap().push(event)))?;
     let produced = Arc::new(AtomicUsize::new(0));
     StreamReader::new(&mut store, Producer(produced.clone()))?.pipe(&mut store, Consumer)?;
     let mut driver = Box::pin(store.run_concurrent(async |_| pending::<()>().await));
@@ -592,7 +592,7 @@ async fn guest_future_transfer_is_observed_from_admission_through_dispatch() -> 
     let observed = events.clone();
     store
         .as_context_mut()
-        .set_runtime_observer(Arc::new(move |event| observed.lock().unwrap().push(event)));
+        .set_runtime_observer(Arc::new(move |event| observed.lock().unwrap().push(event)))?;
     let instance = Linker::new(&engine)
         .instantiate_async(&mut store, &component)
         .await?;
@@ -629,7 +629,7 @@ async fn guest_future_transfer_is_observed_from_admission_through_dispatch() -> 
     assert!(events.iter().any(|event| matches!(
         event,
         RuntimeObservation::ActivityStarted {
-            kind: RuntimeActivityKind::Unknown,
+            kind: RuntimeActivityKind::GuestCall,
             ..
         }
     )));
