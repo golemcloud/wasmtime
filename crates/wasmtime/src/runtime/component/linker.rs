@@ -592,6 +592,47 @@ impl<T: 'static> LinkerInstance<'_, T> {
         Ok(())
     }
 
+    /// Defines a host function whose invocation is selected between borrowed
+    /// asynchronous and concurrent execution before a borrowed future is created.
+    /// Returning `true` from `selector` prefers concurrent execution, which is used
+    /// only when the nearest guest task permits blocking. Otherwise the borrowed
+    /// handler is used, including when the selector returns `false`.
+    #[cfg(feature = "component-model-async")]
+    pub fn func_wrap_dispatch<Params, Return, S, B, C>(
+        &mut self,
+        name: &str,
+        selector: S,
+        borrowed: B,
+        concurrent: C,
+    ) -> Result<()>
+    where
+        Params: ComponentNamedList + Lift + 'static,
+        Return: ComponentNamedList + Lower + 'static,
+        S: Fn(&mut T, &Params) -> Result<bool> + Send + Sync + 'static,
+        B: Fn(
+                StoreContextMut<'_, T>,
+                Params,
+            ) -> Box<dyn Future<Output = Result<Return>> + Send + '_>
+            + Send
+            + Sync
+            + 'static,
+        C: Fn(&Accessor<T>, Params) -> Pin<Box<dyn Future<Output = Result<Return>> + Send + '_>>
+            + Send
+            + Sync
+            + 'static,
+    {
+        if !self.engine.tunables().concurrency_support {
+            bail!("dispatch host functions require `Config::concurrency_support`");
+        }
+        self.insert(
+            name,
+            Definition::Func(HostFunc::func_wrap_dispatch(
+                selector, borrowed, concurrent,
+            )?),
+        )?;
+        Ok(())
+    }
+
     /// Define a new host-provided function using dynamically typed values.
     ///
     /// The `name` provided is the name of the function to define and the

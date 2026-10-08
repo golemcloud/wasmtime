@@ -45,6 +45,8 @@ enum SetStorage {
 /// intentionally borrows `store` for the entire duration of `f` meaning that
 /// `f` is not allowed to access `store` via Rust's borrow checker.
 pub fn set<R>(store: &mut dyn VMStore, f: impl FnOnce() -> R) -> R {
+    // Nested store execution must not inherit the enclosing poll's activity.
+    let _activity = super::observation::ActivityScope::enter(None);
     let mut storage = SetStorage::Present(NonNull::from(store));
     let _reset = ResetTls(component_async_tls_get());
     tls_set(Some(NonNull::from(&mut storage)));

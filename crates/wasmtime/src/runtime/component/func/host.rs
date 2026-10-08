@@ -138,23 +138,38 @@ impl HostFunc {
     {
         Self::new(
             Asyncness::Yes,
-            StaticHostFn::<_, false>::new(move |mut store, params| {
-                let context = match store.guest_task_context_opaque() {
-                    Ok(context) => context,
-                    Err(error) => return HostResult::Done(Err(error)),
-                };
-                HostResult::Done(
-                    store
-                        .block_on(|store| {
-                            let future =
-                                concurrent::with_guest_task_context(context.clone(), || {
-                                    Pin::from(func(store, params))
-                                });
-                            Box::pin(concurrent::poll_with_guest_task_context(context, future))
-                        })
-                        .and_then(|r| r),
-                )
+            StaticHostFn::<_, false>::new(move |store, params| {
+                Self::borrowed_host_call(&func, store, params)
             }),
+        )
+    }
+
+    /// Runs a borrowed-store async host function to completion on the calling
+    /// guest task, propagating the guest task context into the future.
+    #[cfg(feature = "async")]
+    fn borrowed_host_call<T, F, P, R>(
+        func: &F,
+        mut store: StoreContextMut<'_, T>,
+        params: P,
+    ) -> HostResult<R>
+    where
+        T: 'static,
+        F: Fn(StoreContextMut<'_, T>, P) -> Box<dyn Future<Output = Result<R>> + Send + '_>,
+        R: 'static,
+    {
+        let context = match store.guest_task_context_opaque() {
+            Ok(context) => context,
+            Err(error) => return HostResult::Done(Err(error)),
+        };
+        HostResult::Done(
+            store
+                .block_on(|store| {
+                    let future = concurrent::with_guest_task_context(context.clone(), || {
+                        Pin::from(func(store, params))
+                    });
+                    Box::pin(concurrent::poll_with_guest_task_context(context, future))
+                })
+                .and_then(|r| r),
         )
     }
 
@@ -178,6 +193,55 @@ impl HostFunc {
                 HostResult::Future(Box::pin(
                     store.wrap_call(move |accessor| func(accessor, params)),
                 ))
+            }),
+        )
+    }
+
+    /// Equivalent for `Linker::func_wrap_dispatch`
+    #[cfg(feature = "component-model-async")]
+    pub(crate) fn func_wrap_dispatch<T, P, R, S, B, C>(
+        select: S,
+        borrowed: B,
+        concurrent: C,
+    ) -> Result<Arc<HostFunc>>
+    where
+        T: 'static,
+        P: ComponentNamedList + Lift + 'static,
+        R: ComponentNamedList + Lower + 'static,
+        S: Fn(&mut T, &P) -> Result<bool> + Send + Sync + 'static,
+        B: Fn(StoreContextMut<'_, T>, P) -> Box<dyn Future<Output = Result<R>> + Send + '_>
+            + Send
+            + Sync
+            + 'static,
+        C: Fn(&Accessor<T>, P) -> Pin<Box<dyn Future<Output = Result<R>> + Send + '_>>
+            + Send
+            + Sync
+            + 'static,
+    {
+        let concurrent = Arc::new(concurrent);
+        Self::new(
+            Asyncness::Yes,
+            StaticHostFn::<_, false>::new(move |mut store: StoreContextMut<'_, T>, params| {
+                let use_concurrent = match select(store.data_mut(), &params) {
+                    Err(error) => return HostResult::Done(Err(error)),
+                    // Concurrent dispatch is a preference constrained by whether the nearest
+                    // guest task can release the Store. Synchronous guest tasks must keep using
+                    // the borrowed handler, even when the selector prefers concurrency.
+                    Ok(true) => match store.nearest_guest_task_may_block() {
+                        Ok(use_concurrent) => use_concurrent,
+                        Err(error) => return HostResult::Done(Err(error)),
+                    },
+                    Ok(false) => false,
+                };
+                match use_concurrent {
+                    true => {
+                        let concurrent = concurrent.clone();
+                        HostResult::Future(Box::pin(
+                            store.wrap_call(move |accessor| concurrent(accessor, params)),
+                        ))
+                    }
+                    false => Self::borrowed_host_call(&borrowed, store, params),
+                }
             }),
         )
     }

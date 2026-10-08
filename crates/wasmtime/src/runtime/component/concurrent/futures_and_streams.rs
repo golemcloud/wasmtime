@@ -2385,7 +2385,8 @@ impl StoreOpaque {
             })
         };
 
-        self.concurrent_state_mut().push_future(future.boxed());
+        self.concurrent_state_mut()
+            .push_transfer_future(future.boxed());
     }
 
     fn pipe_to_guest(
@@ -2429,7 +2430,8 @@ impl StoreOpaque {
             })
         };
 
-        self.concurrent_state_mut().push_future(future.boxed());
+        self.concurrent_state_mut()
+            .push_transfer_future(future.boxed());
     }
 
     /// Drop the read end of a stream or future read from the host.
@@ -2997,7 +2999,7 @@ impl<T> StoreContextMut<'_, T> {
                     result
                 });
 
-                state.push_future(Box::pin(future));
+                state.push_transfer_future(Box::pin(future));
             }
             WriteState::Dropped => {
                 let reader = transmit.read_handle;

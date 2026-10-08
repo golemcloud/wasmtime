@@ -101,6 +101,11 @@ pub use futures_and_streams::{
     FutureReader, GuardedFutureReader, GuardedStreamReader, ReadBuffer, Source, StreamConsumer,
     StreamProducer, StreamReader, StreamResult, VecBuffer, WriteBuffer,
 };
+use observation::{ActivityGuard, DriverProbe};
+pub use observation::{
+    RuntimeActivityId, RuntimeActivityKind, RuntimeInvalidation, RuntimeObservation,
+    RuntimeObserver,
+};
 
 type OpaqueGuestTaskContext = Arc<dyn Any + Send + Sync>;
 
@@ -191,6 +196,7 @@ mod error_contexts;
 mod func;
 mod future_stream_any;
 mod futures_and_streams;
+mod observation;
 pub(crate) mod table;
 pub(crate) mod tls;
 
@@ -330,6 +336,7 @@ where
             // carries no host-subtask identity.
             host_task: None,
             embedder_context: None,
+            runtime_activity: None,
         };
         self.store
             .as_context_mut()
@@ -443,6 +450,7 @@ where
     /// populated for resource destructors, which currently use the concurrent API without a
     /// guest-visible host subtask.
     embedder_context: Option<OpaqueGuestTaskContext>,
+    runtime_activity: Option<RuntimeActivityId>,
 }
 
 /// How the guest consumed a terminal completion observed by the host.
@@ -551,6 +559,7 @@ impl<T> Accessor<T> {
             get_data: |x| x,
             host_task: None,
             embedder_context: None,
+            runtime_activity: None,
         }
     }
 
@@ -560,12 +569,14 @@ impl<T> Accessor<T> {
         token: StoreToken<T>,
         host_task: TableId<HostTask>,
         embedder_context: Option<OpaqueGuestTaskContext>,
+        runtime_activity: Option<RuntimeActivityId>,
     ) -> Self {
         Self {
             token,
             get_data: |x| x,
             host_task: Some(host_task),
             embedder_context,
+            runtime_activity,
         }
     }
 
@@ -578,6 +589,7 @@ impl<T> Accessor<T> {
             get_data: |x| x,
             host_task: None,
             embedder_context,
+            runtime_activity: None,
         }
     }
 }
@@ -586,6 +598,13 @@ impl<T, D> Accessor<T, D>
 where
     D: HasData + ?Sized,
 {
+    /// The runtime activity owning this accessor, registered before embedder execution.
+    /// Projections preserve this identity; spawned tasks receive a distinct identity.
+    /// Returns `None` when the Store has no [`RuntimeObserver`].
+    pub fn runtime_activity(&self) -> Option<RuntimeActivityId> {
+        self.runtime_activity
+    }
+
     /// Returns the context inherited by the guest task which called this host function.
     ///
     /// Accessors created outside a guest-to-host call return `None`. A context of a different
@@ -669,6 +688,7 @@ where
             get_data,
             host_task: self.host_task,
             embedder_context: self.embedder_context.clone(),
+            runtime_activity: self.runtime_activity,
         }
     }
 
@@ -800,6 +820,7 @@ where
             // table slot may be reused), so the spawned accessor carries no subtask identity.
             host_task: None,
             embedder_context: None,
+            runtime_activity: None,
         }
     }
 
@@ -1034,6 +1055,17 @@ enum WorkItem {
     WorkerFunction(AlwaysMut<Box<dyn FnOnce(&mut dyn VMStore) -> Result<()> + Send>>),
 }
 
+struct QueuedWork {
+    item: WorkItem,
+    activity: Option<ActivityGuard>,
+}
+
+impl QueuedWork {
+    fn new(item: WorkItem, activity: Option<ActivityGuard>) -> Self {
+        Self { item, activity }
+    }
+}
+
 impl fmt::Debug for WorkItem {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
@@ -1074,11 +1106,15 @@ pub(crate) fn poll_and_block<R: Send + Sync + 'static>(
 ) -> Result<R> {
     let state = store.concurrent_state_mut();
     let task = state.current_host_thread()?;
+    // Keep the host task's activity live for as long as this future exists, even
+    // after the host task itself has been deleted from the table.
+    let activity = state.get_mut(task)?.runtime_activity.clone();
 
     // Wrap the future in a closure which will take care of stashing the result
     // in `GuestTask::result` and resuming this fiber when the host task
     // completes.
     let mut future = Box::pin(async move {
+        let _activity = activity;
         let result = future.await?;
         tls::get(move |store| {
             let state = store.concurrent_state_mut();
@@ -1298,6 +1334,13 @@ impl<T> StoreContextMut<'_, T> {
             .map(|guest| guest.task))
     }
 
+    pub(crate) fn nearest_guest_task_may_block(&mut self) -> Result<bool> {
+        let Some(guest) = self.guest_task()? else {
+            return Ok(false);
+        };
+        self.0.concurrent_state_mut().may_block(guest)
+    }
+
     pub(crate) fn guest_task_context_opaque(&mut self) -> Result<Option<OpaqueGuestTaskContext>> {
         let Some(guest) = self.guest_task()? else {
             return Ok(None);
@@ -1388,6 +1431,40 @@ impl<T> StoreContextMut<'_, T> {
             .count()
     }
 
+    /// Installs a policy-free observer for this Store's concurrent runtime.
+    ///
+    /// Notifications are synchronous. A blocked notification describes only an inner no-work
+    /// boundary; it is not permission to suspend. The caller must exclude an active outer driver
+    /// poll while arbitrating any policy decision and invalidate its conclusion on every activity
+    /// notification, including a finish notification which could make the Store newly eligible.
+    /// See [`RuntimeObserver`] for the re-entrancy rules the observer must follow.
+    ///
+    /// Returns an error if an observer is already installed or if the Store has already
+    /// admitted concurrent work, since that work would never be reported to the observer.
+    pub fn set_runtime_observer(&mut self, observer: Arc<dyn RuntimeObserver>) -> Result<()> {
+        let state = self.0.concurrent_state_mut();
+        if state.runtime_observer.is_some() {
+            bail!("a runtime observer is already installed for this store");
+        }
+        if state.observer_frozen {
+            bail!("the runtime observer must be installed before the store admits concurrent work");
+        }
+        state.runtime_observer = Some(observer);
+        Ok(())
+    }
+
+    /// Returns the runtime activity enclosing the current transfer poll for this store.
+    ///
+    /// During observed host future and stream producer or consumer callbacks, this is the transfer ID
+    /// reported by [`RuntimeObservation::ActivityStarted`] and
+    /// [`RuntimeObservation::ActivityFinished`]. Outside the poll, or when the Store has no
+    /// [`RuntimeObserver`], it returns `None`.
+    /// An initial synchronous poll before transfer activity is admitted also returns `None`.
+    /// Nested store execution shadows the enclosing poll, and other stores never inherit its ID.
+    pub fn runtime_activity(&self) -> Option<RuntimeActivityId> {
+        observation::current_activity(self.0.id())
+    }
+
     /// Spawn a background task to run as part of this instance's event loop.
     ///
     /// The task will receive an `&Accessor<U>` and run concurrently with
@@ -1409,7 +1486,7 @@ impl<T> StoreContextMut<'_, T> {
     /// available along with an `Accessor`.
     fn spawn_with_accessor<D>(
         self,
-        accessor: Accessor<T, D>,
+        mut accessor: Accessor<T, D>,
         task: impl AccessorTask<T, D>,
     ) -> JoinHandle
     where
@@ -1419,10 +1496,18 @@ impl<T> StoreContextMut<'_, T> {
         // Create an "abortable future" here where internally the future will
         // hook calls to poll and possibly spawn more background tasks on each
         // iteration.
+        let activity = self
+            .0
+            .concurrent_state_mut()
+            .start_activity(RuntimeActivityKind::Background);
+        accessor.runtime_activity = activity.as_ref().map(|a| a.activity);
         let (handle, future) = JoinHandle::run(async move { task.run(&accessor).await });
         self.0
             .concurrent_state_mut()
-            .push_future(Box::pin(async move { future.await.unwrap_or(Ok(())) }));
+            .push_future(Box::pin(async move {
+                let _activity = activity;
+                future.await.unwrap_or(Ok(()))
+            }));
         handle
     }
 
@@ -1651,7 +1736,13 @@ impl<T> StoreContextMut<'_, T> {
             }
         }
 
-        let accessor = &Accessor::new(token);
+        let root = self
+            .0
+            .concurrent_state_mut()
+            .start_activity(RuntimeActivityKind::Root);
+        let mut accessor = Accessor::new(token);
+        accessor.runtime_activity = root.as_ref().map(|a| a.activity);
+        let accessor = &accessor;
         let dropper = &mut Dropper {
             store: self,
             value: ManuallyDrop::new(fun(accessor)),
@@ -1688,11 +1779,38 @@ impl<T> StoreContextMut<'_, T> {
     /// no interesting guest task remains and the predicate returns `true`:
     /// see [`StoreContextMut::run_concurrent_and_settle`].
     async fn poll_until<R>(
+        self,
+        future: Pin<&mut impl Future<Output = R>>,
+        trap_on_idle: bool,
+        drain_after_complete: bool,
+        settled: Option<&mut (dyn FnMut(StoreContextMut<'_, T>) -> bool + Send)>,
+    ) -> Result<R>
+    where
+        T: Send + 'static,
+    {
+        let Some(observer) = self.0.concurrent_state_mut().runtime_observer.clone() else {
+            return self
+                .poll_until_probe(future, trap_on_idle, drain_after_complete, settled, None)
+                .await;
+        };
+        let probe = DriverProbe::new(observer);
+        let mut inner = core::pin::pin!(self.poll_until_probe(
+            future,
+            trap_on_idle,
+            drain_after_complete,
+            settled,
+            Some(&probe)
+        ));
+        future::poll_fn(|cx| probe.poll(inner.as_mut(), cx)).await
+    }
+
+    async fn poll_until_probe<R>(
         mut self,
         mut future: Pin<&mut impl Future<Output = R>>,
         trap_on_idle: bool,
         drain_after_complete: bool,
         mut settled: Option<&mut (dyn FnMut(StoreContextMut<'_, T>) -> bool + Send)>,
+        probe: Option<&DriverProbe>,
     ) -> Result<R>
     where
         T: Send + 'static,
@@ -1733,7 +1851,7 @@ impl<T> StoreContextMut<'_, T> {
             enum PollResult<R> {
                 Complete(R),
                 ProcessWork {
-                    ready: Vec<WorkItem>,
+                    ready: Vec<QueuedWork>,
                     low_priority: bool,
                 },
             }
@@ -1830,6 +1948,20 @@ impl<T> StoreContextMut<'_, T> {
                             } else {
                                 Poll::Ready(Ok(PollResult::Complete(value)))
                             }
+                        } else if !reset
+                            .store
+                            .0
+                            .concurrent_state_mut()
+                            .high_priority
+                            .is_empty()
+                            || !reset.store.0.concurrent_state_mut().low_priority.is_empty()
+                        {
+                            // The final root poll queued work after queue inspection. Take another
+                            // turn rather than publishing no-work and relying on a missing wake.
+                            Poll::Ready(Ok(PollResult::ProcessWork {
+                                ready: Vec::new(),
+                                low_priority: false,
+                            }))
                         } else if completed.is_some()
                             && reset.store.0.concurrent_state_mut().interesting_tasks == 0
                             && match settled.as_mut() {
@@ -1857,6 +1989,12 @@ impl<T> StoreContextMut<'_, T> {
                             // `trap_on_idle` is false, so we assume the future
                             // (or a tail task) will wake up and give us more
                             // work to do when it's ready to.
+                            if let Some(probe) = probe {
+                                let state = reset.store.0.concurrent_state_mut();
+                                probe.publish(
+                                    state.high_priority.is_empty() && state.low_priority.is_empty(),
+                                );
+                            }
                             Poll::Pending
                         }
                     }
@@ -1878,6 +2016,12 @@ impl<T> StoreContextMut<'_, T> {
                         {
                             Poll::Ready(Ok(PollResult::Complete(completed.take().unwrap())))
                         } else {
+                            if let Some(probe) = probe {
+                                let state = reset.store.0.concurrent_state_mut();
+                                probe.publish(
+                                    state.high_priority.is_empty() && state.low_priority.is_empty(),
+                                );
+                            }
                             Poll::Pending
                         }
                     }
@@ -1900,15 +2044,15 @@ impl<T> StoreContextMut<'_, T> {
                     ready,
                     low_priority,
                 } => {
-                    struct Dispose<'a, T: 'static, I: Iterator<Item = WorkItem>> {
+                    struct Dispose<'a, T: 'static, I: Iterator<Item = QueuedWork>> {
                         store: StoreContextMut<'a, T>,
                         ready: I,
                     }
 
-                    impl<'a, T, I: Iterator<Item = WorkItem>> Drop for Dispose<'a, T, I> {
+                    impl<'a, T, I: Iterator<Item = QueuedWork>> Drop for Dispose<'a, T, I> {
                         fn drop(&mut self) {
-                            while let Some(item) = self.ready.next() {
-                                match item {
+                            while let Some(queued) = self.ready.next() {
+                                match queued.item {
                                     WorkItem::ResumeFiber(mut fiber) => fiber.dispose(self.store.0),
                                     WorkItem::PushFuture(future) => {
                                         tls::set(self.store.0, move || drop(future))
@@ -1962,10 +2106,14 @@ impl<T> StoreContextMut<'_, T> {
     }
 
     /// Handle the specified work item, possibly resuming a fiber if applicable.
-    async fn handle_work_item(self, item: WorkItem) -> Result<()>
+    async fn handle_work_item(self, queued: QueuedWork) -> Result<()>
     where
         T: Send,
     {
+        let QueuedWork {
+            item,
+            activity: _activity,
+        } = queued;
         log::trace!("handle work item {item:?}");
         match item {
             WorkItem::PushFuture(future) => {
@@ -2071,14 +2219,18 @@ impl<T> StoreContextMut<'_, T> {
             // created for this import call. Capture that identity here — before any embedder
             // code runs — so the accessor can carry it across `.await` points, where the
             // store's notion of a current thread is no longer guaranteed to reference it.
-            let (host_task, context) = tls::get(|store| {
+            let (host_task, context, activity) = tls::get(|store| {
                 let state = store.concurrent_state_mut();
                 let task = state.current_host_thread()?;
-                let context = state.get_mut(task)?.embedder_context.clone();
-                Ok::<_, crate::Error>((task, context))
+                let host = state.get_mut(task)?;
+                Ok::<_, crate::Error>((
+                    task,
+                    host.embedder_context.clone(),
+                    host.runtime_activity.as_ref().map(|a| a.activity),
+                ))
             })
             .expect("wrap_call's first poll must run on the host task created for its import call");
-            let accessor = Accessor::new_for_host_task(token, host_task, context);
+            let accessor = Accessor::new_for_host_task(token, host_task, context, activity);
             closure(&accessor).await
         }
     }
@@ -2209,10 +2361,14 @@ impl StoreOpaque {
         let state = self.concurrent_state_mut();
         let caller = state.current_guest_thread()?;
         let embedder_context = state.get_mut(caller.task)?.embedder_context.clone();
+        let activity = state
+            .start_activity(RuntimeActivityKind::Import)
+            .map(Arc::new);
         let task = state.push(HostTask::new(
             caller,
             HostTaskState::CalleeStarted,
             embedder_context,
+            activity,
         ))?;
         log::trace!("new host task {task:?}");
         self.set_thread(task)?;
@@ -4984,6 +5140,9 @@ type HostTaskFuture = Pin<Box<dyn Future<Output = Result<()>> + Send + 'static>>
 /// This is used to represent tasks when the guest calls into the host.
 pub(crate) struct HostTask {
     common: WaitableCommon,
+    /// Activity reported for this host call, shared with any future that
+    /// outlives the task's table entry. `None` when the Store has no observer.
+    runtime_activity: Option<Arc<ActivityGuard>>,
 
     /// Guest thread which called the host.
     caller: QualifiedThreadId,
@@ -5032,6 +5191,7 @@ impl HostTask {
         caller: QualifiedThreadId,
         state: HostTaskState,
         embedder_context: Option<OpaqueGuestTaskContext>,
+        runtime_activity: Option<Arc<ActivityGuard>>,
     ) -> Self {
         Self {
             common: WaitableCommon::default(),
@@ -5040,6 +5200,7 @@ impl HostTask {
             state,
             embedder_context,
             terminal_observer: None,
+            runtime_activity,
         }
     }
 }
@@ -5733,6 +5894,8 @@ impl From<TableId<HostTask>> for CurrentThread {
 
 /// Represents the Component Model Async state of a store.
 pub struct ConcurrentState {
+    runtime_observer: Option<Arc<dyn RuntimeObserver>>,
+    observer_frozen: bool,
     /// The currently running thread, if any.
     current_thread: CurrentThread,
 
@@ -5744,9 +5907,9 @@ pub struct ConcurrentState {
     /// The table of waitables, waitable sets, etc.
     table: AlwaysMut<ResourceTable>,
     /// The "high priority" work queue for this store's event loop.
-    high_priority: Vec<WorkItem>,
+    high_priority: Vec<QueuedWork>,
     /// The "low priority" work queue for this store's event loop.
-    low_priority: VecDeque<WorkItem>,
+    low_priority: VecDeque<QueuedWork>,
     /// A place to stash the reason a fiber is suspending so that the code which
     /// resumed it will know under what conditions the fiber should be resumed
     /// again.
@@ -5796,6 +5959,8 @@ pub struct ConcurrentState {
 impl Default for ConcurrentState {
     fn default() -> Self {
         Self {
+            runtime_observer: None,
+            observer_frozen: false,
             current_thread: CurrentThread::None,
             table: AlwaysMut::new(ResourceTable::new()),
             futures: AlwaysMut::new(Some(FuturesUnordered::new())),
@@ -5853,7 +6018,7 @@ impl ConcurrentState {
             fibers.push(fiber);
         }
 
-        let mut handle_item = |item| match item {
+        let mut handle_item = |queued: QueuedWork| match queued.item {
             WorkItem::ResumeFiber(fiber) => {
                 fibers.push(fiber);
             }
@@ -5915,6 +6080,36 @@ impl ConcurrentState {
         self.table.get_mut().delete(Resource::from(id))
     }
 
+    /// Starts an observed activity of the given `kind`, or returns `None` when
+    /// no observer is installed. Either way the Store is marked as having
+    /// admitted work, so a later `set_runtime_observer` is rejected.
+    fn start_activity(&mut self, kind: RuntimeActivityKind) -> Option<ActivityGuard> {
+        self.observer_frozen = true;
+        let observer = self.runtime_observer.clone()?;
+        Some(ActivityGuard::new(observer, kind))
+    }
+
+    /// Like `push_future`, but reports the future as a
+    /// [`RuntimeActivityKind::Transfer`] activity and makes its identity
+    /// available through `StoreContextMut::runtime_activity` while it is polled.
+    fn push_transfer_future(&mut self, future: HostTaskFuture) {
+        let future = match self.start_activity(RuntimeActivityKind::Transfer) {
+            None => future,
+            Some(activity) => Box::pin(async move {
+                let _activity = activity;
+                let mut future = future;
+                future::poll_fn(move |cx| {
+                    let store = tls::get(|store| store.id());
+                    let _scope =
+                        observation::ActivityScope::enter(Some((store, _activity.activity)));
+                    future.as_mut().poll(cx)
+                })
+                .await
+            }),
+        };
+        self.push_future(future);
+    }
+
     fn push_future(&mut self, future: HostTaskFuture) {
         // Note that we can't directly push to `ConcurrentState::futures` here
         // since this may be called from a future that's being polled inside
@@ -5927,12 +6122,27 @@ impl ConcurrentState {
 
     fn push_high_priority(&mut self, item: WorkItem) {
         log::trace!("push high priority: {item:?}");
-        self.high_priority.push(item);
+        let activity = self.work_item_activity(&item);
+        self.high_priority.push(QueuedWork::new(item, activity));
     }
 
     fn push_low_priority(&mut self, item: WorkItem) {
         log::trace!("push low priority: {item:?}");
-        self.low_priority.push_front(item);
+        let activity = self.work_item_activity(&item);
+        self.low_priority
+            .push_front(QueuedWork::new(item, activity));
+    }
+
+    fn work_item_activity(&mut self, item: &WorkItem) -> Option<ActivityGuard> {
+        let kind = match item {
+            WorkItem::PushFuture(_) => return None,
+            WorkItem::ResumeFiber(_) | WorkItem::ResumeThread(..) => {
+                RuntimeActivityKind::StoreRetainingFiber
+            }
+            WorkItem::GuestCall(..) => RuntimeActivityKind::GuestCall,
+            WorkItem::WorkerFunction(_) => RuntimeActivityKind::WorkerFunction,
+        };
+        self.start_activity(kind)
     }
 
     fn push_work_item(&mut self, item: WorkItem, high_priority: bool) {
@@ -5971,14 +6181,23 @@ impl ConcurrentState {
         // If there's a high-priority work item to resume the current guest thread,
         // we don't need to promote anything, but we return true to indicate that
         // work is pending for the current instance.
-        if self.high_priority.iter().any(&mut predicate) {
+        if self
+            .high_priority
+            .iter()
+            .any(|queued| predicate(&queued.item))
+        {
             true
         }
         // Otherwise, look for a low-priority work item that matches the current
         // instance and promote it to high-priority.
-        else if let Some(idx) = self.low_priority.iter().position(&mut predicate) {
-            let item = self.low_priority.remove(idx).unwrap();
-            self.push_high_priority(item);
+        else if let Some(idx) = self
+            .low_priority
+            .iter()
+            .position(|queued| predicate(&queued.item))
+        {
+            let queued = self.low_priority.remove(idx).unwrap();
+            log::trace!("promote to high priority: {:?}", queued.item);
+            self.high_priority.push(queued);
             true
         } else {
             false
