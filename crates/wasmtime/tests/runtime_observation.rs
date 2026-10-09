@@ -77,6 +77,109 @@ impl StreamProducer<()> for Producer {
 struct Consumer;
 
 #[test]
+fn successive_driver_runs_are_ordered_and_saved_wakes_keep_their_run() -> wasmtime::Result<()> {
+    fn wake_old_on_clone(old: Waker) -> Waker {
+        use std::mem::ManuallyDrop;
+        use std::task::{RawWaker, RawWakerVTable};
+        fn raw(old: Arc<Waker>) -> RawWaker {
+            RawWaker::new(Arc::into_raw(old).cast(), &VTABLE)
+        }
+        unsafe fn clone(data: *const ()) -> RawWaker {
+            // The raw waker owns one Arc; cloning borrows it without consuming it.
+            let old = ManuallyDrop::new(unsafe { Arc::<Waker>::from_raw(data.cast()) });
+            old.wake_by_ref();
+            raw(Arc::clone(&old))
+        }
+        unsafe fn wake(data: *const ()) {
+            let old = unsafe { Arc::<Waker>::from_raw(data.cast()) };
+            old.wake_by_ref();
+        }
+        unsafe fn wake_by_ref(data: *const ()) {
+            let old = ManuallyDrop::new(unsafe { Arc::<Waker>::from_raw(data.cast()) });
+            old.wake_by_ref();
+        }
+        unsafe fn drop_waker(data: *const ()) {
+            drop(unsafe { Arc::<Waker>::from_raw(data.cast()) });
+        }
+        const VTABLE: RawWakerVTable = RawWakerVTable::new(clone, wake, wake_by_ref, drop_waker);
+        // Every vtable operation preserves or consumes exactly its owned Arc.
+        unsafe { Waker::from_raw(raw(Arc::new(old))) }
+    }
+
+    let mut config = Config::new();
+    config
+        .wasm_component_model_async(true)
+        .concurrency_support(true);
+    let engine = Engine::new(&config)?;
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let observed = events.clone();
+    let mut store = Store::new(&engine, ());
+    store
+        .as_context_mut()
+        .set_runtime_observer(Arc::new(move |event| {
+            observed.lock().unwrap().push(event);
+        }))?;
+    drop(store.run_concurrent(async |_| ()));
+    assert!(events.lock().unwrap().is_empty());
+
+    let saved = Arc::new(Mutex::new(None::<Waker>));
+    let captured = saved.clone();
+    let wakes = Arc::new(WakeCount::default());
+    let mut first = Box::pin(store.run_concurrent(async move |_| {
+        std::future::poll_fn(|cx| {
+            *captured.lock().unwrap() = Some(cx.waker().clone());
+            Poll::<()>::Pending
+        })
+        .await
+    }));
+    assert!(poll(first.as_mut(), &wakes).is_pending());
+    drop(first);
+    let parent = wake_old_on_clone(saved.lock().unwrap().as_ref().unwrap().clone());
+    let before = wakes.0.load(SeqCst);
+    let mut second = Box::pin(store.run_concurrent(async |_| ()));
+    assert!(
+        second
+            .as_mut()
+            .poll(&mut Context::from_waker(&parent))
+            .is_ready()
+    );
+    drop(second);
+    assert!(wakes.0.load(SeqCst) > before);
+    let polls = events
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|event| {
+            if let RuntimeObservation::DriverInvalidated {
+                run,
+                reason: RuntimeInvalidation::Poll,
+                ..
+            } = event
+            {
+                Some(*run)
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(polls.len(), 2);
+    assert!(polls[0] < polls[1]);
+    {
+        let events = events.lock().unwrap();
+        let old_wake = events.iter().position(|event| matches!(event,
+            RuntimeObservation::DriverInvalidated { run, reason: RuntimeInvalidation::Wake, .. } if *run == polls[0])).unwrap();
+        let new_poll = events.iter().position(|event| matches!(event,
+            RuntimeObservation::DriverInvalidated { run, reason: RuntimeInvalidation::Poll, .. } if *run == polls[1])).unwrap();
+        assert!(old_wake < new_poll);
+    }
+    saved.lock().unwrap().as_ref().unwrap().wake_by_ref();
+    assert!(
+        matches!(events.lock().unwrap().last(), Some(RuntimeObservation::DriverInvalidated { run, reason: RuntimeInvalidation::Wake, .. }) if *run == polls[0])
+    );
+    Ok(())
+}
+
+#[test]
 fn consumer_poll_activity_is_live_and_not_reused_after_drop() -> wasmtime::Result<()> {
     struct BufferedProducer;
     impl StreamProducer<()> for BufferedProducer {

@@ -123,9 +123,9 @@ pub use self::concurrent::{
     ErrorContext, FuncCallConcurrent, FutureAny, FutureConsumer, FutureProducer, FutureReader,
     GuardedFutureReader, GuardedStreamReader, GuestTaskId, JoinHandle, ReadBuffer,
     RuntimeActivityId, RuntimeActivityKind, RuntimeInvalidation, RuntimeObservation,
-    RuntimeObserver, Source, StreamAny, StreamConsumer, StreamProducer, StreamReader, StreamResult,
-    TerminalConsumption, TypedFuncCallConcurrent, VMComponentAsyncStore, VecBuffer, WriteBuffer,
-    current_guest_task_context,
+    RuntimeObserver, RuntimeRunId, Source, StreamAny, StreamConsumer, StreamProducer, StreamReader,
+    StreamResult, TerminalConsumption, TypedFuncCallConcurrent, VMComponentAsyncStore, VecBuffer,
+    WriteBuffer, current_guest_task_context,
 };
 pub use self::func::{
     ComponentNamedList, ComponentType, Func, Lift, Lower, TypedFunc, WasmList, WasmStr,
