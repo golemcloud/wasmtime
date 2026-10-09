@@ -20,6 +20,7 @@ use futures::task::AtomicWaker;
 use std::cell::Cell;
 
 static NEXT_RUNTIME_ID: AtomicU64 = AtomicU64::new(1);
+static NEXT_RUNTIME_RUN_ID: AtomicU64 = AtomicU64::new(1);
 
 /// An opaque identity which is never reused during a process lifetime.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -28,6 +29,29 @@ pub struct RuntimeActivityId(u64);
 impl RuntimeActivityId {
     fn next() -> Self {
         Self(NEXT_RUNTIME_ID.fetch_add(1, Ordering::Relaxed))
+    }
+}
+
+/// Identity of one driver run, ordered by admission.
+///
+/// Successive driver runs on the same Store have strictly increasing identities.
+/// A token is assigned when the driver is first polled, before registering its
+/// parent waker or emitting observations. Creating and dropping an unpolled
+/// driver does not assign a token. Notifications from old saved wakers can arrive
+/// after a newer run has started, but retain their original token.
+///
+/// Tokens are never reused. Exhausting the process-wide token space panics before
+/// a token is published; the allocator remains exhausted even if panic is caught.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct RuntimeRunId(u64);
+
+impl RuntimeRunId {
+    fn next(counter: &AtomicU64) -> Self {
+        Self(
+            counter
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
+                .expect("runtime run identity space exhausted"),
+        )
     }
 }
 
@@ -80,14 +104,14 @@ pub enum RuntimeObservation {
     /// The inner driver reached a genuine no-work boundary.
     DriverBlocked {
         /// Opaque driver run identity.
-        run: RuntimeActivityId,
+        run: RuntimeRunId,
         /// Generation invalidated by the next poll, wake, or driver drop.
         generation: usize,
     },
     /// A blocked generation was invalidated synchronously.
     DriverInvalidated {
         /// Opaque driver run identity.
-        run: RuntimeActivityId,
+        run: RuntimeRunId,
         /// Generations strictly below this watermark are invalid. Observers must retain the
         /// greatest watermark even if the blocked callback has not arrived yet.
         generation: usize,
@@ -162,7 +186,7 @@ impl Drop for ActivityGuard {
 /// publication. `start` is the epoch at the beginning of the current outer
 /// poll; a publication succeeds only if no invalidation happened since then.
 struct ProbeWake {
-    run: RuntimeActivityId,
+    run: RuntimeRunId,
     epoch: AtomicUsize,
     start: AtomicUsize,
     parent: AtomicWaker,
@@ -173,8 +197,10 @@ impl ProbeWake {
     fn invalidate(&self, reason: RuntimeInvalidation) -> usize {
         let old = self
             .epoch
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| Some((n + 2) & !1))
-            .unwrap();
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+                n.checked_add(2).map(|n| n & !1)
+            })
+            .expect("runtime driver generation exhausted");
         let generation = (old + 2) & !1;
         self.observer
             .observe(RuntimeObservation::DriverInvalidated {
@@ -207,7 +233,7 @@ pub(super) struct DriverProbe {
 impl DriverProbe {
     pub(super) fn new(observer: Arc<dyn RuntimeObserver>) -> Self {
         let probe = Arc::new(ProbeWake {
-            run: RuntimeActivityId::next(),
+            run: RuntimeRunId::next(&NEXT_RUNTIME_RUN_ID),
             epoch: AtomicUsize::new(0),
             start: AtomicUsize::new(0),
             parent: AtomicWaker::new(),
@@ -295,6 +321,42 @@ mod tests {
     use core::future;
     use core::mem;
     use std::sync::{Condvar, Mutex};
+
+    #[test]
+    fn exhausted_run_identity_allocator_never_wraps_or_recovers() {
+        let counter = AtomicU64::new(u64::MAX - 1);
+        assert_eq!(RuntimeRunId::next(&counter), RuntimeRunId(u64::MAX - 1));
+        for _ in 0..2 {
+            assert!(std::panic::catch_unwind(|| RuntimeRunId::next(&counter)).is_err());
+            assert_eq!(counter.load(Ordering::Relaxed), u64::MAX);
+        }
+    }
+
+    #[test]
+    fn exhausted_driver_generation_never_publishes_a_wrapped_watermark() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = calls.clone();
+        let probe = ProbeWake {
+            run: RuntimeRunId(1),
+            epoch: AtomicUsize::new(usize::MAX - 3),
+            start: AtomicUsize::new(0),
+            parent: AtomicWaker::new(),
+            observer: Arc::new(move |_| {
+                observed.fetch_add(1, Ordering::Relaxed);
+            }),
+        };
+        assert_eq!(probe.invalidate(RuntimeInvalidation::Poll), usize::MAX - 1);
+        for _ in 0..2 {
+            assert!(
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                    || probe.invalidate(RuntimeInvalidation::Wake)
+                ))
+                .is_err()
+            );
+            assert_eq!(probe.epoch.load(Ordering::Relaxed), usize::MAX - 1);
+            assert_eq!(calls.load(Ordering::Relaxed), 1);
+        }
+    }
 
     struct MonotonicObserver {
         state: Mutex<MonotonicState>,

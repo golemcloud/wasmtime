@@ -104,7 +104,7 @@ pub use futures_and_streams::{
 use observation::{ActivityGuard, DriverProbe};
 pub use observation::{
     RuntimeActivityId, RuntimeActivityKind, RuntimeInvalidation, RuntimeObservation,
-    RuntimeObserver,
+    RuntimeObserver, RuntimeRunId,
 };
 
 type OpaqueGuestTaskContext = Arc<dyn Any + Send + Sync>;
