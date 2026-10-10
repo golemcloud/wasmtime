@@ -2227,6 +2227,8 @@ struct TransmitState {
     terminal_observer: Option<AlwaysMut<TerminalObserver>>,
     /// Observer for the current read of a host-created stream.
     read_observer: Option<AlwaysMut<TerminalObserver>>,
+    /// Whether the pending read is settling a cancellation request.
+    read_cancelled: bool,
     /// The original creator of this stream, used for type-checking with
     /// `{Future,Stream}Any`.
     pub(super) origin: TransmitOrigin,
@@ -2249,6 +2251,7 @@ impl TransmitState {
             done: false,
             terminal_observer: None,
             read_observer: None,
+            read_cancelled: false,
             origin,
         }
     }
@@ -3856,6 +3859,7 @@ impl Instance {
             if !matches!(&transmit.read, ReadState::Open) {
                 bail_bug!("expected `ReadState::Open`; got `{:?}`", transmit.read);
             }
+            transmit.read_cancelled = false;
             transmit.read = ReadState::GuestReady {
                 ty,
                 flat_abi,
@@ -4171,6 +4175,7 @@ impl Instance {
             transmit.write
         );
 
+        transmit.read_cancelled = true;
         let waitable = Waitable::Transmit(transmit.read_handle);
         let code = if let Some(event) = waitable.take_event(state)? {
             let (Event::FutureRead { code, .. } | Event::StreamRead { code, .. }) = event else {
@@ -4325,7 +4330,12 @@ impl Instance {
             TransmitLocalState::Busy => {}
         }
         let transmit_id = store.concurrent_state_mut().get_mut(id)?.state;
-        let code = self.cancel_read(store, transmit_id, async_)?;
+        let code = match (ty, self.cancel_read(store, transmit_id, async_)?) {
+            (TransmitIndex::Stream(_), ReturnCode::Completed(count)) => {
+                ReturnCode::Cancelled(count)
+            }
+            (_, code) => code,
+        };
         if !matches!(code, ReturnCode::Blocked) {
             let state =
                 get_mut_by_index_from(self.id().get_mut(store).table_for_transmit(ty), ty, reader)?
@@ -4885,7 +4895,14 @@ impl ConcurrentState {
         handle: u32,
         code: ReturnCode,
     ) -> Result<()> {
-        let read_handle = self.get_mut(id)?.read_handle.rep();
+        let transmit = self.get_mut(id)?;
+        let read_handle = transmit.read_handle.rep();
+        let code = match (ty, code, transmit.read_cancelled) {
+            (TransmitIndex::Stream(_), ReturnCode::Completed(count), true) => {
+                ReturnCode::Cancelled(count)
+            }
+            (_, code, _) => code,
+        };
         self.set_event(
             read_handle,
             match ty {

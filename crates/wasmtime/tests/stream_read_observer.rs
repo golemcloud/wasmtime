@@ -59,6 +59,7 @@ const COMPONENT: &str = r#"
 struct Producer {
     pending: bool,
     terminal: bool,
+    retain_on_cancel: bool,
     registered: bool,
     observed: Arc<Mutex<Vec<TerminalConsumption>>>,
 }
@@ -81,12 +82,14 @@ impl StreamProducer<()> for Producer {
                 observed.lock().unwrap().push(event);
             })?;
         }
-        if finish {
+        if finish && !self.retain_on_cancel {
             return Poll::Ready(Ok(StreamResult::Cancelled));
         }
-        if self.pending {
-            self.pending = false;
-            cx.waker().wake_by_ref();
+        if self.pending && !finish {
+            if !self.retain_on_cancel {
+                self.pending = false;
+                cx.waker().wake_by_ref();
+            }
             return Poll::Pending;
         }
         if self.terminal {
@@ -214,6 +217,7 @@ async fn observes_each_guest_read_at_consumption_not_production() -> Result<()> 
             Producer {
                 pending,
                 terminal,
+                retain_on_cancel: false,
                 registered: false,
                 observed: observed.clone(),
             },
@@ -223,6 +227,103 @@ async fn observes_each_guest_read_at_consumption_not_production() -> Result<()> 
             .call_async(&mut store, (reader,))
             .await?;
         assert_eq!(*observed.lock().unwrap(), vec![expected]);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn pending_cancellation_preserves_partial_count_and_cancelled_tag() -> Result<()> {
+    let mut config = Config::new();
+    config.wasm_component_model_async(true);
+    config.wasm_component_model_more_async_builtins(true);
+    let engine = Engine::new(&config)?;
+    for async_cancel in [false, true] {
+        for count in [0, 1] {
+            let observed = Arc::new(Mutex::new(Vec::new()));
+            let mut linker = Linker::<()>::new(&engine);
+            linker.root().func_wrap("check", |_, _: (bool,)| Ok(()))?;
+            let body = if async_cancel {
+                format!(
+                    r#"
+                    (call $read (local.get $reader) (i32.const 0x100) (i32.const {count}))
+                    i32.const -1 i32.ne if unreachable end
+                    (call $cancel (local.get $reader))
+                    i32.const -1 i32.ne if unreachable end
+                    (local.set $set (call $new-set))
+                    (call $join (local.get $reader) (local.get $set))
+                    (drop (call $wait (local.get $set) (i32.const 0x200)))
+                    (call $join (local.get $reader) (i32.const 0))
+                    (call $drop-set (local.get $set))
+                    (call $drop (local.get $reader))
+                    "#
+                )
+            } else {
+                format!(
+                    r#"
+                    (call $read (local.get $reader) (i32.const 0x100) (i32.const {count}))
+                    i32.const -1 i32.ne if unreachable end
+                    (call $cancel (local.get $reader))
+                    i32.const {} i32.ne if unreachable end
+                    (call $drop (local.get $reader))
+                    "#,
+                    count * 16 + 2,
+                )
+            };
+            let source = COMPONENT
+                .replace("$BODY", &body)
+                .replace(
+                    "(core module $m",
+                    "(core module $m (import \"\" \"memory\" (memory 1))",
+                )
+                .replace(
+                    "(export \"read\" (func $read))",
+                    "(export \"memory\" (memory $libc \"memory\")) (export \"read\" (func $read))",
+                );
+            let source = if async_cancel {
+                source
+                    .replace("(canon stream.cancel-read $s)", "(canon stream.cancel-read $s async)")
+                    .replace(
+                        "(call $join (local.get $reader) (i32.const 0))",
+                        &format!(
+                            "(i32.load (i32.const 0x204)) i32.const {} i32.ne if unreachable end (call $join (local.get $reader) (i32.const 0))",
+                            count * 16 + 2,
+                        ),
+                    )
+            } else {
+                source
+            };
+            let component = Component::new(&engine, source)?;
+            let mut store = Store::new(&engine, ());
+            let instance = linker.instantiate_async(&mut store, &component).await?;
+            let reader = StreamReader::new(
+                &mut store,
+                Producer {
+                    pending: true,
+                    terminal: false,
+                    retain_on_cancel: true,
+                    registered: false,
+                    observed: observed.clone(),
+                },
+            )?;
+            instance
+                .get_typed_func::<(StreamReader<u8>,), ()>(&mut store, "run")?
+                .call_async(&mut store, (reader,))
+                .await
+                .map_err(|error| {
+                    wasmtime::Error::msg(format!(
+                        "async_cancel={async_cancel}, count={count}: {error:?}"
+                    ))
+                })?;
+            assert_eq!(
+                *observed.lock().unwrap(),
+                vec![if count == 0 {
+                    TerminalConsumption::NotDelivered
+                } else {
+                    TerminalConsumption::Delivered
+                }],
+                "async_cancel={async_cancel}, count={count}",
+            );
+        }
     }
     Ok(())
 }
@@ -258,6 +359,7 @@ async fn store_teardown_does_not_report_guest_cancellation() -> Result<()> {
         Producer {
             pending: true,
             terminal: false,
+            retain_on_cancel: false,
             registered: false,
             observed: observed.clone(),
         },
