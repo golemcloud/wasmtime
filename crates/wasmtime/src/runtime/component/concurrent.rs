@@ -453,15 +453,17 @@ where
     runtime_activity: Option<RuntimeActivityId>,
 }
 
-/// How the guest consumed a terminal completion observed by the host.
+/// How the guest consumed a completion observed by the host.
 ///
 /// Passed to observers registered via [`Accessor::register_terminal_observer`] or
-/// [`FutureReader::register_terminal_observer`](crate::component::FutureReader::register_terminal_observer).
+/// [`FutureReader::register_terminal_observer`](crate::component::FutureReader::register_terminal_observer),
+/// and to per-read observers registered via
+/// [`Destination::register_read_observer`](crate::component::Destination::register_read_observer).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TerminalConsumption {
-    /// The successful terminal was received by the guest.
+    /// The successful completion was received by the guest.
     Delivered,
-    /// The terminal was consumed without the guest observing a successful result.
+    /// The completion was consumed without the guest observing a successful result.
     NotDelivered,
     /// The observer was replaced by a newer observer for the same terminal.
     Superseded,

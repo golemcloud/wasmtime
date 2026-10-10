@@ -26,6 +26,7 @@ const COMPONENT: &str = r#"
     (import "" "wait" (func $wait (param i32 i32) (result i32)))
     (import "" "drop-set" (func $drop-set (param i32)))
     (import "" "check" (func $check (param i32)))
+    (import "" "yield" (func $yield (result i32)))
     (func (export "run") (param $reader i32)
       (local $set i32)
       $BODY
@@ -40,12 +41,14 @@ const COMPONENT: &str = r#"
   (canon waitable-set.wait (memory $libc "memory") (core func $wait))
   (canon waitable-set.drop (core func $drop-set))
   (core func $check (canon lower (func $check)))
+  (core func $yield (canon thread.yield))
   (core instance $i (instantiate $m
     (with "" (instance
       (export "read" (func $read)) (export "cancel" (func $cancel))
       (export "drop" (func $drop)) (export "join" (func $join))
       (export "new-set" (func $new-set)) (export "wait" (func $wait))
       (export "drop-set" (func $drop-set)) (export "check" (func $check))
+      (export "yield" (func $yield))
     ))
   ))
   (func (export "run") async (param "reader" $s)
@@ -162,6 +165,34 @@ async fn observes_each_guest_read_at_consumption_not_production() -> Result<()> 
             false,
             TerminalConsumption::Delivered,
         ),
+        (
+            r#"
+          (drop (call $read (local.get $reader) (i32.const 0x100) (i32.const 1)))
+          (drop (call $yield)) (drop (call $yield)) (drop (call $yield))
+          (call $check (i32.const 0))
+          (call $cancel (local.get $reader))
+          i32.const 18 i32.ne if unreachable end
+          (call $check (i32.const 1))
+          (call $drop (local.get $reader))
+        "#,
+            true,
+            false,
+            TerminalConsumption::Delivered,
+        ),
+        (
+            r#"
+          (drop (call $read (local.get $reader) (i32.const 0x100) (i32.const 0)))
+          (drop (call $yield)) (drop (call $yield)) (drop (call $yield))
+          (call $check (i32.const 0))
+          (call $cancel (local.get $reader))
+          i32.const 2 i32.ne if unreachable end
+          (call $check (i32.const 1))
+          (call $drop (local.get $reader))
+        "#,
+            true,
+            false,
+            TerminalConsumption::NotDelivered,
+        ),
     ] {
         let observed = Arc::new(Mutex::new(Vec::new()));
         let checked = observed.clone();
@@ -193,5 +224,52 @@ async fn observes_each_guest_read_at_consumption_not_production() -> Result<()> 
             .await?;
         assert_eq!(*observed.lock().unwrap(), vec![expected]);
     }
+    Ok(())
+}
+
+#[tokio::test]
+async fn store_teardown_does_not_report_guest_cancellation() -> Result<()> {
+    let mut config = Config::new();
+    config.wasm_component_model_async(true);
+    config.wasm_component_model_more_async_builtins(true);
+    let engine = Engine::new(&config)?;
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    let checked = observed.clone();
+    let mut linker = Linker::<()>::new(&engine);
+    linker.root().func_wrap("check", move |_, _: (bool,)| {
+        assert!(checked.lock().unwrap().is_empty());
+        Ok(())
+    })?;
+    let component = Component::new(
+        &engine,
+        COMPONENT.replace(
+            "$BODY",
+            r#"
+          (drop (call $read (local.get $reader) (i32.const 0x100) (i32.const 1)))
+          (call $check (i32.const 0))
+          unreachable
+        "#,
+        ),
+    )?;
+    let mut store = Store::new(&engine, ());
+    let instance = linker.instantiate_async(&mut store, &component).await?;
+    let reader = StreamReader::new(
+        &mut store,
+        Producer {
+            pending: true,
+            terminal: false,
+            registered: false,
+            observed: observed.clone(),
+        },
+    )?;
+    assert!(
+        instance
+            .get_typed_func::<(StreamReader<u8>,), ()>(&mut store, "run")?
+            .call_async(&mut store, (reader,))
+            .await
+            .is_err()
+    );
+    drop(store);
+    assert!(observed.lock().unwrap().is_empty());
     Ok(())
 }
