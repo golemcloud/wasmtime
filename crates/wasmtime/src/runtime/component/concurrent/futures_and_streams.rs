@@ -1,8 +1,8 @@
 use super::table::{TableDebug, TableId};
 use super::{Event, GlobalErrorContextRefCount, Waitable, WaitableCommon};
 use crate::component::concurrent::{
-    ConcurrentState, QualifiedThreadId, Status, TerminalConsumption, TerminalObserver, WorkItem,
-    tls,
+    Accessor, AccessorTask, ConcurrentState, HostTaskFuture, QualifiedThreadId, Status,
+    TerminalConsumption, TerminalObserver, WorkItem, tls,
 };
 use crate::component::func::{self, LiftContext, LowerContext};
 use crate::component::matching::InstanceType;
@@ -42,6 +42,74 @@ use wasmtime_environ::component::{
 };
 
 pub use buffers::{ReadBuffer, VecBuffer, WriteBuffer};
+
+/// A host-created stream's guest read boundary.
+///
+/// Results use the canonical packed copy-result ABI: `u32::MAX` is Blocked;
+/// otherwise the count is `result >> 4` and the low bits are 0 (completed),
+/// 1 (writable end dropped / EOF), or 2 (cancelled).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StreamReadBoundary {
+    /// A valid Busy read is about to be cancelled, before result selection.
+    BeforeCancel,
+    /// The original read invocation is about to return.
+    ReadReturn {
+        /// Selected canonical copy result.
+        result: u32,
+    },
+    /// A cancellation invocation is about to return. Blocked leaves the same
+    /// read Busy, so multiple cancellations may precede one settlement.
+    CancelReturn {
+        /// Selected canonical copy result.
+        result: u32,
+    },
+    /// The result is about to be consumed, inline or by waitable delivery.
+    /// Positive cancellation and EOF are delivered; zero cancellation is not.
+    Settled {
+        /// Canonical copy result being consumed.
+        result: u32,
+        /// Whether the guest observes delivery of the result.
+        consumption: TerminalConsumption,
+    },
+}
+
+/// Targeted progress requested at [`StreamReadBoundary::BeforeCancel`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StreamReadProgress {
+    /// Use the transfer's current readiness. Replay producers must gate
+    /// completion to preserve a recorded Blocked cancellation.
+    Continue,
+    /// Complete this transfer before native cancellation selects its result.
+    Complete,
+    /// First request `finish=true`, then complete this transfer. This permits
+    /// zero-progress cancellation without receiving another producer item.
+    Cancel,
+}
+
+type ReadControl =
+    Box<dyn FnMut(StreamReadBoundary) -> (StreamReadProgress, Option<HostTaskFuture>) + Send>;
+type ReadLowering = Box<dyn FnOnce(&mut dyn VMStore) -> Result<()> + Send>;
+
+#[derive(Default)]
+struct ReadTransfer {
+    future: Option<HostTaskFuture>,
+    lowering: Option<ReadLowering>,
+}
+
+/// Poll the one existing transfer, without holding its cell during callbacks.
+fn poll_read_transfer(
+    transfer: &LockedState<ReadTransfer>,
+    cx: &mut Context<'_>,
+) -> Poll<Result<()>> {
+    let Some(mut future) = transfer.with(|t| t.future.take())? else {
+        return Poll::Ready(Ok(()));
+    };
+    let poll = future.as_mut().poll(cx);
+    if poll.is_pending() {
+        transfer.with(|t| t.future = Some(future))?;
+    }
+    poll
+}
 
 mod buffers;
 
@@ -418,6 +486,70 @@ impl<'a, T, B> Destination<'a, T, B> {
             bail!("guest read already has a consumption observer");
         }
         transmit.read_observer = Some(AlwaysMut::new(Box::new(observer)));
+        Ok(())
+    }
+
+    /// Registers invisible host control at this guest read's ABI boundaries.
+    ///
+    /// Returning a task releases the fiber's Store and runs only that
+    /// task, with an [`Accessor`], before resuming the builtin exactly once.
+    /// No other guest fibers, callbacks, or guest-entering lowering/realloc can
+    /// overtake it. No task leaves the boundary unchanged. The selected canonical
+    /// result is never rewritten, and this wait does not itself return Blocked.
+    /// To reproduce an original async read's Blocked result, the producer must
+    /// return `Poll::Pending` on its initial poll.
+    ///
+    /// Control must not enter guest code, drive the event loop recursively, or
+    /// wait for guest progress or ordinary queued host tasks. Prepare those
+    /// dependencies before the boundary. Independently driven I/O is allowed.
+    /// Task errors trap; dropping the driver disposes the suspended fiber.
+    ///
+    /// Return `(progress, task)`. Progress other than `Continue` is legal only
+    /// at `BeforeCancel`, after the task completes. It drives only this read's
+    /// existing transfer. If canonical lowering requires guest realloc, host
+    /// control unwinds first and the cancelling fiber executes that transfer's
+    /// lowering, then returns to host-only progression. This explicit lowering
+    /// phase is not a host-control wait and does not run unrelated guest work.
+    /// No synthetic result is returned: native cancellation consumes the real
+    /// event. A replay producer must keep completion gated until authorized;
+    /// a completed event cannot be made Blocked again.
+    ///
+    /// The hook survives Blocked returns and repeated cancellation of the same
+    /// Busy read. Settlement precedes the consumption observer. Settlement or
+    /// readable-end drop removes the hook; Store teardown only drops it and
+    /// never synthesizes consumption. `finish=true` still settles only the
+    /// current transfer, not the producer.
+    ///
+    /// Returns an error for a host read or a duplicate hook on this read.
+    pub fn register_read_control<D: 'static, F, C>(
+        &mut self,
+        mut store: impl AsContextMut<Data = D>,
+        mut control: F,
+    ) -> Result<()>
+    where
+        F: FnMut(StreamReadBoundary) -> (StreamReadProgress, Option<C>) + Send + 'static,
+        C: AccessorTask<D>,
+    {
+        let mut store = store.as_context_mut();
+        let token = StoreToken::new(store.as_context_mut());
+        let transmit = store.0.concurrent_state_mut().get_mut(self.id)?;
+        if !matches!(transmit.read, ReadState::GuestReady { .. }) {
+            bail!("read control requires a guest read");
+        }
+        if transmit.read_control.is_some() {
+            bail!("guest read already has a control hook");
+        }
+        transmit
+            .read_transfer
+            .get_or_insert_with(|| Arc::new(LockedState::new(ReadTransfer::default())));
+        transmit.read_control = Some(AlwaysMut::new(Box::new(move |boundary| {
+            let (progress, task) = control(boundary);
+            let task = task.map(|task| {
+                let accessor = Accessor::new(token);
+                Box::pin(async move { task.run(&accessor).await }) as HostTaskFuture
+            });
+            (progress, task)
+        })));
         Ok(())
     }
 
@@ -2212,7 +2344,7 @@ impl TableDebug for TransmitHandle {
 }
 
 /// Represents the state of a stream or future.
-struct TransmitState {
+pub(super) struct TransmitState {
     /// The write end of the stream or future.
     write_handle: TableId<TransmitHandle>,
     /// The read end of the stream or future.
@@ -2227,6 +2359,9 @@ struct TransmitState {
     terminal_observer: Option<AlwaysMut<TerminalObserver>>,
     /// Observer for the current read of a host-created stream.
     read_observer: Option<AlwaysMut<TerminalObserver>>,
+    /// Control hook for the current read, including its Busy cancellation sequence.
+    read_control: Option<AlwaysMut<ReadControl>>,
+    read_transfer: Option<Arc<LockedState<ReadTransfer>>>,
     /// Whether the pending read is settling a cancellation request.
     read_cancelled: bool,
     /// The original creator of this stream, used for type-checking with
@@ -2242,6 +2377,22 @@ pub(super) enum TransmitOrigin {
 }
 
 impl TransmitState {
+    pub(super) fn take_read_control_future(&mut self) -> Option<HostTaskFuture> {
+        let transfer = self.read_transfer.take()?;
+        let (future, lowering) = transfer
+            .with(|t| (t.future.take(), t.lowering.take()))
+            .unwrap();
+        // The caller drops this future under TLS during Store teardown, just
+        // like the normal transfer collection. Never report consumption here.
+        Some(Box::pin(async move {
+            let _lowering = lowering;
+            if let Some(future) = future {
+                future.await?;
+            }
+            Ok(())
+        }))
+    }
+
     fn new(origin: TransmitOrigin) -> Self {
         Self {
             write_handle: TableId::new(u32::MAX),
@@ -2251,6 +2402,8 @@ impl TransmitState {
             done: false,
             terminal_observer: None,
             read_observer: None,
+            read_control: None,
+            read_transfer: None,
             read_cancelled: false,
             origin,
         }
@@ -2461,8 +2614,27 @@ impl StoreOpaque {
             })
         };
 
-        self.concurrent_state_mut()
-            .push_transfer_future(future.boxed());
+        // Keep one owner cell even before a control hook is registered: a
+        // later producer poll can attach control to this same pending read.
+        let transfer = if matches!(kind, TransmitKind::Stream) {
+            Some(
+                self.concurrent_state_mut()
+                    .get_mut(id)
+                    .unwrap()
+                    .read_transfer
+                    .get_or_insert_with(|| Arc::new(LockedState::new(ReadTransfer::default())))
+                    .clone(),
+            )
+        } else {
+            None
+        };
+        let future = if let Some(transfer) = transfer {
+            transfer.with(|t| t.future = Some(future.boxed())).unwrap();
+            future::poll_fn(move |cx| poll_read_transfer(&transfer, cx)).boxed()
+        } else {
+            future.boxed()
+        };
+        self.concurrent_state_mut().push_transfer_future(future);
     }
 
     /// Drop the read end of a stream or future read from the host.
@@ -3113,15 +3285,31 @@ async fn write<D: 'static, P: Send + 'static, T: func::Lower + 'static, B: Write
                     // host embedder frames on the stack is unsound.
                     let (tx, rx) = oneshot::channel();
                     tls::get(move |store| {
+                        let lowering: ReadLowering = Box::new(move |store| {
+                            _ = tx.send(accept(token.as_context_mut(store))?);
+                            Ok(())
+                        });
+                        let transfer = store
+                            .concurrent_state_mut()
+                            .get_mut(id)?
+                            .read_transfer
+                            .clone();
+                        let lowering = if let Some(transfer) = transfer {
+                            transfer.with(|t| t.lowering = Some(lowering))?;
+                            Box::new(move |store: &mut dyn VMStore| {
+                                if let Some(lowering) = transfer.with(|t| t.lowering.take())? {
+                                    lowering(store)?;
+                                }
+                                Ok(())
+                            }) as ReadLowering
+                        } else {
+                            lowering
+                        };
                         store
                             .concurrent_state_mut()
-                            .push_high_priority(WorkItem::WorkerFunction(AlwaysMut::new(Box::new(
-                                move |store| {
-                                    _ = tx.send(accept(token.as_context_mut(store))?);
-                                    Ok(())
-                                },
-                            ))))
-                    });
+                            .push_high_priority(WorkItem::WorkerFunction(AlwaysMut::new(lowering)));
+                        crate::error::Ok(())
+                    })?;
                     match rx.await {
                         Ok(r) => r,
                         Err(oneshot::Canceled) => bail_bug!("work cancelled"),
@@ -4046,10 +4234,22 @@ impl Instance {
                 .consume_future_terminal(transmit_handle, TerminalConsumption::Delivered);
         }
         if matches!(ty, TransmitIndex::Stream(_)) && result != ReturnCode::Blocked {
+            store.0.stream_read_control(
+                transmit_handle,
+                StreamReadBoundary::ReadReturn {
+                    result: result.encode(),
+                },
+            )?;
             store
                 .0
-                .concurrent_state_mut()
-                .consume_stream_read(transmit_handle, TerminalConsumption::Delivered);
+                .stream_read_settled(transmit_handle, result, TerminalConsumption::Delivered)?;
+        } else if matches!(ty, TransmitIndex::Stream(_)) {
+            store.0.stream_read_control(
+                transmit_handle,
+                StreamReadBoundary::ReadReturn {
+                    result: result.encode(),
+                },
+            )?;
         }
 
         Ok(result)
@@ -4197,23 +4397,11 @@ impl Instance {
                     TerminalConsumption::NotDelivered,
                 );
             }
-            if matches!(event, Event::StreamRead { .. }) {
-                let Waitable::Transmit(handle) = waitable else {
-                    unreachable!();
-                };
-                store.concurrent_state_mut().consume_stream_read(
-                    handle,
-                    match code {
-                        ReturnCode::Completed(count) if count > 0 => TerminalConsumption::Delivered,
-                        ReturnCode::Dropped(_) => TerminalConsumption::Delivered,
-                        _ => TerminalConsumption::NotDelivered,
-                    },
-                );
-            }
             match (code, event) {
                 (ReturnCode::Completed(count), Event::StreamRead { .. }) => {
                     ReturnCode::Cancelled(count)
                 }
+                (ReturnCode::Cancelled(_), Event::StreamRead { .. }) => code,
                 (ReturnCode::Dropped(_) | ReturnCode::Completed(_), _) => code,
                 _ => bail_bug!("unexpected code/event combo"),
             }
@@ -4330,12 +4518,24 @@ impl Instance {
             TransmitLocalState::Busy => {}
         }
         let transmit_id = store.concurrent_state_mut().get_mut(id)?.state;
+        if matches!(ty, TransmitIndex::Stream(_)) {
+            let progress = store.stream_read_control(id, StreamReadBoundary::BeforeCancel)?;
+            store.progress_read_transfer(transmit_id, progress)?;
+        }
         let code = match (ty, self.cancel_read(store, transmit_id, async_)?) {
             (TransmitIndex::Stream(_), ReturnCode::Completed(count)) => {
                 ReturnCode::Cancelled(count)
             }
             (_, code) => code,
         };
+        if matches!(ty, TransmitIndex::Stream(_)) {
+            store.stream_read_control(
+                id,
+                StreamReadBoundary::CancelReturn {
+                    result: code.encode(),
+                },
+            )?;
+        }
         if !matches!(code, ReturnCode::Blocked) {
             let state =
                 get_mut_by_index_from(self.id().get_mut(store).table_for_transmit(ty), ty, reader)?
@@ -4344,8 +4544,9 @@ impl Instance {
                 *state = TransmitLocalState::Read { done: false };
             }
             if matches!(ty, TransmitIndex::Stream(_)) {
-                store.concurrent_state_mut().consume_stream_read(
+                store.stream_read_settled(
                     id,
+                    code,
                     match code {
                         ReturnCode::Cancelled(count) | ReturnCode::Completed(count)
                             if count > 0 =>
@@ -4355,7 +4556,7 @@ impl Instance {
                         ReturnCode::Dropped(_) => TerminalConsumption::Delivered,
                         _ => TerminalConsumption::NotDelivered,
                     },
-                );
+                )?;
             }
         }
         Ok(code)
@@ -4388,6 +4589,17 @@ impl Instance {
             store
                 .concurrent_state_mut()
                 .consume_stream_read(id, TerminalConsumption::NotDelivered);
+            let transmit_id = store.concurrent_state_mut().get_mut(id)?.state;
+            store
+                .concurrent_state_mut()
+                .get_mut(transmit_id)?
+                .read_control
+                .take();
+            store
+                .concurrent_state_mut()
+                .get_mut(transmit_id)?
+                .read_transfer
+                .take();
         }
         store.host_drop_reader(id, kind)
     }
@@ -5115,7 +5327,11 @@ impl Waitable {
     /// immediately before invoking a guest callback with the event arguments. A callback may
     /// resume arbitrary guest code and drop the host subtask before returning, so notifying after
     /// it returns is too late.
-    pub(super) fn notify_terminal_observer(&self, store: &mut StoreOpaque, event: Event) {
+    pub(super) fn notify_terminal_observer(
+        &self,
+        store: &mut StoreOpaque,
+        event: Event,
+    ) -> Result<()> {
         match (self, event) {
             (
                 Waitable::Host(host_task),
@@ -5139,18 +5355,109 @@ impl Waitable {
                 .concurrent_state_mut()
                 .consume_future_terminal(*handle, TerminalConsumption::Delivered),
             (Waitable::Transmit(handle), Event::StreamRead { code, .. }) => {
-                store.concurrent_state_mut().consume_stream_read(
+                store.stream_read_settled(
                     *handle,
+                    code,
                     match code {
                         ReturnCode::Cancelled(count) if count == 0 => {
                             TerminalConsumption::NotDelivered
                         }
                         _ => TerminalConsumption::Delivered,
                     },
-                );
+                )?;
             }
             _ => {}
         }
+        Ok(())
+    }
+}
+
+impl StoreOpaque {
+    fn stream_read_control(
+        &mut self,
+        handle: TableId<TransmitHandle>,
+        boundary: StreamReadBoundary,
+    ) -> Result<StreamReadProgress> {
+        let state = self.concurrent_state_mut();
+        let id = state.get_mut(handle)?.state;
+        let (progress, control) = state
+            .get_mut(id)?
+            .read_control
+            .as_mut()
+            .map(|control| control.get_mut()(boundary))
+            .unwrap_or((StreamReadProgress::Continue, None));
+        if boundary != StreamReadBoundary::BeforeCancel && progress != StreamReadProgress::Continue
+        {
+            bail!("transfer progress is only valid before cancellation");
+        }
+        if let Some(control) = control {
+            self.run_builtin_control(control)?;
+        }
+        Ok(progress)
+    }
+
+    fn progress_read_transfer(
+        &mut self,
+        id: TableId<TransmitState>,
+        progress: StreamReadProgress,
+    ) -> Result<()> {
+        if progress == StreamReadProgress::Continue {
+            return Ok(());
+        }
+        let transmit = self.concurrent_state_mut().get_mut(id)?;
+        let Some(transfer) = transmit.read_transfer.clone() else {
+            bail!("targeted progression requires a host read control hook");
+        };
+        // An already-published event must be consumed as-is. Do not leave a
+        // finish request on the producer for the next, unrelated read.
+        if progress == StreamReadProgress::Cancel && transfer.with(|t| t.future.is_some())? {
+            transmit.read_cancelled = true;
+            if let WriteState::HostReady { cancel, .. } = &mut transmit.write {
+                *cancel = true;
+            }
+        }
+        loop {
+            let poll_transfer = transfer.clone();
+            self.run_builtin_control(Box::pin(future::poll_fn(move |cx| {
+                let poll = poll_read_transfer(&poll_transfer, cx);
+                if poll.is_pending() && poll_transfer.with(|t| t.lowering.is_some())? {
+                    Poll::Ready(Ok(()))
+                } else {
+                    poll
+                }
+            })))?;
+            if let Some(lowering) = transfer.with(|t| t.lowering.take())? {
+                // All embedder poll frames have unwound. Only this transfer's
+                // canonical lowering may enter the guest in this phase.
+                // SAFETY: exclusively reborrow this Store for the lowering.
+                lowering(unsafe { self.traitobj().as_mut() })?;
+            }
+            if transfer.with(|t| t.future.is_none())? {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    fn stream_read_settled(
+        &mut self,
+        handle: TableId<TransmitHandle>,
+        code: ReturnCode,
+        consumption: TerminalConsumption,
+    ) -> Result<()> {
+        self.stream_read_control(
+            handle,
+            StreamReadBoundary::Settled {
+                result: code.encode(),
+                consumption,
+            },
+        )?;
+        let state = self.concurrent_state_mut();
+        let id = state.get_mut(handle)?.state;
+        state.get_mut(id)?.read_control.take();
+        state.get_mut(id)?.read_transfer.take();
+        state.consume_stream_read(handle, consumption);
+        Ok(())
     }
 }
 
