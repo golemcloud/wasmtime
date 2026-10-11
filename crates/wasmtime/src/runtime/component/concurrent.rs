@@ -2781,6 +2781,42 @@ impl StoreOpaque {
         self.suspend(SuspendReason::BuiltinControl)
     }
 
+    /// Park only the caller while normally scheduled work admits a builtin.
+    /// The private set cannot be woken by guest events or `thread.resume`.
+    fn run_builtin_admission(&mut self, admission: HostTaskFuture) -> Result<()> {
+        let state = self.concurrent_state_mut();
+        let thread = state.current_guest_thread()?;
+        let set = state.push(WaitableSet::default())?;
+        let (send, mut receive) = oneshot::channel();
+        state.push_future(Box::pin(async move {
+            let result = admission.await;
+            tls::get(move |store| {
+                let state = store.concurrent_state_mut();
+                // Even an error wakes the caller so it can unwind the builtin.
+                let _ = send.send(result);
+                let Some(WaitMode::Fiber(fiber)) = state.get_mut(set)?.waiting.remove(&thread)
+                else {
+                    bail_bug!("builtin admission caller missing");
+                };
+                state.push_high_priority(WorkItem::ResumeFiber(fiber));
+                Ok(())
+            })
+        }));
+        let suspended = self.suspend(SuspendReason::Waiting {
+            set,
+            thread,
+            // This invisible host wait does not make the canonical builtin a
+            // guest blocking operation, including in callback contexts.
+            skip_may_block_check: true,
+        });
+        self.concurrent_state_mut().delete(set)?;
+        suspended?;
+        match receive.try_recv()? {
+            Some(result) => result,
+            None => bail_bug!("builtin admission resumed before completion"),
+        }
+    }
+
     fn wait_for_event(&mut self, waitable: Waitable) -> Result<()> {
         let state = self.concurrent_state_mut();
 

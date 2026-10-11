@@ -50,6 +50,11 @@ pub use buffers::{ReadBuffer, VecBuffer, WriteBuffer};
 /// 1 (writable end dropped / EOF), or 2 (cancelled).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StreamReadBoundary {
+    /// Admit each cancellation before exclusive control. Its optional task
+    /// parks only the caller, allowing ordinary host and guest work to run.
+    /// Only [`StreamReadProgress::Continue`] is legal here. After admission,
+    /// the same Busy read is revalidated before entering `BeforeCancel`.
+    BeforeCancelAdmission,
     /// A valid Busy read is about to be cancelled, before result selection.
     BeforeCancel,
     /// The original read invocation is about to return.
@@ -491,16 +496,27 @@ impl<'a, T, B> Destination<'a, T, B> {
 
     /// Registers invisible host control at this guest read's ABI boundaries.
     ///
-    /// Returning a task releases the fiber's Store and runs only that
-    /// task, with an [`Accessor`], before resuming the builtin exactly once.
+    /// At `BeforeCancelAdmission`, a task parks only the cancelling fiber and
+    /// runs with ordinary scheduling. Use it to await earlier actual guest
+    /// consumption and reserve the exact replay cancellation boundary. Keep
+    /// the producer gated and retain that admission in per-read host state;
+    /// `BeforeCancel` must use it without awaiting suppressed guest work.
+    /// Admission does not select a result or progress the native transfer.
+    /// If another fiber consumes or replaces this Busy read during admission,
+    /// cancellation traps rather than targeting a different read.
+    /// Admission errors trap; Store teardown drops the task and its admission
+    /// state without synthesizing guest consumption.
+    ///
+    /// At all other boundaries, a task releases the fiber's Store and runs only
+    /// that task, with an [`Accessor`], before resuming the builtin exactly once.
     /// No other guest fibers, callbacks, or guest-entering lowering/realloc can
     /// overtake it. No task leaves the boundary unchanged. The selected canonical
     /// result is never rewritten, and this wait does not itself return Blocked.
     /// To reproduce an original async read's Blocked result, the producer must
     /// return `Poll::Pending` on its initial poll.
     ///
-    /// Control must not enter guest code, drive the event loop recursively, or
-    /// wait for guest progress or ordinary queued host tasks. Prepare those
+    /// Exclusive control must not enter guest code, drive the event loop
+    /// recursively, or wait for guest progress or ordinary queued host tasks. Prepare those
     /// dependencies before the boundary. Independently driven I/O is allowed.
     /// Task errors trap; dropping the driver disposes the suspended fiber.
     ///
@@ -4519,6 +4535,28 @@ impl Instance {
         }
         let transmit_id = store.concurrent_state_mut().get_mut(id)?.state;
         if matches!(ty, TransmitIndex::Stream(_)) {
+            let transfer = store
+                .concurrent_state_mut()
+                .get_mut(transmit_id)?
+                .read_transfer
+                .clone();
+            store.stream_read_control(id, StreamReadBoundary::BeforeCancelAdmission)?;
+            let (rep, local) =
+                get_mut_by_index_from(self.id().get_mut(store).table_for_transmit(ty), ty, reader)?;
+            let same_handle = rep == id.rep() && matches!(local, TransmitLocalState::Busy);
+            let current_id = store.concurrent_state_mut().get_mut(id)?.state;
+            let current = &store
+                .concurrent_state_mut()
+                .get_mut(current_id)?
+                .read_transfer;
+            let same_transfer = match (&transfer, current) {
+                (Some(before), Some(after)) => Arc::ptr_eq(before, after),
+                (None, None) => true,
+                _ => false,
+            };
+            if !same_handle || current_id != transmit_id || !same_transfer {
+                bail!("stream read changed during cancellation admission");
+            }
             let progress = store.stream_read_control(id, StreamReadBoundary::BeforeCancel)?;
             store.progress_read_transfer(transmit_id, progress)?;
         }
@@ -5391,7 +5429,11 @@ impl StoreOpaque {
             bail!("transfer progress is only valid before cancellation");
         }
         if let Some(control) = control {
-            self.run_builtin_control(control)?;
+            if boundary == StreamReadBoundary::BeforeCancelAdmission {
+                self.run_builtin_admission(control)?;
+            } else {
+                self.run_builtin_control(control)?;
+            }
         }
         Ok(progress)
     }

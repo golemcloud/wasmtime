@@ -381,6 +381,7 @@ async fn store_teardown_does_not_report_guest_cancellation() -> Result<()> {
 #[derive(Default)]
 struct ControlState {
     ready: bool,
+    admit: bool,
     boundaries: Vec<StreamReadBoundary>,
     controls: usize,
     guest_steps: usize,
@@ -425,8 +426,10 @@ impl AccessorTask<ControlState> for ControlTask {
         }
         accessor.with(|mut store| {
             let state = store.data_mut();
-            assert_eq!(state.guest_steps, guest_steps, "guest overtook control");
-            assert_eq!(state.reallocs, reallocs, "realloc overtook control");
+            if self.0 != StreamReadBoundary::BeforeCancelAdmission {
+                assert_eq!(state.guest_steps, guest_steps, "guest overtook control");
+                assert_eq!(state.reallocs, reallocs, "realloc overtook control");
+            }
             state.boundaries.push(self.0);
         });
         Ok(())
@@ -460,8 +463,12 @@ impl<T: Lower + Clone + Unpin + Send + 'static> StreamProducer<ControlState>
             self.registered = true;
             let progress = self.progress;
             let blocked_cancels = self.blocked_cancels;
+            let admit = store.data().admit;
             let mut cancels = 0;
             destination.register_read_control(&mut store, move |boundary| {
+                if boundary == StreamReadBoundary::BeforeCancelAdmission && !admit {
+                    return (StreamReadProgress::Continue, None);
+                }
                 let progress = if boundary == StreamReadBoundary::BeforeCancel {
                     cancels += 1;
                     if cancels <= blocked_cancels {
@@ -479,6 +486,11 @@ impl<T: Lower + Clone + Unpin + Send + 'static> StreamProducer<ControlState>
                 observed.lock().unwrap().push(event);
             })?;
             // Even an already-prepared value must reproduce original Blocked.
+            return Poll::Pending;
+        }
+        // A replay readiness gate must also hold finish=true across repeated
+        // cancellation admissions, which deliberately poll ordinary work.
+        if self.blocked_cancels != 0 && !store.data().ready {
             return Poll::Pending;
         }
         if finish && self.zero {
@@ -687,7 +699,13 @@ async fn repeated_busy_cancellation_and_later_settlement() -> Result<()> {
             "#
             );
             let component = Component::new(&engine, controlled_source(&body, false, true))?;
-            let mut store = Store::new(&engine, ControlState::default());
+            let mut store = Store::new(
+                &engine,
+                ControlState {
+                    admit: true,
+                    ..Default::default()
+                },
+            );
             let instance = linker.instantiate_async(&mut store, &component).await?;
             let reader = StreamReader::new(
                 &mut store,
@@ -707,13 +725,16 @@ async fn repeated_busy_cancellation_and_later_settlement() -> Result<()> {
                 .await?;
             let mut expected = vec![
                 StreamReadBoundary::ReadReturn { result: u32::MAX },
+                StreamReadBoundary::BeforeCancelAdmission,
                 StreamReadBoundary::BeforeCancel,
                 StreamReadBoundary::CancelReturn { result: u32::MAX },
+                StreamReadBoundary::BeforeCancelAdmission,
                 StreamReadBoundary::BeforeCancel,
                 StreamReadBoundary::CancelReturn { result: u32::MAX },
             ];
             if !wait {
                 expected.extend([
+                    StreamReadBoundary::BeforeCancelAdmission,
                     StreamReadBoundary::BeforeCancel,
                     StreamReadBoundary::CancelReturn { result },
                 ]);
@@ -797,6 +818,7 @@ async fn control_failure_or_driver_cancellation_disposes_fiber_without_consumpti
     let engine = control_engine()?;
     for (index, boundary) in [
         StreamReadBoundary::ReadReturn { result: u32::MAX },
+        StreamReadBoundary::BeforeCancelAdmission,
         StreamReadBoundary::BeforeCancel,
         StreamReadBoundary::CancelReturn { result: 18 },
         StreamReadBoundary::Settled {
@@ -833,6 +855,7 @@ async fn control_failure_or_driver_cancellation_disposes_fiber_without_consumpti
                 &engine,
                 ControlState {
                     ready: true,
+                    admit: true,
                     park_at: Some(boundary),
                     parked: Some(parked),
                     entered: Some(entered),
@@ -865,9 +888,10 @@ async fn control_failure_or_driver_cancellation_disposes_fiber_without_consumpti
                 drop(call);
             }
             assert_eq!(store.data().controls, index + 1);
-            assert_eq!(store.data().control_drops.load(Ordering::SeqCst), index + 1);
+            let drops = store.data().control_drops.clone();
             assert_eq!(store.data().boundaries.len(), index);
             drop(store);
+            assert_eq!(drops.load(Ordering::SeqCst), index + 1);
             assert!(observed.lock().unwrap().is_empty());
         }
     }
@@ -1199,4 +1223,447 @@ async fn late_control_registration_completes_existing_transfer() -> Result<()> {
         .call_async(&mut store, (reader,))
         .await?;
     Ok(())
+}
+
+#[tokio::test]
+async fn cancellation_admission_revalidates_the_same_busy_read() -> Result<()> {
+    let mut config = Config::new();
+    config.wasm_component_model_async(true);
+    config.wasm_component_model_more_async_builtins(true);
+    config.wasm_component_model_async_stackful(true);
+    config.wasm_component_model_threading(true);
+    let engine = Engine::new(&config)?;
+    for replace in [false, true] {
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let mut linker = Linker::<ControlState>::new(&engine);
+        let (release, parked) = tokio::sync::oneshot::channel();
+        let release = Arc::new(Mutex::new(Some(release)));
+        linker.root().func_wrap("check", move |_, _: (bool,)| {
+            release.lock().unwrap().take().unwrap().send(()).unwrap();
+            Ok(())
+        })?;
+        let replacement = if replace {
+            r#"(call $read (local.get $reader) (i32.const 0x100) (i32.const 1))
+                i32.const -1 i32.ne if unreachable end"#
+        } else {
+            ""
+        };
+        let source = controlled_source(
+            r#"
+                (call $read (local.get $reader) (i32.const 0x100) (i32.const 1))
+                i32.const -1 i32.ne if unreachable end
+                (call $new (i32.const 0) (local.get $reader)) call $unsuspend
+                (drop (call $cancel (local.get $reader)))
+                unreachable
+            "#,
+            false,
+            true,
+        )
+        .replace(
+            "(core module $libc (memory (export \"memory\") 1))",
+            r#"
+            (core module $libc
+                (memory (export "memory") 1)
+                (table (export "table") 1 funcref))"#,
+        )
+        .replace(
+            "(core module $m",
+            r#"
+            (core type $start (func (param i32)))
+            (alias core export $libc "table" (core table $table))
+            (core func $new (canon thread.new-indirect $start (table $table)))
+            (core func $unsuspend (canon thread.unsuspend))
+            (core module $m
+                (import "" "new" (func $new (param i32 i32) (result i32)))
+                (import "" "unsuspend" (func $unsuspend (param i32)))
+                (import "" "table" (table $table 1 funcref))"#,
+        )
+        .replace(
+            "(export \"read\" (func $read))",
+            r#"
+            (export "new" (func $new)) (export "unsuspend" (func $unsuspend))
+            (export "table" (table $table)) (export "read" (func $read))"#,
+        )
+        .replace(
+            "    )\n  )\n  (type $s",
+            &format!(
+                r#"
+                )
+                (func $replace (param $reader i32)
+                    (call $cancel (local.get $reader))
+                    i32.const 2 i32.ne if unreachable end
+                    {replacement}
+                    (call $check (i32.const 1)))
+                (elem (table $table) (i32.const 0) func $replace)
+              )
+              (type $s"#
+            ),
+        );
+        let component = Component::new(&engine, source)?;
+        let mut store = Store::new(
+            &engine,
+            ControlState {
+                admit: true,
+                park_at: Some(StreamReadBoundary::BeforeCancelAdmission),
+                parked: Some(parked),
+                ..Default::default()
+            },
+        );
+        let instance = linker.instantiate_async(&mut store, &component).await?;
+        let reader = StreamReader::new(
+            &mut store,
+            ControlledProducer {
+                item: 64u8,
+                registered: false,
+                eof: false,
+                zero: true,
+                progress: StreamReadProgress::Cancel,
+                blocked_cancels: 0,
+                observed: observed.clone(),
+            },
+        )?;
+        let error = instance
+            .get_typed_func::<(StreamReader<u8>,), ()>(&mut store, "run")?
+            .call_async(&mut store, (reader,))
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{error:?}").contains("stream read changed during cancellation admission"),
+            "replace={replace}: {error:?}"
+        );
+        // Only the competing fiber's real zero settlement is consumed. The
+        // stale caller must not cancel the new Busy read or synthesize delivery.
+        drop(store);
+        assert_eq!(
+            *observed.lock().unwrap(),
+            [TerminalConsumption::NotDelivered]
+        );
+    }
+    Ok(())
+}
+
+// This native scheduling fixture reproduces an earlier guest terminal
+// acknowledgment required by replay admission. The oneshot models admission,
+// not an oplog; only B's real terminal observer can acknowledge it.
+mod admission {
+    use super::*;
+    use std::task::Waker;
+    use wasmtime::component::{FutureProducer, FutureReader};
+
+    const COMPONENT: &str = r#"
+    (component
+      (import "mark" (func $mark (param "phase" u32)))
+      (core module $mem (memory (export "memory") 1))
+      (core instance $mem (instantiate $mem))
+      (type $s (stream u8)) (type $f (future u32))
+      (core func $read (canon stream.read $s async (memory $mem "memory")))
+      (core func $cancel (canon stream.cancel-read $s async))
+      (core func $drop (canon stream.drop-readable $s))
+      (core func $future-read (canon future.read $f async (memory $mem "memory")))
+      (core func $future-drop (canon future.drop-readable $f))
+      (core func $mark (canon lower (func $mark)))
+      (core func $yield (canon thread.yield))
+      (canon waitable.join (core func $join))
+      (canon waitable-set.new (core func $new-set))
+      (canon waitable-set.wait (memory $mem "memory") (core func $wait))
+      (canon waitable-set.drop (core func $drop-set))
+      (core module $m
+        (import "" "read" (func $read (param i32 i32 i32) (result i32)))
+        (import "" "cancel" (func $cancel (param i32) (result i32)))
+        (import "" "drop" (func $drop (param i32)))
+        (import "" "future-read" (func $future-read (param i32 i32) (result i32)))
+        (import "" "future-drop" (func $future-drop (param i32)))
+        (import "" "mark" (func $mark (param i32)))
+        (import "" "yield" (func $yield (result i32)))
+        (import "" "join" (func $join (param i32 i32)))
+        (import "" "new-set" (func $new-set (result i32)))
+        (import "" "wait" (func $wait (param i32 i32) (result i32)))
+        (import "" "drop-set" (func $drop-set (param i32)))
+        (func (export "a") (param $reader i32) (local $set i32)
+          (call $read (local.get $reader) (i32.const 0x100) (i32.const 1))
+          i32.const -1 i32.ne if unreachable end
+          i32.const 1 call $mark
+          (drop (call $yield)) (drop (call $yield))
+          i32.const 2 call $mark
+          (call $cancel (local.get $reader))
+          i32.const -1 i32.ne if unreachable end
+          i32.const 3 call $mark
+          (local.set $set (call $new-set))
+          (call $join (local.get $reader) (local.get $set))
+          (drop (call $wait (local.get $set) (i32.const 0x200)))
+          (call $join (local.get $reader) (i32.const 0))
+          (call $drop-set (local.get $set))
+          (call $drop (local.get $reader)))
+        (func (export "b") (param $future i32) (local $set i32)
+          (call $future-read (local.get $future) (i32.const 0x300))
+          i32.const -1 i32.ne if unreachable end
+          i32.const 0 call $mark
+          (local.set $set (call $new-set))
+          (call $join (local.get $future) (local.get $set))
+          (drop (call $wait (local.get $set) (i32.const 0x200)))
+          (call $join (local.get $future) (i32.const 0))
+          (call $future-drop (local.get $future))
+          (call $drop-set (local.get $set))))
+      (core instance $i (instantiate $m (with "" (instance
+        (export "read" (func $read)) (export "cancel" (func $cancel))
+        (export "drop" (func $drop)) (export "future-read" (func $future-read))
+        (export "future-drop" (func $future-drop)) (export "mark" (func $mark))
+        (export "yield" (func $yield)) (export "join" (func $join))
+        (export "new-set" (func $new-set)) (export "wait" (func $wait))
+        (export "drop-set" (func $drop-set))))))
+      (func (export "a") async (param "reader" $s)
+        (canon lift (core func $i "a") (memory $mem "memory")))
+      (func (export "b") async (param "future" $f)
+        (canon lift (core func $i "b") (memory $mem "memory"))))
+    "#;
+
+    #[derive(Default)]
+    struct Probe {
+        ready: bool,
+        waker: Option<Waker>,
+        events: Vec<&'static str>,
+        acknowledged: Option<tokio::sync::oneshot::Sender<()>>,
+        admission: Option<tokio::sync::oneshot::Receiver<()>>,
+        entered: Option<tokio::sync::oneshot::Sender<()>>,
+        b_started: Option<tokio::sync::oneshot::Sender<()>>,
+    }
+
+    struct State {
+        probe: Arc<Mutex<Probe>>,
+        replay: bool,
+        release_at_admission: bool,
+    }
+
+    struct Control(StreamReadBoundary, bool);
+    impl AccessorTask<State> for Control {
+        async fn run(self, accessor: &Accessor<State>) -> Result<()> {
+            let wait = accessor.with(|mut access| {
+                let state = access.data_mut();
+                let mut probe = state.probe.lock().unwrap();
+                if self.0 == StreamReadBoundary::BeforeCancelAdmission {
+                    probe.events.push("Admission");
+                    if state.release_at_admission {
+                        probe.ready = true;
+                        if let Some(waker) = probe.waker.take() {
+                            waker.wake();
+                        }
+                    }
+                    probe.admission.take()
+                } else {
+                    probe.events.push("BeforeCancel");
+                    if let Some(entered) = probe.entered.take() {
+                        let _ = entered.send(());
+                    }
+                    if self.1 {
+                        // The lease has already been admitted. Exclusive
+                        // control must never await earlier guest progress.
+                        assert!(probe.admission.is_none());
+                        None
+                    } else {
+                        probe.admission.take()
+                    }
+                }
+            });
+            if let Some(wait) = wait {
+                wait.await?;
+            }
+            if self.0 == StreamReadBoundary::BeforeCancelAdmission {
+                accessor.with(|mut access| {
+                    access
+                        .data_mut()
+                        .probe
+                        .lock()
+                        .unwrap()
+                        .events
+                        .push("Admitted")
+                });
+            }
+            Ok(())
+        }
+    }
+
+    struct Stream(bool, bool);
+    impl StreamProducer<State> for Stream {
+        type Item = u8;
+        type Buffer = Option<u8>;
+        fn poll_produce<'a>(
+            mut self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            mut store: StoreContextMut<'a, State>,
+            mut destination: Destination<'a, u8, Option<u8>>,
+            finish: bool,
+        ) -> Poll<Result<StreamResult>> {
+            if !self.0 {
+                self.0 = true;
+                let admit = self.1;
+                destination.register_read_control(&mut store, move |boundary| {
+                    (
+                        StreamReadProgress::Continue,
+                        (boundary == StreamReadBoundary::BeforeCancel
+                            || (admit && boundary == StreamReadBoundary::BeforeCancelAdmission))
+                            .then_some(Control(boundary, admit)),
+                    )
+                })?;
+            }
+            if finish {
+                Poll::Ready(Ok(StreamResult::Cancelled))
+            } else {
+                Poll::Pending
+            }
+        }
+    }
+
+    struct Completion(Arc<Mutex<Probe>>);
+    impl FutureProducer<State> for Completion {
+        type Item = u32;
+        fn poll_produce(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            _: StoreContextMut<State>,
+            finish: bool,
+        ) -> Poll<Result<Option<u32>>> {
+            if finish {
+                return Poll::Ready(Ok(None));
+            }
+            let mut probe = self.0.lock().unwrap();
+            if probe.ready {
+                Poll::Ready(Ok(Some(42)))
+            } else {
+                probe.waker = Some(cx.waker().clone());
+                Poll::Pending
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn earlier_guest_acknowledgment_requires_nonexclusive_admission() -> Result<()> {
+        let engine = control_engine()?;
+        let component = Component::new(&engine, COMPONENT)?;
+        for admit in [false, true] {
+            for (replay, release_at_admission) in [(false, false), (true, false), (true, true)] {
+                if release_at_admission && !admit {
+                    continue;
+                }
+                let (acknowledged, admission) = tokio::sync::oneshot::channel();
+                let (entered, waiting) = tokio::sync::oneshot::channel();
+                let (b_started, b_waiting) = tokio::sync::oneshot::channel();
+                let probe = Arc::new(Mutex::new(Probe {
+                    acknowledged: Some(acknowledged),
+                    admission: Some(admission),
+                    entered: Some(entered),
+                    b_started: Some(b_started),
+                    ..Probe::default()
+                }));
+                let mut linker = Linker::<State>::new(&engine);
+                linker.root().func_wrap(
+                    "mark",
+                    |store: StoreContextMut<State>, (phase,): (u32,)| {
+                        let mut probe = store.data().probe.lock().unwrap();
+                        probe.events.push(match phase {
+                            0 => "B blocked",
+                            1 => "A read Blocked",
+                            2 => "A cancel entry",
+                            _ => "A cancel return",
+                        });
+                        if phase == 0 {
+                            let _ = probe.b_started.take().unwrap().send(());
+                        }
+                        if !store.data().release_at_admission
+                            && phase == if store.data().replay { 2 } else { 1 }
+                        {
+                            probe.ready = true;
+                            if let Some(waker) = probe.waker.take() {
+                                waker.wake();
+                            }
+                        }
+                        Ok(())
+                    },
+                )?;
+                let mut store = Store::new(
+                    &engine,
+                    State {
+                        probe: probe.clone(),
+                        replay,
+                        release_at_admission,
+                    },
+                );
+                let a_instance = linker.instantiate_async(&mut store, &component).await?;
+                let b_instance = linker.instantiate_async(&mut store, &component).await?;
+                let a = a_instance.get_typed_func::<(StreamReader<u8>,), ()>(&mut store, "a")?;
+                let b = b_instance.get_typed_func::<(FutureReader<u32>,), ()>(&mut store, "b")?;
+                let reader = StreamReader::new(&mut store, Stream(false, admit))?;
+                let mut completion = FutureReader::new(&mut store, Completion(probe.clone()))?;
+                let observed = probe.clone();
+                completion.register_terminal_observer(&mut store, move |consumption| {
+                    assert_eq!(consumption, TerminalConsumption::Delivered);
+                    let mut probe = observed.lock().unwrap();
+                    probe.events.push("M_B acknowledged");
+                    let _ = probe.acknowledged.take().unwrap().send(());
+                })?;
+                let mut run = Box::pin(store.run_concurrent_and_drain(
+                    async |accessor| -> Result<()> {
+                        let main = async {
+                            b_waiting.await?;
+                            a.call_concurrent(accessor, (reader,)).await
+                        };
+                        let other = b.call_concurrent(accessor, (completion,));
+                        tokio::try_join!(main, other)?;
+                        Ok(())
+                    },
+                ));
+                if replay && !admit {
+                    tokio::select! {
+                        result = &mut run => panic!("unadmitted replay unexpectedly completed: {result:?}"),
+                        result = waiting => result?,
+                    }
+                    assert_eq!(
+                        probe.lock().unwrap().events,
+                        [
+                            "B blocked",
+                            "A read Blocked",
+                            "A cancel entry",
+                            "BeforeCancel"
+                        ]
+                    );
+                    assert!(probe.lock().unwrap().acknowledged.is_some());
+                    drop(run);
+                } else {
+                    run.await??;
+                    let events = &probe.lock().unwrap().events;
+                    let index = |event| events.iter().position(|e| *e == event).unwrap();
+                    // Normal scheduling may acknowledge B before or during
+                    // admission; both must precede the exclusive phase.
+                    assert!(index("M_B acknowledged") < index("BeforeCancel"));
+                    if replay {
+                        assert!(index("A cancel entry") < index("M_B acknowledged"));
+                    } else {
+                        assert!(index("M_B acknowledged") < index("A cancel entry"));
+                    }
+                    if release_at_admission {
+                        assert!(index("Admission") < index("M_B acknowledged"));
+                    }
+                    let mut expected = vec!["B blocked", "A read Blocked", "A cancel entry"];
+                    if admit {
+                        expected.push("Admission");
+                        expected.push("Admitted");
+                        assert!(index("M_B acknowledged") < index("Admitted"));
+                    }
+                    expected.extend(["BeforeCancel", "A cancel return"]);
+                    assert_eq!(
+                        events
+                            .iter()
+                            .filter(|e| **e != "M_B acknowledged")
+                            .copied()
+                            .collect::<Vec<_>>(),
+                        expected
+                    );
+                    assert_eq!(
+                        events.iter().filter(|e| **e == "M_B acknowledged").count(),
+                        1
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
 }
