@@ -396,6 +396,31 @@ impl<'a, T, B> Destination<'a, T, B> {
         *self.buffer = buffer;
     }
 
+    /// Observes consumption of the current guest read, not producer completion.
+    ///
+    /// The observer runs at the synchronous return, waitable-set delivery, or callback
+    /// boundary. Cancelling or dropping the read without consuming its result reports
+    /// [`TerminalConsumption::NotDelivered`]. Store teardown drops the observer without
+    /// invoking it. The producer must not buffer more items than this read can accept.
+    ///
+    /// Returns an error for a host read or if this read already has an observer.
+    pub fn register_read_observer(
+        &mut self,
+        mut store: impl AsContextMut,
+        observer: impl FnOnce(TerminalConsumption) + Send + 'static,
+    ) -> Result<()> {
+        let state = store.as_context_mut().0.concurrent_state_mut();
+        let transmit = state.get_mut(self.id)?;
+        if !matches!(transmit.read, ReadState::GuestReady { .. }) {
+            bail!("read observer requires a guest read");
+        }
+        if transmit.read_observer.is_some() {
+            bail!("guest read already has a consumption observer");
+        }
+        transmit.read_observer = Some(AlwaysMut::new(Box::new(observer)));
+        Ok(())
+    }
+
     /// Return the remaining number of items the current read has capacity to
     /// accept, if known.
     ///
@@ -2200,6 +2225,10 @@ struct TransmitState {
     done: bool,
     /// Observer invoked when a host-created future's terminal is consumed by the guest.
     terminal_observer: Option<AlwaysMut<TerminalObserver>>,
+    /// Observer for the current read of a host-created stream.
+    read_observer: Option<AlwaysMut<TerminalObserver>>,
+    /// Whether the pending read is settling a cancellation request.
+    read_cancelled: bool,
     /// The original creator of this stream, used for type-checking with
     /// `{Future,Stream}Any`.
     pub(super) origin: TransmitOrigin,
@@ -2221,6 +2250,8 @@ impl TransmitState {
             write: WriteState::Open,
             done: false,
             terminal_observer: None,
+            read_observer: None,
+            read_cancelled: false,
             origin,
         }
     }
@@ -3828,6 +3859,7 @@ impl Instance {
             if !matches!(&transmit.read, ReadState::Open) {
                 bail_bug!("expected `ReadState::Open`; got `{:?}`", transmit.read);
             }
+            transmit.read_cancelled = false;
             transmit.read = ReadState::GuestReady {
                 ty,
                 flat_abi,
@@ -4013,6 +4045,12 @@ impl Instance {
                 .concurrent_state_mut()
                 .consume_future_terminal(transmit_handle, TerminalConsumption::Delivered);
         }
+        if matches!(ty, TransmitIndex::Stream(_)) && result != ReturnCode::Blocked {
+            store
+                .0
+                .concurrent_state_mut()
+                .consume_stream_read(transmit_handle, TerminalConsumption::Delivered);
+        }
 
         Ok(result)
     }
@@ -4137,6 +4175,7 @@ impl Instance {
             transmit.write
         );
 
+        transmit.read_cancelled = true;
         let waitable = Waitable::Transmit(transmit.read_handle);
         let code = if let Some(event) = waitable.take_event(state)? {
             let (Event::FutureRead { code, .. } | Event::StreamRead { code, .. }) = event else {
@@ -4156,6 +4195,19 @@ impl Instance {
                         _ => unreachable!("future read waitable is a transmit handle"),
                     },
                     TerminalConsumption::NotDelivered,
+                );
+            }
+            if matches!(event, Event::StreamRead { .. }) {
+                let Waitable::Transmit(handle) = waitable else {
+                    unreachable!();
+                };
+                store.concurrent_state_mut().consume_stream_read(
+                    handle,
+                    match code {
+                        ReturnCode::Completed(count) if count > 0 => TerminalConsumption::Delivered,
+                        ReturnCode::Dropped(_) => TerminalConsumption::Delivered,
+                        _ => TerminalConsumption::NotDelivered,
+                    },
                 );
             }
             match (code, event) {
@@ -4278,13 +4330,32 @@ impl Instance {
             TransmitLocalState::Busy => {}
         }
         let transmit_id = store.concurrent_state_mut().get_mut(id)?.state;
-        let code = self.cancel_read(store, transmit_id, async_)?;
+        let code = match (ty, self.cancel_read(store, transmit_id, async_)?) {
+            (TransmitIndex::Stream(_), ReturnCode::Completed(count)) => {
+                ReturnCode::Cancelled(count)
+            }
+            (_, code) => code,
+        };
         if !matches!(code, ReturnCode::Blocked) {
             let state =
                 get_mut_by_index_from(self.id().get_mut(store).table_for_transmit(ty), ty, reader)?
                     .1;
             if let TransmitLocalState::Busy = state {
                 *state = TransmitLocalState::Read { done: false };
+            }
+            if matches!(ty, TransmitIndex::Stream(_)) {
+                store.concurrent_state_mut().consume_stream_read(
+                    id,
+                    match code {
+                        ReturnCode::Cancelled(count) | ReturnCode::Completed(count)
+                            if count > 0 =>
+                        {
+                            TerminalConsumption::Delivered
+                        }
+                        ReturnCode::Dropped(_) => TerminalConsumption::Delivered,
+                        _ => TerminalConsumption::NotDelivered,
+                    },
+                );
             }
         }
         Ok(code)
@@ -4312,6 +4383,11 @@ impl Instance {
             store
                 .concurrent_state_mut()
                 .consume_future_terminal(id, TerminalConsumption::NotDelivered);
+        }
+        if matches!(kind, TransmitKind::Stream) {
+            store
+                .concurrent_state_mut()
+                .consume_stream_read(id, TerminalConsumption::NotDelivered);
         }
         store.host_drop_reader(id, kind)
     }
@@ -4768,6 +4844,27 @@ impl ConcurrentState {
         }
     }
 
+    fn consume_stream_read(
+        &mut self,
+        handle: TableId<TransmitHandle>,
+        consumption: TerminalConsumption,
+    ) {
+        let observer = self
+            .get_mut(handle)
+            .ok()
+            .map(|handle| handle.state)
+            .and_then(|id| {
+                self.get_mut(id)
+                    .ok()?
+                    .read_observer
+                    .take()
+                    .map(AlwaysMut::into_inner)
+            });
+        if let Some(observer) = observer {
+            observer(consumption);
+        }
+    }
+
     fn send_write_result(
         &mut self,
         ty: TransmitIndex,
@@ -4798,7 +4895,14 @@ impl ConcurrentState {
         handle: u32,
         code: ReturnCode,
     ) -> Result<()> {
-        let read_handle = self.get_mut(id)?.read_handle.rep();
+        let transmit = self.get_mut(id)?;
+        let read_handle = transmit.read_handle.rep();
+        let code = match (ty, code, transmit.read_cancelled) {
+            (TransmitIndex::Stream(_), ReturnCode::Completed(count), true) => {
+                ReturnCode::Cancelled(count)
+            }
+            (_, code, _) => code,
+        };
         self.set_event(
             read_handle,
             match ty {
@@ -5034,6 +5138,17 @@ impl Waitable {
             ) => store
                 .concurrent_state_mut()
                 .consume_future_terminal(*handle, TerminalConsumption::Delivered),
+            (Waitable::Transmit(handle), Event::StreamRead { code, .. }) => {
+                store.concurrent_state_mut().consume_stream_read(
+                    *handle,
+                    match code {
+                        ReturnCode::Cancelled(count) if count == 0 => {
+                            TerminalConsumption::NotDelivered
+                        }
+                        _ => TerminalConsumption::Delivered,
+                    },
+                );
+            }
             _ => {}
         }
     }
