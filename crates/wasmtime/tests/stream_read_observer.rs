@@ -399,13 +399,18 @@ struct ControlTask(StreamReadBoundary);
 
 impl AccessorTask<ControlState> for ControlTask {
     async fn run(self, accessor: &Accessor<ControlState>) -> Result<()> {
-        struct OnDrop(Arc<AtomicUsize>);
-        impl Drop for OnDrop {
+        struct OnDrop<'a>(&'a Accessor<ControlState>);
+        impl Drop for OnDrop<'_> {
             fn drop(&mut self) {
-                self.0.fetch_add(1, Ordering::SeqCst);
+                self.0.with(|mut store| {
+                    store
+                        .data_mut()
+                        .control_drops
+                        .fetch_add(1, Ordering::SeqCst);
+                });
             }
         }
-        let _drop = OnDrop(accessor.with(|mut store| store.data_mut().control_drops.clone()));
+        let _drop = OnDrop(accessor);
         let (guest_steps, reallocs, parked) = accessor.with(|mut store| {
             let state = store.data_mut();
             state.controls += 1;
@@ -576,7 +581,7 @@ async fn controlled_cancel_preserves_real_results_and_observer_order() -> Result
                 move |mut store: StoreContextMut<ControlState>, (consumed,): (bool,)| {
                     if consumed {
                         assert_eq!(*checked.lock().unwrap(), vec![consumption]);
-                        assert_eq!(store.data().controls, 4);
+                        assert_eq!(store.data().controls, 3);
                     } else {
                         assert!(checked.lock().unwrap().is_empty());
                         store.data_mut().ready = true;
@@ -622,7 +627,6 @@ async fn controlled_cancel_preserves_real_results_and_observer_order() -> Result
             assert_eq!(
                 store.data().boundaries,
                 vec![
-                    StreamReadBoundary::ReadReturn { result: u32::MAX },
                     StreamReadBoundary::BeforeCancel,
                     StreamReadBoundary::CancelReturn { result },
                     StreamReadBoundary::Settled {
@@ -724,7 +728,6 @@ async fn repeated_busy_cancellation_and_later_settlement() -> Result<()> {
                 .call_async(&mut store, (reader,))
                 .await?;
             let mut expected = vec![
-                StreamReadBoundary::ReadReturn { result: u32::MAX },
                 StreamReadBoundary::BeforeCancelAdmission,
                 StreamReadBoundary::BeforeCancel,
                 StreamReadBoundary::CancelReturn { result: u32::MAX },
@@ -817,7 +820,6 @@ async fn zero_cancellation_retains_producer_for_next_read() -> Result<()> {
 async fn control_failure_or_driver_cancellation_disposes_fiber_without_consumption() -> Result<()> {
     let engine = control_engine()?;
     for (index, boundary) in [
-        StreamReadBoundary::ReadReturn { result: u32::MAX },
         StreamReadBoundary::BeforeCancelAdmission,
         StreamReadBoundary::BeforeCancel,
         StreamReadBoundary::CancelReturn { result: 18 },
@@ -899,6 +901,91 @@ async fn control_failure_or_driver_cancellation_disposes_fiber_without_consumpti
 }
 
 #[tokio::test]
+async fn pending_control_can_resume_or_be_disposed_on_another_thread() -> Result<()> {
+    let engine = control_engine()?;
+    for resume in [false, true] {
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let mut linker = Linker::<ControlState>::new(&engine);
+        linker.root().func_wrap("check", |_, _: (bool,)| Ok(()))?;
+        let component = Component::new(
+            &engine,
+            controlled_source(
+                r#"
+            (call $read (local.get $reader) (i32.const 0x100) (i32.const 1))
+            i32.const -1 i32.ne if unreachable end
+            (call $cancel (local.get $reader)) i32.const 18 i32.ne if unreachable end
+            (call $drop (local.get $reader))
+        "#,
+                false,
+                true,
+            ),
+        )?;
+        let (release, parked) = tokio::sync::oneshot::channel();
+        let (entered, wait_entered) = tokio::sync::oneshot::channel();
+        let mut store = Store::new(
+            &engine,
+            ControlState {
+                ready: true,
+                park_at: Some(StreamReadBoundary::BeforeCancel),
+                parked: Some(parked),
+                entered: Some(entered),
+                ..Default::default()
+            },
+        );
+        let instance = linker.instantiate_async(&mut store, &component).await?;
+        let reader = StreamReader::new(
+            &mut store,
+            ControlledProducer {
+                item: 51u8,
+                registered: false,
+                eof: false,
+                zero: false,
+                progress: StreamReadProgress::Complete,
+                blocked_cancels: 0,
+                observed: observed.clone(),
+            },
+        )?;
+        let run = instance.get_typed_func::<(StreamReader<u8>,), ()>(&mut store, "run")?;
+        let mut call = Box::pin(run.call_async(&mut store, (reader,)));
+        tokio::select! {
+            result = &mut call => panic!("control did not park: {result:?}"),
+            result = wait_entered => result?,
+        }
+        let original = std::thread::current().id();
+        std::thread::scope(|scope| {
+            scope
+                .spawn(move || -> Result<()> {
+                    assert_ne!(std::thread::current().id(), original);
+                    if resume {
+                        release.send(()).unwrap();
+                        tokio::runtime::Builder::new_current_thread()
+                            .build()?
+                            .block_on(call)
+                    } else {
+                        drop(call);
+                        Ok(())
+                    }
+                })
+                .join()
+                .unwrap()
+        })?;
+        let drops = store.data().control_drops.clone();
+        let controls = store.data().controls;
+        drop(store);
+        assert_eq!(drops.load(Ordering::SeqCst), controls);
+        assert_eq!(
+            *observed.lock().unwrap(),
+            if resume {
+                vec![TerminalConsumption::Delivered]
+            } else {
+                vec![]
+            }
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn designated_lowering_does_not_let_runnable_fibers_or_callbacks_overtake() -> Result<()> {
     let engine = control_engine()?;
     let observed = Arc::new(Mutex::new(Vec::new()));
@@ -924,10 +1011,10 @@ async fn designated_lowering_does_not_let_runnable_fibers_or_callbacks_overtake(
     linker.root().func_wrap(
         "realloc-check",
         |mut store: StoreContextMut<ControlState>, (): ()| {
-            // ReadReturn and BeforeCancel host phases have completed. Neither
+            // BeforeCancel host control has completed. Neither
             // CancelReturn nor Settled has started, and neither side task ran.
-            assert_eq!(store.data().controls, 2);
-            assert_eq!(store.data().boundaries.len(), 2);
+            assert_eq!(store.data().controls, 1);
+            assert_eq!(store.data().boundaries.len(), 1);
             assert_eq!(store.data().guest_steps, 0);
             store.data_mut().reallocs += 1;
             Ok(())
@@ -1037,8 +1124,8 @@ async fn designated_lowering_does_not_let_runnable_fibers_or_callbacks_overtake(
         .await??;
     assert_eq!(store.data().guest_steps, 2);
     assert_eq!(store.data().reallocs, 1, "stale lowering proxy ran twice");
-    assert_eq!(store.data().controls, 4);
-    assert_eq!(store.data().control_drops.load(Ordering::SeqCst), 4);
+    assert_eq!(store.data().controls, 3);
+    assert_eq!(store.data().control_drops.load(Ordering::SeqCst), 3);
     assert_eq!(
         *observed.lock().unwrap(),
         vec![TerminalConsumption::Delivered]
@@ -1152,8 +1239,8 @@ async fn cancellation_after_inline_read_is_illegal() -> Result<()> {
 }
 
 #[tokio::test]
-async fn late_control_registration_completes_existing_transfer() -> Result<()> {
-    struct LateProducer(usize);
+async fn late_control_registration_is_rejected_without_changing_uncontrolled_reads() -> Result<()> {
+    struct LateProducer(usize, bool);
     impl StreamProducer<ControlState> for LateProducer {
         type Item = u8;
         type Buffer = Option<u8>;
@@ -1170,17 +1257,20 @@ async fn late_control_registration_completes_existing_transfer() -> Result<()> {
                 return Poll::Pending;
             }
             if self.0 == 2 {
-                destination.register_read_control(&mut store, |boundary| {
-                    (
-                        if boundary == StreamReadBoundary::BeforeCancel {
-                            StreamReadProgress::Complete
-                        } else {
-                            StreamReadProgress::Continue
-                        },
-                        None::<ControlTask>,
-                    )
-                })?;
+                if self.1 {
+                    destination.register_read_control(&mut store, |boundary| {
+                        (
+                            if boundary == StreamReadBoundary::BeforeCancel {
+                                StreamReadProgress::Complete
+                            } else {
+                                StreamReadProgress::Continue
+                            },
+                            None::<ControlTask>,
+                        )
+                    })?;
+                }
                 store.data_mut().ready = true;
+                cx.waker().wake_by_ref();
                 return Poll::Pending;
             }
             destination.set_buffer(Some(42));
@@ -1215,13 +1305,21 @@ async fn late_control_registration_completes_existing_transfer() -> Result<()> {
             true,
         ),
     )?;
-    let mut store = Store::new(&engine, ControlState::default());
-    let instance = linker.instantiate_async(&mut store, &component).await?;
-    let reader = StreamReader::new(&mut store, LateProducer(0))?;
-    instance
-        .get_typed_func::<(StreamReader<u8>,), ()>(&mut store, "run")?
-        .call_async(&mut store, (reader,))
-        .await?;
+    for register in [false, true] {
+        let mut store = Store::new(&engine, ControlState::default());
+        let instance = linker.instantiate_async(&mut store, &component).await?;
+        let reader = StreamReader::new(&mut store, LateProducer(0, register))?;
+        let result = instance
+            .get_typed_func::<(StreamReader<u8>,), ()>(&mut store, "run")?
+            .call_async(&mut store, (reader,))
+            .await;
+        if register {
+            let error = result.unwrap_err();
+            assert!(format!("{error:?}").contains("initial producer poll"));
+        } else {
+            result?;
+        }
+    }
     Ok(())
 }
 

@@ -57,11 +57,6 @@ pub enum StreamReadBoundary {
     BeforeCancelAdmission,
     /// A valid Busy read is about to be cancelled, before result selection.
     BeforeCancel,
-    /// The original read invocation is about to return.
-    ReadReturn {
-        /// Selected canonical copy result.
-        result: u32,
-    },
     /// A cancellation invocation is about to return. Blocked leaves the same
     /// read Busy, so multiple cancellations may precede one settlement.
     CancelReturn {
@@ -99,6 +94,20 @@ type ReadLowering = Box<dyn FnOnce(&mut dyn VMStore) -> Result<()> + Send>;
 struct ReadTransfer {
     future: Option<HostTaskFuture>,
     lowering: Option<ReadLowering>,
+}
+
+/// The ordinary event-loop proxy also owns cleanup of an opted-in read.
+/// Like other queued futures, it is dropped with Store TLS installed.
+struct ReadTransferOwner(Arc<LockedState<ReadTransfer>>);
+
+impl Drop for ReadTransferOwner {
+    fn drop(&mut self) {
+        let state = self
+            .0
+            .with(|t| (t.future.take(), t.lowering.take()))
+            .unwrap();
+        drop(state);
+    }
 }
 
 /// Poll the one existing transfer, without holding its cell during callbacks.
@@ -428,6 +437,7 @@ impl HostBuffer<'_> {
 /// Represents the buffer for a host- or guest-initiated stream read.
 pub struct Destination<'a, T, B> {
     id: TableId<TransmitState>,
+    initial_poll: bool,
     buffer: &'a mut B,
     host_buffer: Option<HostBuffer<'a>>,
     _phantom: PhantomData<fn() -> T>,
@@ -438,6 +448,7 @@ impl<'a, T, B> Destination<'a, T, B> {
     pub fn reborrow(&mut self) -> Destination<'_, T, B> {
         Destination {
             id: self.id,
+            initial_poll: self.initial_poll,
             buffer: &mut *self.buffer,
             host_buffer: self.host_buffer.as_mut().map(|b| b.reborrow()),
             _phantom: PhantomData,
@@ -507,8 +518,9 @@ impl<'a, T, B> Destination<'a, T, B> {
     /// Admission errors trap; Store teardown drops the task and its admission
     /// state without synthesizing guest consumption.
     ///
-    /// At all other boundaries, a task releases the fiber's Store and runs only
-    /// that task, with an [`Accessor`], before resuming the builtin exactly once.
+    /// At all other boundaries, only that task is polled, with an [`Accessor`],
+    /// while the builtin's fiber keeps exclusive Store ownership. Its Store
+    /// TLS scope ends before each pending suspension and is restored per poll.
     /// No other guest fibers, callbacks, or guest-entering lowering/realloc can
     /// overtake it. No task leaves the boundary unchanged. The selected canonical
     /// result is never rewritten, and this wait does not itself return Blocked.
@@ -536,7 +548,8 @@ impl<'a, T, B> Destination<'a, T, B> {
     /// never synthesizes consumption. `finish=true` still settles only the
     /// current transfer, not the producer.
     ///
-    /// Returns an error for a host read or a duplicate hook on this read.
+    /// Register on the initial producer poll of each native read. Later
+    /// registration, host reads, and duplicate hooks return an error.
     pub fn register_read_control<D: 'static, F, C>(
         &mut self,
         mut store: impl AsContextMut<Data = D>,
@@ -546,6 +559,9 @@ impl<'a, T, B> Destination<'a, T, B> {
         F: FnMut(StreamReadBoundary) -> (StreamReadProgress, Option<C>) + Send + 'static,
         C: AccessorTask<D>,
     {
+        if !self.initial_poll {
+            bail!("read control must be registered on the initial producer poll");
+        }
         let mut store = store.as_context_mut();
         let token = StoreToken::new(store.as_context_mut());
         let transmit = store.0.concurrent_state_mut().get_mut(self.id)?;
@@ -555,9 +571,7 @@ impl<'a, T, B> Destination<'a, T, B> {
         if transmit.read_control.is_some() {
             bail!("guest read already has a control hook");
         }
-        transmit
-            .read_transfer
-            .get_or_insert_with(|| Arc::new(LockedState::new(ReadTransfer::default())));
+        transmit.read_transfer = Some(Arc::new(LockedState::new(ReadTransfer::default())));
         transmit.read_control = Some(AlwaysMut::new(Box::new(move |boundary| {
             let (progress, task) = control(boundary);
             let task = task.map(|task| {
@@ -2393,22 +2407,6 @@ pub(super) enum TransmitOrigin {
 }
 
 impl TransmitState {
-    pub(super) fn take_read_control_future(&mut self) -> Option<HostTaskFuture> {
-        let transfer = self.read_transfer.take()?;
-        let (future, lowering) = transfer
-            .with(|t| (t.future.take(), t.lowering.take()))
-            .unwrap();
-        // The caller drops this future under TLS during Store teardown, just
-        // like the normal transfer collection. Never report consumption here.
-        Some(Box::pin(async move {
-            let _lowering = lowering;
-            if let Some(future) = future {
-                future.await?;
-            }
-            Ok(())
-        }))
-    }
-
     fn new(origin: TransmitOrigin) -> Self {
         Self {
             write_handle: TableId::new(u32::MAX),
@@ -2630,23 +2628,21 @@ impl StoreOpaque {
             })
         };
 
-        // Keep one owner cell even before a control hook is registered: a
-        // later producer poll can attach control to this same pending read.
-        let transfer = if matches!(kind, TransmitKind::Stream) {
-            Some(
-                self.concurrent_state_mut()
-                    .get_mut(id)
-                    .unwrap()
-                    .read_transfer
-                    .get_or_insert_with(|| Arc::new(LockedState::new(ReadTransfer::default())))
-                    .clone(),
-            )
-        } else {
-            None
-        };
+        // Uncontrolled reads retain the ordinary transfer path unchanged.
+        let transfer = self
+            .concurrent_state_mut()
+            .get_mut(id)
+            .unwrap()
+            .read_transfer
+            .clone();
         let future = if let Some(transfer) = transfer {
             transfer.with(|t| t.future = Some(future.boxed())).unwrap();
-            future::poll_fn(move |cx| poll_read_transfer(&transfer, cx)).boxed()
+            let owner = ReadTransferOwner(transfer);
+            async move {
+                let owner = owner;
+                future::poll_fn(|cx| poll_read_transfer(&owner.0, cx)).await
+            }
+            .boxed()
         } else {
             future.boxed()
         };
@@ -2863,6 +2859,7 @@ impl<T> StoreContextMut<'_, T> {
                 async move {
                     let mut state = producer.take()?;
                     let (mine, buffer) = &mut *state;
+                    let mut initial_poll = true;
 
                     let (result, cancelled) = if buffer.remaining().is_empty() {
                         future::poll_fn(|cx| {
@@ -2886,6 +2883,7 @@ impl<T> StoreContextMut<'_, T> {
                                     token.as_context_mut(store),
                                     Destination {
                                         id,
+                                        initial_poll: mem::replace(&mut initial_poll, false),
                                         buffer,
                                         host_buffer: host_buffer.as_mut().map(|b| {
                                             HostBuffer {
@@ -4250,22 +4248,9 @@ impl Instance {
                 .consume_future_terminal(transmit_handle, TerminalConsumption::Delivered);
         }
         if matches!(ty, TransmitIndex::Stream(_)) && result != ReturnCode::Blocked {
-            store.0.stream_read_control(
-                transmit_handle,
-                StreamReadBoundary::ReadReturn {
-                    result: result.encode(),
-                },
-            )?;
             store
                 .0
                 .stream_read_settled(transmit_handle, result, TerminalConsumption::Delivered)?;
-        } else if matches!(ty, TransmitIndex::Stream(_)) {
-            store.0.stream_read_control(
-                transmit_handle,
-                StreamReadBoundary::ReadReturn {
-                    result: result.encode(),
-                },
-            )?;
         }
 
         Ok(result)
@@ -4544,17 +4529,16 @@ impl Instance {
             let (rep, local) =
                 get_mut_by_index_from(self.id().get_mut(store).table_for_transmit(ty), ty, reader)?;
             let same_handle = rep == id.rep() && matches!(local, TransmitLocalState::Busy);
-            let current_id = store.concurrent_state_mut().get_mut(id)?.state;
             let current = &store
                 .concurrent_state_mut()
-                .get_mut(current_id)?
+                .get_mut(transmit_id)?
                 .read_transfer;
-            let same_transfer = match (&transfer, current) {
+            let same_read = match (&transfer, current) {
                 (Some(before), Some(after)) => Arc::ptr_eq(before, after),
                 (None, None) => true,
                 _ => false,
             };
-            if !same_handle || current_id != transmit_id || !same_transfer {
+            if !same_handle || !same_read {
                 bail!("stream read changed during cancellation admission");
             }
             let progress = store.stream_read_control(id, StreamReadBoundary::BeforeCancel)?;

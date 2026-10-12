@@ -922,9 +922,6 @@ enum WaitMode {
 /// Represents the reason a fiber is suspending itself.
 #[derive(Debug)]
 enum SuspendReason {
-    /// Invisible host control at a builtin boundary. Only the designated
-    /// control future may run before this fiber resumes.
-    BuiltinControl,
     /// The fiber is waiting for an event to be delivered to the specified
     /// waitable set or task.
     Waiting {
@@ -2610,51 +2607,7 @@ impl StoreOpaque {
         let old_thread = self.concurrent_state_mut().current_thread;
         log::trace!("resume_fiber: save current thread {old_thread:?}");
 
-        let mut fiber = fiber::resolve_or_release(self, fiber).await?;
-        while fiber.is_some()
-            && matches!(
-                self.concurrent_state_mut().suspend_reason,
-                Some(SuspendReason::BuiltinControl)
-            )
-        {
-            self.concurrent_state_mut().suspend_reason.take();
-            // Keep disposal scoped to this wait: cancellation of the outer
-            // driver must not drop a live fiber or fabricate guest consumption.
-            struct ControlWait<'a> {
-                store: &'a mut StoreOpaque,
-                fiber: Option<StoreFiber<'static>>,
-                control: Option<HostTaskFuture>,
-            }
-            impl Drop for ControlWait<'_> {
-                fn drop(&mut self) {
-                    // SAFETY: the trait object belongs to this exclusively
-                    // borrowed Store; no Store borrow is used inside `set`.
-                    let store = unsafe { self.store.traitobj().as_mut() };
-                    tls::set(store, || drop(self.control.take()));
-                    if let Some(fiber) = &mut self.fiber {
-                        fiber.dispose(self.store);
-                    }
-                }
-            }
-            let control = self.concurrent_state_mut().builtin_control.get_mut().take();
-            let mut wait = ControlWait {
-                store: self,
-                fiber: fiber.take(),
-                control,
-            };
-            future::poll_fn(|cx| {
-                // SAFETY: same exclusive Store reborrow as in ControlWait::drop.
-                let store = unsafe { wait.store.traitobj().as_mut() };
-                tls::set(store, || wait.control.as_mut().unwrap().as_mut().poll(cx))
-            })
-            .await?;
-            // Drop accessor-owning state with Store access, before resuming.
-            // SAFETY: no other Store reference is used during this TLS scope.
-            let store = unsafe { wait.store.traitobj().as_mut() };
-            tls::set(store, || drop(wait.control.take()));
-            let next = wait.fiber.take().unwrap();
-            fiber = fiber::resolve_or_release(wait.store, next).await?;
-        }
+        let fiber = fiber::resolve_or_release(self, fiber).await?;
 
         self.set_thread(old_thread)?;
 
@@ -2673,7 +2626,6 @@ impl StoreOpaque {
                 None => bail_bug!("suspend reason missing when resuming fiber"),
             };
             match reason {
-                SuspendReason::BuiltinControl => unreachable!(),
                 SuspendReason::NeedWork => {
                     if state.worker.is_none() {
                         state.worker = Some(fiber);
@@ -2724,7 +2676,7 @@ impl StoreOpaque {
             SuspendReason::Yielding { thread, .. }
             | SuspendReason::Waiting { thread, .. }
             | SuspendReason::ExplicitlySuspending { thread, .. } => Some(thread.task),
-            SuspendReason::NeedWork | SuspendReason::BuiltinControl => None,
+            SuspendReason::NeedWork => None,
         };
 
         let old_guest_thread = if task.is_some() {
@@ -2741,19 +2693,16 @@ impl StoreOpaque {
         debug_assert!(
             matches!(
                 reason,
-                SuspendReason::BuiltinControl
-                    | SuspendReason::ExplicitlySuspending {
-                        skip_may_block_check: true,
-                        ..
-                    }
-                    | SuspendReason::Waiting {
-                        skip_may_block_check: true,
-                        ..
-                    }
-                    | SuspendReason::Yielding {
-                        skip_may_block_check: true,
-                        ..
-                    }
+                SuspendReason::ExplicitlySuspending {
+                    skip_may_block_check: true,
+                    ..
+                } | SuspendReason::Waiting {
+                    skip_may_block_check: true,
+                    ..
+                } | SuspendReason::Yielding {
+                    skip_may_block_check: true,
+                    ..
+                }
             ) || old_guest_thread
                 .guest()
                 .map(|thread| self.concurrent_state_mut().may_block(thread.task))
@@ -2774,11 +2723,22 @@ impl StoreOpaque {
         Ok(())
     }
 
-    fn run_builtin_control(&mut self, control: HostTaskFuture) -> Result<()> {
-        let slot = self.concurrent_state_mut().builtin_control.get_mut();
-        assert!(slot.is_none());
-        *slot = Some(control);
-        self.suspend(SuspendReason::BuiltinControl)
+    fn run_builtin_control(&mut self, mut control: HostTaskFuture) -> Result<()> {
+        let result = self.with_blocking(|store, blocking| {
+            blocking.block_on(future::poll_fn(|cx| {
+                // Each Store TLS scope ends before KeepStore suspends. No
+                // host poll frame or thread-local Store pointer crosses it.
+                // SAFETY: exclusively reborrow the Store for this one poll.
+                let store = unsafe { store.traitobj().as_mut() };
+                tls::set(store, || control.as_mut().poll(cx))
+            }))
+        });
+        // Retain the future outside the poll wrapper so completion, errors,
+        // and fiber cancellation all drop accessor state with Store access.
+        // SAFETY: with_blocking and its Store borrow have ended.
+        let store = unsafe { self.traitobj().as_mut() };
+        tls::set(store, || drop(control));
+        result?
     }
 
     /// Park only the caller while normally scheduled work admits a builtin.
@@ -6011,9 +5971,6 @@ pub struct ConcurrentState {
     /// resumed it will know under what conditions the fiber should be resumed
     /// again.
     suspend_reason: Option<SuspendReason>,
-    /// Designated work for an invisible builtin control wait, never placed in
-    /// the general future collection (which can enqueue guest work).
-    builtin_control: AlwaysMut<Option<HostTaskFuture>>,
     /// A cached fiber which is waiting for work to do.
     ///
     /// This helps us avoid creating a new fiber for each `GuestCall` work item.
@@ -6067,7 +6024,6 @@ impl Default for ConcurrentState {
             high_priority: Vec::new(),
             low_priority: VecDeque::new(),
             suspend_reason: None,
-            builtin_control: AlwaysMut::new(None),
             worker: None,
             worker_item: None,
             global_error_context_ref_counts: BTreeMap::new(),
@@ -6112,12 +6068,6 @@ impl ConcurrentState {
                 {
                     fibers.push(fiber);
                 }
-            } else if let Some(transmit) =
-                entry.downcast_mut::<futures_and_streams::TransmitState>()
-            {
-                if let Some(future) = transmit.take_read_control_future() {
-                    futures.push(core::iter::once(future).collect());
-                }
             }
         }
 
@@ -6149,9 +6099,6 @@ impl ConcurrentState {
 
         if let Some(them) = self.futures.get_mut().take() {
             futures.push(them);
-        }
-        if let Some(control) = self.builtin_control.get_mut().take() {
-            futures.push(core::iter::once(control).collect());
         }
     }
 
