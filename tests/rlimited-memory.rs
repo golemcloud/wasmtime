@@ -17,12 +17,13 @@ impl ResourceLimiter for MemoryGrowFailureDetector {
         current: usize,
         desired: usize,
         _maximum: Option<usize>,
+        _kind: MemoryKind,
     ) -> Result<bool> {
         self.current = current;
         self.desired = desired;
         Ok(true)
     }
-    fn memory_grow_failed(&mut self, err: wasmtime::Error) -> Result<()> {
+    fn memory_grow_failed(&mut self, err: wasmtime::Error, _kind: MemoryKind) -> Result<()> {
         self.error = Some(err.to_string());
         Ok(())
     }

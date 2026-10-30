@@ -636,7 +636,7 @@ unsafe impl InstanceAllocator for PoolingInstanceAllocator {
         request: &'a mut InstanceAllocationRequest<'b, 'c>,
         ty: &'a wasmtime_environ::Memory,
         memory_index: Option<DefinedMemoryIndex>,
-        _memory_kind: MemoryKind,
+        memory_kind: MemoryKind,
     ) -> Pin<Box<dyn Future<Output = Result<(MemoryAllocationIndex, Memory)>> + Send + 'a>> {
         crate::runtime::box_future(async move {
             async {
@@ -644,7 +644,11 @@ unsafe impl InstanceAllocator for PoolingInstanceAllocator {
                 // `with_flush_and_retry` but adapted for async closures instead of only
                 // sync closures. Right now that won't compile though so this is the
                 // manually expanded version of the method.
-                let mut e = match self.memories.allocate(request, ty, memory_index).await {
+                let mut e = match self
+                    .memories
+                    .allocate(request, ty, memory_index, memory_kind)
+                    .await
+                {
                     Ok(result) => return Ok(result),
                     Err(e) => e,
                 };
@@ -655,7 +659,11 @@ unsafe impl InstanceAllocator for PoolingInstanceAllocator {
                     }
                     let queue = self.decommit_queue(shard).lock().unwrap();
                     if self.flush_decommit_queue(queue) {
-                        match self.memories.allocate(request, ty, memory_index).await {
+                        match self
+                            .memories
+                            .allocate(request, ty, memory_index, memory_kind)
+                            .await
+                        {
                             Ok(result) => return Ok(result),
                             Err(err) => e = err,
                         }

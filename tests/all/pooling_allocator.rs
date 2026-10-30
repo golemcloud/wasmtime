@@ -523,7 +523,13 @@ fn drop_externref_global_during_module_init() -> Result<()> {
     struct Limiter;
 
     impl ResourceLimiter for Limiter {
-        fn memory_growing(&mut self, _: usize, _: usize, _: Option<usize>) -> Result<bool> {
+        fn memory_growing(
+            &mut self,
+            _: usize,
+            _: usize,
+            _: Option<usize>,
+            _: MemoryKind,
+        ) -> Result<bool> {
             Ok(false)
         }
 
@@ -1473,7 +1479,13 @@ fn memory_reset_if_instantiation_fails() -> Result<()> {
     struct Limiter;
 
     impl ResourceLimiter for Limiter {
-        fn memory_growing(&mut self, _: usize, _: usize, _: Option<usize>) -> Result<bool> {
+        fn memory_growing(
+            &mut self,
+            _: usize,
+            _: usize,
+            _: Option<usize>,
+            _: MemoryKind,
+        ) -> Result<bool> {
             Ok(false)
         }
 

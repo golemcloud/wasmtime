@@ -246,12 +246,12 @@ impl Memory {
         limiter: Option<&mut StoreResourceLimiter<'_>>,
         kind: MemoryKind,
     ) -> Result<Self> {
-        let (minimum, maximum) = Self::limit_new(ty, limiter).await?;
+        let (minimum, maximum) = Self::limit_new(ty, kind, limiter).await?;
         let tunables = engine.tunables();
         let memory_tunables = MemoryTunables::new(tunables, kind);
         let allocation = creator.new_memory(ty, &memory_tunables, minimum, maximum)?;
 
-        let memory = LocalMemory::new(ty, &memory_tunables, allocation, memory_image)?;
+        let memory = LocalMemory::new(ty, &memory_tunables, allocation, memory_image, kind)?;
         Ok(if ty.shared {
             Memory::Shared(SharedMemory::wrap(engine, ty, memory)?)
         } else {
@@ -264,12 +264,13 @@ impl Memory {
     pub async fn new_static(
         ty: &wasmtime_environ::Memory,
         memory_tunables: &MemoryTunables<'_>,
+        kind: MemoryKind,
         base: MemoryBase,
         base_capacity: usize,
         memory_image: MemoryImageSlot,
         limiter: Option<&mut StoreResourceLimiter<'_>>,
     ) -> Result<Self> {
-        let (minimum, maximum) = Self::limit_new(ty, limiter).await?;
+        let (minimum, maximum) = Self::limit_new(ty, kind, limiter).await?;
         let pooled_memory = StaticMemory::new(base, base_capacity, minimum, maximum)?;
         let allocation = try_new::<Box<_>>(pooled_memory)?;
 
@@ -277,7 +278,7 @@ impl Memory {
         // `LocalMemory` structure created, notably we already have
         // `memory_image` and regardless of configuration settings this memory
         // can't move its base pointer since it's a fixed allocation.
-        let mut memory = LocalMemory::new(ty, memory_tunables, allocation, None)?;
+        let mut memory = LocalMemory::new(ty, memory_tunables, allocation, None, kind)?;
         assert!(memory.memory_image.is_none());
         memory.memory_image = Some(memory_image);
         memory.memory_may_move = false;
@@ -298,6 +299,7 @@ impl Memory {
     /// size) of the memory, all in bytes.
     pub(crate) async fn limit_new(
         ty: &wasmtime_environ::Memory,
+        kind: MemoryKind,
         limiter: Option<&mut StoreResourceLimiter<'_>>,
     ) -> Result<(usize, Option<usize>)> {
         let page_size = usize::try_from(ty.page_size()).unwrap();
@@ -343,7 +345,7 @@ impl Memory {
         // now the expected uses of limiter means that's ok.
         if let Some(limiter) = limiter {
             if !limiter
-                .memory_growing(0, minimum.unwrap_or(absolute_max), maximum)
+                .memory_growing(0, minimum.unwrap_or(absolute_max), maximum, kind.into())
                 .await?
             {
                 bail!(
@@ -398,8 +400,14 @@ impl Memory {
     /// Grow memory by the specified amount of wasm pages.
     ///
     /// Returns `None` if memory can't be grown by the specified amount
-    /// of wasm pages. Returns `Some` with the old size of memory, in bytes, on
-    /// successful growth.
+    /// of wasm pages. Returns `Some` with the old and new sizes of memory, in
+    /// bytes, on successful growth.
+    ///
+    /// Note that this does *not* emit the limiter's `memory_grown`
+    /// notification: at the point this returns the backing allocation has
+    /// committed but the owning `VMContext` has not yet been refreshed. Callers
+    /// are responsible for publishing the new [`VMMemoryDefinition`] and then
+    /// calling [`Self::notify_grown`].
     ///
     /// # Safety
     ///
@@ -416,14 +424,35 @@ impl Memory {
         &mut self,
         delta_pages: u64,
         limiter: Option<&mut StoreResourceLimiter<'_>>,
-    ) -> Result<Option<usize>, Error> {
-        let result = match self {
-            Memory::Local(mem) => mem.grow(delta_pages, limiter).await?,
-            Memory::Shared(mem) => mem.grow(delta_pages)?,
-        };
-        match result {
-            Some((old, _new)) => Ok(Some(old)),
-            None => Ok(None),
+    ) -> Result<Option<(usize, usize)>, Error> {
+        match self {
+            Memory::Local(mem) => mem.grow(delta_pages, limiter).await,
+            Memory::Shared(mem) => mem.grow(delta_pages),
+        }
+    }
+
+    /// Emits the limiter's `memory_grown` notification for a growth that
+    /// [`Self::grow`] just reported as successful.
+    ///
+    /// This must be called only *after* the refreshed [`VMMemoryDefinition`]
+    /// has been published to whatever owns this memory, so that embedder code
+    /// which panics cannot leave a `VMContext` pointing at a stale base or
+    /// length.
+    ///
+    /// The notification is suppressed for shared memories, which have no
+    /// associated limiter, and for growth of zero bytes.
+    pub fn notify_grown(
+        &self,
+        limiter: Option<&mut StoreResourceLimiter<'_>>,
+        old_byte_size: usize,
+        new_byte_size: usize,
+    ) {
+        let Memory::Local(mem) = self else { return };
+        if new_byte_size <= old_byte_size {
+            return;
+        }
+        if let Some(limiter) = limiter {
+            limiter.memory_grown(old_byte_size, new_byte_size, mem.limiter_kind());
         }
     }
 
@@ -536,6 +565,7 @@ impl Memory {
 pub struct LocalMemory {
     alloc: Box<dyn RuntimeLinearMemory>,
     ty: wasmtime_environ::Memory,
+    kind: MemoryKind,
     memory_may_move: bool,
     memory_guard_size: usize,
     memory_reservation: usize,
@@ -551,6 +581,7 @@ impl LocalMemory {
         memory_tunables: &MemoryTunables<'_>,
         alloc: Box<dyn RuntimeLinearMemory>,
         memory_image: Option<&Arc<MemoryImage>>,
+        kind: MemoryKind,
     ) -> Result<LocalMemory> {
         // If a memory image was specified, try to create the MemoryImageSlot on
         // top of our mmap.
@@ -586,6 +617,7 @@ impl LocalMemory {
         };
         Ok(LocalMemory {
             ty: *ty,
+            kind,
             alloc,
             memory_may_move: ty.memory_may_move(memory_tunables),
             memory_image,
@@ -596,6 +628,14 @@ impl LocalMemory {
 
     pub fn ty(&self) -> &wasmtime_environ::Memory {
         &self.ty
+    }
+
+    /// This memory's kind as the embedder-facing [`crate::MemoryKind`].
+    ///
+    /// Note that `MemoryKind` in this module refers to the `wasmtime_environ`
+    /// type; this converts to the public one the limiter callbacks take.
+    fn limiter_kind(&self) -> crate::MemoryKind {
+        self.kind.into()
     }
 
     /// Grows a memory by `delta_pages`.
@@ -643,7 +683,7 @@ impl LocalMemory {
         if !self.ty().allow_growth_to(new_byte_size) {
             if let Some(limiter) = limiter {
                 let err = crate::format_err!("memory growth exceeds memory type's limits");
-                limiter.memory_grow_failed(err)?;
+                limiter.memory_grow_failed(err, self.limiter_kind())?;
             }
             return Ok(None);
         }
@@ -651,7 +691,7 @@ impl LocalMemory {
         // Store limiter gets first chance to reject memory_growing.
         if let Some(limiter) = &mut limiter {
             if !limiter
-                .memory_growing(old_byte_size, new_byte_size, maximum)
+                .memory_growing(old_byte_size, new_byte_size, maximum, self.limiter_kind())
                 .await?
             {
                 return Ok(None);
@@ -712,6 +752,13 @@ impl LocalMemory {
                     assert_eq!(base_ptr_before, self.alloc.base().as_mut_ptr());
                 }
 
+                // NB: the `memory_grown` notification is deliberately *not*
+                // emitted here. The backing allocation has committed but the
+                // owning `VMContext` still holds the pre-growth base pointer
+                // and length, so running embedder code at this point would let
+                // a panic escape with compiled wasm observing stale bounds or a
+                // freed base. Callers emit the notification once they have
+                // published the refreshed `VMMemoryDefinition`.
                 Ok(Some((old_byte_size, new_byte_size)))
             }
             Err(e) => {
@@ -720,7 +767,7 @@ impl LocalMemory {
                 // dropped
                 // (https://github.com/bytecodealliance/wasmtime/issues/4240).
                 if let Some(limiter) = limiter {
-                    limiter.memory_grow_failed(e)?;
+                    limiter.memory_grow_failed(e, self.limiter_kind())?;
                 }
                 Ok(None)
             }
