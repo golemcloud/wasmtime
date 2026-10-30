@@ -91,7 +91,7 @@ impl<'a> bindings::types::HostFutureClientStreams for WasiTlsCtxView<'a> {
         &mut self,
         this: Resource<HostFutureClientStreams>,
     ) -> wasmtime::Result<Resource<DynPollable>> {
-        wasmtime_wasi::p2::subscribe(self.table, this)
+        wasmtime_wasi::p2::subscribe(self.table, this, None)
     }
 
     fn get(

@@ -83,6 +83,9 @@ impl InputStream for AsyncStdinStream {
             }
         }
     }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
 }
 
 #[async_trait::async_trait]
@@ -194,6 +197,9 @@ impl OutputStream for AsyncStdoutStream {
                 Err(_) => {}
             }
         }
+    }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
     }
 }
 

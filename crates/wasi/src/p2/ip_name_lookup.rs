@@ -12,8 +12,15 @@ use wasmtime_wasi_io::poll::{DynPollable, Pollable, subscribe};
 
 pub struct ResolveAddressStream(MaybeSpawned<Result<vec::IntoIter<IpAddr>, ErrorCode>>);
 
+impl ResolveAddressStream {
+    /// Creates an immediately ready stream from addresses that are already resolved.
+    pub fn from_addresses(addresses: Vec<IpAddr>) -> Self {
+        Self(MaybeSpawned::Ready(Ok(addresses.into_iter())))
+    }
+}
+
 impl Host for WasiSocketsCtxView<'_> {
-    fn resolve_addresses(
+    async fn resolve_addresses(
         &mut self,
         network: Resource<Network>,
         name: String,
@@ -56,7 +63,7 @@ impl HostResolveAddressStream for WasiSocketsCtxView<'_> {
         &mut self,
         resource: Resource<ResolveAddressStream>,
     ) -> Result<Resource<DynPollable>> {
-        subscribe(self.table, resource)
+        subscribe(self.table, resource, None)
     }
 
     async fn drop(&mut self, resource: Resource<ResolveAddressStream>) -> Result<()> {
@@ -75,47 +82,52 @@ impl Pollable for ResolveAddressStream {
     }
 }
 
-mod sync {
-    use super::ResolveAddressStream;
-    use crate::p2::SocketError;
-    use crate::p2::bindings::sockets::network::{IpAddress, Network};
-    use crate::p2::bindings::sync::sockets::ip_name_lookup::{Host, HostResolveAddressStream};
-    use crate::runtime::in_tokio;
-    use crate::sockets::WasiSocketsCtxView;
-    use wasmtime::Result;
-    use wasmtime::component::Resource;
-    use wasmtime_wasi_io::poll::DynPollable;
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sockets::WasiSocketsCtx;
+    use std::net::{Ipv4Addr, Ipv6Addr};
+    use wasmtime::component::ResourceTable;
 
-    impl Host for WasiSocketsCtxView<'_> {
-        fn resolve_addresses(
-            &mut self,
-            network: Resource<Network>,
-            name: String,
-        ) -> Result<Resource<ResolveAddressStream>, SocketError> {
-            <Self as super::Host>::resolve_addresses(self, network, name)
+    #[tokio::test]
+    async fn resolved_addresses_preserve_order_and_exhaustion() -> Result<()> {
+        for addresses in [
+            vec![],
+            vec![
+                IpAddr::V4(Ipv4Addr::LOCALHOST),
+                IpAddr::V6(Ipv6Addr::LOCALHOST),
+                IpAddr::V4(Ipv4Addr::LOCALHOST),
+            ],
+        ] {
+            let mut stream = ResolveAddressStream::from_addresses(addresses.clone());
+            assert!(poll_now(|cx| stream.ready().as_mut().poll(cx)).is_some());
+            let mut table = ResourceTable::new();
+            let resource = table.push(stream)?;
+            let mut ctx = WasiSocketsCtx::default();
+            let mut view = WasiSocketsCtxView {
+                ctx: &mut ctx,
+                table: &mut table,
+            };
+            for expected in addresses {
+                let actual = view
+                    .resolve_next_address(Resource::new_borrow(resource.rep()))?
+                    .map(|address| match address {
+                        IpAddress::Ipv4((a, b, c, d)) => IpAddr::from([a, b, c, d]),
+                        IpAddress::Ipv6((a, b, c, d, e, f, g, h)) => {
+                            IpAddr::from([a, b, c, d, e, f, g, h])
+                        }
+                    });
+                assert_eq!(actual, Some(expected));
+            }
+            for _ in 0..2 {
+                assert!(
+                    view.resolve_next_address(Resource::new_borrow(resource.rep()))?
+                        .is_none()
+                );
+            }
+            HostResolveAddressStream::drop(&mut view, resource).await?;
         }
-    }
-
-    impl HostResolveAddressStream for WasiSocketsCtxView<'_> {
-        fn resolve_next_address(
-            &mut self,
-            resource: Resource<ResolveAddressStream>,
-        ) -> Result<Option<IpAddress>, SocketError> {
-            <Self as super::HostResolveAddressStream>::resolve_next_address(self, resource)
-        }
-
-        fn subscribe(
-            &mut self,
-            resource: Resource<ResolveAddressStream>,
-        ) -> Result<Resource<DynPollable>> {
-            <Self as super::HostResolveAddressStream>::subscribe(self, resource)
-        }
-
-        fn drop(&mut self, resource: Resource<ResolveAddressStream>) -> Result<()> {
-            in_tokio(<Self as super::HostResolveAddressStream>::drop(
-                self, resource,
-            ))
-        }
+        Ok(())
     }
 }
 
@@ -139,13 +151,13 @@ mod named {
             err.downcast()
         }
 
-        fn resolve_addresses(
+        async fn resolve_addresses(
             &mut self,
             id: NamedId,
             network: Resource<Network>,
             name: String,
         ) -> Result<Resource<ResolveAddressStream>, SocketError> {
-            super::Host::resolve_addresses(&mut self.0.sockets(id), network, name)
+            super::Host::resolve_addresses(&mut self.0.sockets(id), network, name).await
         }
     }
 

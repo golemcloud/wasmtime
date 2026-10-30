@@ -304,23 +304,27 @@ impl<T: Send> HostTcpSocketWithStore<T> for WasiSockets {
         listen(store, &socket_resource, getter).await
     }
 
-    fn send(
-        mut store: Access<'_, T, Self>,
+    async fn send(
+        store: &Accessor<T, Self>,
         socket: Resource<TcpSocket>,
         data: StreamReader<u8>,
     ) -> wasmtime::Result<FutureReader<Result<(), ErrorCode>>> {
-        let socket = get_socket_mut(store.get().table, &socket)?;
-        let stream = socket.take_send_stream();
-        send(&mut store, stream, data)
+        store.with(|mut store| {
+            let socket = get_socket_mut(store.get().table, &socket)?;
+            let stream = socket.take_send_stream();
+            send(&mut store, stream, data)
+        })
     }
 
-    fn receive(
-        mut store: Access<T, Self>,
+    async fn receive(
+        store: &Accessor<T, Self>,
         socket: Resource<TcpSocket>,
     ) -> wasmtime::Result<(StreamReader<u8>, FutureReader<Result<(), ErrorCode>>)> {
-        let socket = get_socket_mut(store.get().table, &socket)?;
-        let stream = socket.take_receive_stream();
-        receive(&mut store, stream)
+        store.with(|mut store| {
+            let socket = get_socket_mut(store.get().table, &socket)?;
+            let stream = socket.take_receive_stream();
+            receive(&mut store, stream)
+        })
     }
 }
 
@@ -531,25 +535,29 @@ mod named {
             .await
         }
 
-        fn send(
-            mut store: Access<'_, U, Self>,
+        async fn send(
+            store: &Accessor<U, Self>,
             id: NamedId,
             socket: Resource<TcpSocket>,
             data: StreamReader<u8>,
         ) -> wasmtime::Result<FutureReader<Result<(), ErrorCode>>> {
-            let socket = super::get_socket_mut(store.get().0.sockets(id).table, &socket)?;
-            let stream = socket.take_send_stream();
-            super::send(&mut store, stream, data)
+            store.with(|mut store| {
+                let socket = super::get_socket_mut(store.get().0.sockets(id).table, &socket)?;
+                let stream = socket.take_send_stream();
+                super::send(&mut store, stream, data)
+            })
         }
 
-        fn receive(
-            mut store: Access<U, Self>,
+        async fn receive(
+            store: &Accessor<U, Self>,
             id: NamedId,
             socket: Resource<TcpSocket>,
         ) -> wasmtime::Result<(StreamReader<u8>, FutureReader<Result<(), ErrorCode>>)> {
-            let socket = super::get_socket_mut(store.get().0.sockets(id).table, &socket)?;
-            let stream = socket.take_receive_stream();
-            super::receive(&mut store, stream)
+            store.with(|mut store| {
+                let socket = super::get_socket_mut(store.get().0.sockets(id).table, &socket)?;
+                let stream = socket.take_receive_stream();
+                super::receive(&mut store, stream)
+            })
         }
     }
 

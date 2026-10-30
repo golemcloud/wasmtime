@@ -40,7 +40,7 @@
 //! });
 //!
 //! struct MyState {
-//!     ctx: WasiCtx,
+//!     ctx: (WasiCtx, wasmtime_wasi::IoCtx),
 //!     table: ResourceTable,
 //! }
 //!
@@ -53,7 +53,8 @@
 //! impl WasiView for MyState {
 //!     fn ctx(&mut self) -> WasiCtxView<'_> {
 //!         WasiCtxView{
-//!             ctx: &mut self.ctx,
+//!             ctx: &mut self.ctx.0,
+//!             io_ctx: &mut self.ctx.1,
 //!             table: &mut self.table,
 //!         }
 //!     }
@@ -78,17 +79,27 @@ mod generated {
         path: "src/p3/wit",
         world: "wasi:cli/command",
         imports: {
-            "wasi:cli/stdin": store | tracing | trappable,
-            "wasi:cli/stdout": store | tracing | trappable,
-            "wasi:cli/stderr": store | tracing | trappable,
-            "wasi:filesystem/types.[method]descriptor.read-via-stream": store | tracing | trappable,
-            "wasi:filesystem/types.[method]descriptor.write-via-stream": store | tracing | trappable,
-            "wasi:filesystem/types.[method]descriptor.append-via-stream": store | tracing | trappable,
-            "wasi:filesystem/types.[method]descriptor.read-directory": store | tracing | trappable,
+            "wasi:clocks/system-clock.now": async | tracing | trappable,
+            "wasi:clocks/system-clock.get-resolution": async | tracing | trappable,
+            "wasi:clocks/monotonic-clock.now": async | tracing | trappable,
+            "wasi:clocks/monotonic-clock.get-resolution": async | tracing | trappable,
+            "wasi:random/random.get-random-bytes": async | tracing | trappable,
+            "wasi:random/random.get-random-u64": async | tracing | trappable,
+            "wasi:random/insecure.get-insecure-random-bytes": async | tracing | trappable,
+            "wasi:random/insecure.get-insecure-random-u64": async | tracing | trappable,
+            "wasi:random/insecure-seed.get-insecure-seed": async | tracing | trappable,
+            "wasi:cli/environment.get-environment": async | tracing | trappable,
+            "wasi:cli/stdin": store | async | tracing | trappable,
+            "wasi:cli/stdout": store | async | tracing | trappable,
+            "wasi:cli/stderr": store | async | tracing | trappable,
+            "wasi:filesystem/types.[method]descriptor.read-via-stream": concurrent | tracing | trappable,
+            "wasi:filesystem/types.[method]descriptor.write-via-stream": concurrent | tracing | trappable,
+            "wasi:filesystem/types.[method]descriptor.append-via-stream": concurrent | tracing | trappable,
+            "wasi:filesystem/types.[method]descriptor.read-directory": concurrent | tracing | trappable,
             "wasi:sockets/types.[method]tcp-socket.bind": async | tracing | trappable,
             "wasi:sockets/types.[method]tcp-socket.listen": async | store | tracing | trappable,
-            "wasi:sockets/types.[method]tcp-socket.send": store | tracing | trappable,
-            "wasi:sockets/types.[method]tcp-socket.receive": store | tracing | trappable,
+            "wasi:sockets/types.[method]tcp-socket.send": concurrent | tracing | trappable,
+            "wasi:sockets/types.[method]tcp-socket.receive": concurrent | tracing | trappable,
             "wasi:sockets/types.[static]udp-socket.create": async | tracing | trappable,
             "wasi:sockets/types.[method]udp-socket.bind": async | tracing | trappable,
             "wasi:sockets/types.[method]udp-socket.connect": async | tracing | trappable,
@@ -192,14 +203,15 @@ pub use self::generated::wasi::*;
 /// }
 ///
 /// struct MyState {
-///     ctx: WasiCtx,
+///     ctx: (WasiCtx, wasmtime_wasi::IoCtx),
 ///     table: ResourceTable,
 /// }
 ///
 /// impl WasiView for MyState {
 ///     fn ctx(&mut self) -> WasiCtxView<'_> {
 ///         WasiCtxView{
-///             ctx: &mut self.ctx,
+///             ctx: &mut self.ctx.0,
+///             io_ctx: &mut self.ctx.1,
 ///             table: &mut self.table,
 ///         }
 ///     }
@@ -266,14 +278,15 @@ pub use self::generated::Command;
 /// }
 ///
 /// struct MyState {
-///     ctx: WasiCtx,
+///     ctx: (WasiCtx, wasmtime_wasi::IoCtx),
 ///     table: ResourceTable,
 /// }
 ///
 /// impl WasiView for MyState {
 ///     fn ctx(&mut self) -> WasiCtxView<'_> {
 ///         WasiCtxView{
-///             ctx: &mut self.ctx,
+///             ctx: &mut self.ctx.0,
+///             io_ctx: &mut self.ctx.1,
 ///             table: &mut self.table,
 ///         }
 ///     }

@@ -156,14 +156,15 @@ impl<I, E> Drop for FallibleIteratorProducer<I, E> {
 ///
 /// #[derive(Default)]
 /// struct MyState {
-///     ctx: WasiCtx,
+///     ctx: (WasiCtx, wasmtime_wasi::IoCtx),
 ///     table: ResourceTable,
 /// }
 ///
 /// impl WasiView for MyState {
 ///     fn ctx(&mut self) -> WasiCtxView<'_> {
 ///         WasiCtxView{
-///             ctx: &mut self.ctx,
+///             ctx: &mut self.ctx.0,
+///             io_ctx: &mut self.ctx.1,
 ///             table: &mut self.table,
 ///         }
 ///     }
@@ -294,7 +295,7 @@ pub enum Interface {
 ///     // also use `name_map` to configure each context differently.
 ///     let mut my_state = MyState::default();
 ///     for _ in 0..name_map.len() {
-///         my_state.contexts.push(WasiCtx::default());
+///         my_state.contexts.push(WasiCtx::builder().build());
 ///     }
 ///     let mut store = Store::new(&engine, my_state);
 ///
@@ -306,13 +307,15 @@ pub enum Interface {
 /// #[derive(Default)]
 /// struct MyState {
 ///     table: ResourceTable,
-///     contexts: Vec<WasiCtx>,
+///     contexts: Vec<(WasiCtx, wasmtime_wasi::IoCtx)>,
 /// }
 ///
 /// impl WasiNamedView for MyState {
 ///     fn ctx(&mut self, id: NamedId) -> WasiCtxView<'_> {
+///         let (ctx, io_ctx) = &mut self.contexts[id.0];
 ///         WasiCtxView {
-///             ctx: &mut self.contexts[id.0],
+///             ctx,
+///             io_ctx,
 ///             table: &mut self.table,
 ///         }
 ///     }

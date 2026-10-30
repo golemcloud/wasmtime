@@ -914,7 +914,7 @@ mod tests {
     async fn accepted_remote_address_survives_reset() {
         let mut ctx = WasiCtxBuilder::new();
         ctx.inherit_network().allow_tcp(true);
-        let ctx = ctx.build();
+        let (ctx, _) = ctx.build();
         let mut socket = TcpSocket::new(&ctx.sockets, SocketAddressFamily::Ipv4).unwrap();
         socket.bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
         let mut listener = socket.listen().await.unwrap();
@@ -953,7 +953,7 @@ mod tests {
     async fn connected_remote_address_survives_reset() {
         let mut ctx = WasiCtxBuilder::new();
         ctx.inherit_network().allow_tcp(true);
-        let ctx = ctx.build();
+        let (ctx, _) = ctx.build();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let peer = listener.local_addr().unwrap();
 

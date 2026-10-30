@@ -18,13 +18,13 @@
 //!
 //! struct Ctx {
 //!     table: ResourceTable,
-//!     wasi_ctx: WasiCtx,
+//!     wasi_ctx: (WasiCtx, wasmtime_wasi::IoCtx),
 //!     wasi_tls_ctx: WasiTlsCtx,
 //! }
 //!
 //! impl WasiView for Ctx {
 //!     fn ctx(&mut self) -> WasiCtxView<'_> {
-//!         WasiCtxView { ctx: &mut self.wasi_ctx, table: &mut self.table }
+//!         WasiCtxView { ctx: &mut self.wasi_ctx.0, table: &mut self.table, io_ctx: &mut self.wasi_ctx.1 }
 //!     }
 //! }
 //!

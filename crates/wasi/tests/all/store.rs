@@ -87,14 +87,19 @@ impl<T> Drop for Ctx<T> {
 
 pub struct MyWasiCtx {
     wasi: WasiCtx,
+    io_ctx: wasmtime_wasi::IoCtx,
     table: ResourceTable,
 }
 
 impl MyWasiCtx {
-    pub fn new(wasi: WasiCtx) -> Self {
+    pub fn new((wasi, io_ctx): (WasiCtx, wasmtime_wasi::IoCtx)) -> Self {
         let mut table = ResourceTable::new();
         table.set_max_capacity(1000);
-        Self { wasi, table }
+        Self {
+            wasi,
+            io_ctx,
+            table,
+        }
     }
 }
 
@@ -103,6 +108,7 @@ impl WasiView for Ctx<MyWasiCtx> {
         WasiCtxView {
             ctx: &mut self.wasi.wasi,
             table: &mut self.wasi.table,
+            io_ctx: &mut self.wasi.io_ctx,
         }
     }
 }

@@ -245,9 +245,9 @@ fn read_stdin(
     Ok((stream, future))
 }
 
-impl<U> stdin::HostWithStore<U> for WasiCli {
-    fn read_via_stream(
-        mut store: Access<U, Self>,
+impl<U: Send> stdin::HostWithStore<U> for WasiCli {
+    async fn read_via_stream(
+        mut store: Access<'_, U, Self>,
     ) -> wasmtime::Result<(StreamReader<u8>, FutureReader<Result<(), ErrorCode>>)> {
         let rx = store.get().ctx.stdin.async_stream();
         read_stdin(&mut store, rx)
@@ -278,8 +278,8 @@ fn write_output(
     })
 }
 
-impl<U> stdout::HostWithStore<U> for WasiCli {
-    fn write_via_stream(
+impl<U: Send> stdout::HostWithStore<U> for WasiCli {
+    async fn write_via_stream(
         mut store: Access<'_, U, Self>,
         data: StreamReader<u8>,
     ) -> wasmtime::Result<FutureReader<Result<(), ErrorCode>>> {
@@ -290,8 +290,8 @@ impl<U> stdout::HostWithStore<U> for WasiCli {
 
 impl stdout::Host for WasiCliCtxView<'_> {}
 
-impl<U> stderr::HostWithStore<U> for WasiCli {
-    fn write_via_stream(
+impl<U: Send> stderr::HostWithStore<U> for WasiCli {
+    async fn write_via_stream(
         mut store: Access<'_, U, Self>,
         data: StreamReader<u8>,
     ) -> wasmtime::Result<FutureReader<Result<(), ErrorCode>>> {
@@ -303,7 +303,7 @@ impl<U> stderr::HostWithStore<U> for WasiCli {
 impl stderr::Host for WasiCliCtxView<'_> {}
 
 impl environment::Host for WasiCliCtxView<'_> {
-    fn get_environment(&mut self) -> wasmtime::Result<Vec<(String, String)>> {
+    async fn get_environment(&mut self) -> wasmtime::Result<Vec<(String, String)>> {
         Ok(self.ctx.environment.clone())
     }
 
@@ -411,12 +411,12 @@ mod named {
         }
     }
 
-    impl<T, U> stdin::HostWithStore<U> for WasiCliNamed<T>
+    impl<T, U: Send> stdin::HostWithStore<U> for WasiCliNamed<T>
     where
         T: WasiCliNamedView,
     {
-        fn read_via_stream(
-            mut store: Access<U, Self>,
+        async fn read_via_stream(
+            mut store: Access<'_, U, Self>,
             id: NamedId,
         ) -> wasmtime::Result<(StreamReader<u8>, FutureReader<Result<(), ErrorCode>>)> {
             let rx = store.get().0.cli(id).ctx.stdin.async_stream();
@@ -426,11 +426,11 @@ mod named {
 
     impl<T> stdin::Host for WasiCtxNamedView<'_, T> where T: WasiCliNamedView {}
 
-    impl<T, U> stdout::HostWithStore<U> for WasiCliNamed<T>
+    impl<T, U: Send> stdout::HostWithStore<U> for WasiCliNamed<T>
     where
         T: WasiCliNamedView,
     {
-        fn write_via_stream(
+        async fn write_via_stream(
             mut store: Access<'_, U, Self>,
             id: NamedId,
             data: StreamReader<u8>,
@@ -442,11 +442,11 @@ mod named {
 
     impl<T> stdout::Host for WasiCtxNamedView<'_, T> where T: WasiCliNamedView {}
 
-    impl<T, U> stderr::HostWithStore<U> for WasiCliNamed<T>
+    impl<T, U: Send> stderr::HostWithStore<U> for WasiCliNamed<T>
     where
         T: WasiCliNamedView,
     {
-        fn write_via_stream(
+        async fn write_via_stream(
             mut store: Access<'_, U, Self>,
             id: NamedId,
             data: StreamReader<u8>,
@@ -462,8 +462,11 @@ mod named {
     where
         T: WasiCliNamedView,
     {
-        fn get_environment(&mut self, id: NamedId) -> wasmtime::Result<Vec<(String, String)>> {
-            super::environment::Host::get_environment(&mut self.0.cli(id))
+        async fn get_environment(
+            &mut self,
+            id: NamedId,
+        ) -> wasmtime::Result<Vec<(String, String)>> {
+            super::environment::Host::get_environment(&mut self.0.cli(id)).await
         }
 
         fn get_arguments(&mut self, id: NamedId) -> wasmtime::Result<Vec<String>> {

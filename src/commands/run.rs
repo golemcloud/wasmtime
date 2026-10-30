@@ -487,7 +487,7 @@ impl RunCommand {
                 // Exit the process if Wasmtime understands the error;
                 // otherwise, fall back on Rust's default error printing/return
                 // code.
-                if store.data().wasip1_ctx.is_some() {
+                if store.data().wasi_ctx.is_some() {
                     if let Some(exit) = e.downcast_ref::<wasmtime_wasi::I32Exit>() {
                         std::process::exit(exit.0);
                     }
@@ -1136,7 +1136,7 @@ impl RunCommand {
 
         if cli != Some(false) {
             match linker {
-                CliLinker::Core(linker) => {
+                CliLinker::Core(_linker) => {
                     match (self.run.common.wasi.preview2, self.run.common.wasi.threads) {
                         (Some(false), _) | (None, Some(true)) => {
                             let flag = if self.run.common.wasi.preview2 == Some(false) {
@@ -1146,13 +1146,8 @@ impl RunCommand {
                             };
                             bail!("the `{flag}` flag is no longer supported")
                         }
-                        // If preview2 was explicitly requested, always use it.
-                        // Otherwise use it so long as threads are disabled.
+                        // Core modules do not receive WASIp0 or WASIp1 imports.
                         (Some(true), _) | (None, Some(false) | None) => {
-                            if self.run.common.wasi.preview0 == Some(true) {
-                                wasmtime_wasi::p0::add_to_linker_async(linker, |t| t.wasip1_ctx())?;
-                            }
-                            wasmtime_wasi::p1::add_to_linker_async(linker, |t| t.wasip1_ctx())?;
                             self.set_wasi_ctx(store)?;
                         }
                     }
@@ -1184,9 +1179,8 @@ impl RunCommand {
                     #[cfg(feature = "component-model")]
                     CliLinker::Component(linker) => {
                         wasmtime_wasi_nn::wit::add_to_linker(linker, |h: &mut Host| {
-                            let ctx = h.wasip1_ctx.as_mut().expect("wasi is not configured");
                             let nn_ctx = h.wasi_nn_wit.as_mut().unwrap();
-                            WasiNnView::new(ctx.ctx().table, nn_ctx)
+                            WasiNnView::new(&mut h.wasi_table, nn_ctx)
                         })?;
                         store.data_mut().wasi_nn_wit =
                             Some(wasmtime_wasi_nn::wit::WasiNnCtx::new(backends, registry));
@@ -1253,8 +1247,7 @@ impl RunCommand {
                             .build();
 
                         wasmtime_wasi_keyvalue::add_to_linker(linker, |h| {
-                            let ctx = h.wasip1_ctx.as_mut().expect("wasip2 is not configured");
-                            WasiKeyValue::new(h.wasi_keyvalue.as_mut().unwrap(), ctx.ctx().table)
+                            WasiKeyValue::new(h.wasi_keyvalue.as_mut().unwrap(), &mut h.wasi_table)
                         })?;
                         store.data_mut().wasi_keyvalue = Some(ctx);
                     }
@@ -1340,7 +1333,9 @@ impl RunCommand {
             builder.inherit_stderr();
         }
         self.run.configure_wasip2(&mut builder)?;
-        store.data_mut().wasip1_ctx = Some(builder.build_p1());
+        let (ctx, io_ctx) = builder.build();
+        store.data_mut().wasi_ctx = Some(ctx);
+        store.data_mut().wasi_io_ctx = Some(io_ctx);
         Ok(())
     }
 
@@ -1371,10 +1366,9 @@ pub struct Host {
     #[cfg(feature = "profiling")]
     guest_profiler: Option<wasmtime::GuestProfiler>,
 
-    // Context for both WASIp1 and WASIp2 (and beyond) for the `wasmtime_wasi`
-    // crate. This has both `wasmtime_wasi::WasiCtx` as well as a
-    // `ResourceTable` internally to be used.
-    wasip1_ctx: Option<wasmtime_wasi::p1::WasiP1Ctx>,
+    wasi_ctx: Option<wasmtime_wasi::WasiCtx>,
+    wasi_io_ctx: Option<wasmtime_wasi::IoCtx>,
+    wasi_table: wasmtime::component::ResourceTable,
 
     #[cfg(feature = "wasi-nn")]
     wasi_nn_wit: Option<wasmtime_wasi_nn::wit::WasiNnCtx>,
@@ -1394,15 +1388,13 @@ pub struct Host {
     wasi_tls: Option<wasmtime_wasi_tls::WasiTlsCtx>,
 }
 
-impl Host {
-    pub(crate) fn wasip1_ctx(&mut self) -> &mut wasmtime_wasi::p1::WasiP1Ctx {
-        self.wasip1_ctx.as_mut().unwrap()
-    }
-}
-
 impl WasiView for Host {
     fn ctx(&mut self) -> WasiCtxView<'_> {
-        WasiView::ctx(self.wasip1_ctx())
+        WasiCtxView {
+            ctx: self.wasi_ctx.as_mut().expect("wasi is not configured"),
+            table: &mut self.wasi_table,
+            io_ctx: self.wasi_io_ctx.as_mut().expect("wasi is not configured"),
+        }
     }
 }
 
@@ -1411,7 +1403,7 @@ impl wasmtime_wasi_http::WasiHttpView for Host {
     fn http(&mut self) -> wasmtime_wasi_http::WasiHttpCtxView<'_> {
         let ctx = self.wasi_http.as_mut().unwrap();
         wasmtime_wasi_http::WasiHttpCtxView {
-            table: WasiView::ctx(self.wasip1_ctx.as_mut().unwrap()).table,
+            table: &mut self.wasi_table,
             ctx,
             hooks: &mut self.wasi_http_hooks,
         }
@@ -1422,7 +1414,7 @@ impl wasmtime_wasi_http::WasiHttpView for Host {
 impl wasmtime_wasi_tls::WasiTlsView for Host {
     fn tls(&mut self) -> wasmtime_wasi_tls::WasiTlsCtxView<'_> {
         wasmtime_wasi_tls::WasiTlsCtxView {
-            table: WasiView::ctx(self.wasip1_ctx.as_mut().unwrap()).table,
+            table: &mut self.wasi_table,
             ctx: self.wasi_tls.as_mut().unwrap(),
         }
     }

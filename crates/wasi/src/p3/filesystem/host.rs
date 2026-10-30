@@ -18,7 +18,7 @@ use std::time::SystemTime;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::{JoinHandle, spawn_blocking};
 use wasmtime::component::{
-    Access, Accessor, Destination, FutureReader, Resource, ResourceTable, Source, StreamConsumer,
+    Accessor, Destination, FutureReader, Resource, ResourceTable, Source, StreamConsumer,
     StreamProducer, StreamReader, StreamResult,
 };
 use wasmtime::error::Context as _;
@@ -856,33 +856,39 @@ impl WasiFilesystemCtxView<'_> {
     }
 }
 
-impl<U> types::HostDescriptorWithStore<U> for WasiFilesystem {
-    fn read_via_stream(
-        mut store: Access<U, Self>,
+impl<U: Send> types::HostDescriptorWithStore<U> for WasiFilesystem {
+    async fn read_via_stream(
+        store: &Accessor<U, Self>,
         fd: Resource<Descriptor>,
         offset: Filesize,
     ) -> wasmtime::Result<(StreamReader<u8>, FutureReader<Result<(), ErrorCode>>)> {
-        let fd = get_descriptor(store.get().table, &fd)?.clone();
-        read_via_stream(&mut store, fd, offset)
+        store.with(|mut store| {
+            let fd = get_descriptor(store.get().table, &fd)?.clone();
+            read_via_stream(&mut store, fd, offset)
+        })
     }
 
-    fn write_via_stream(
-        mut store: Access<'_, U, Self>,
+    async fn write_via_stream(
+        store: &Accessor<U, Self>,
         fd: Resource<Descriptor>,
         data: StreamReader<u8>,
         offset: Filesize,
     ) -> wasmtime::Result<FutureReader<Result<(), ErrorCode>>> {
-        let file = get_writable_file(store.get().table, &fd);
-        write_via_stream(&mut store, file, data, WriteLocation::Offset(offset))
+        store.with(|mut store| {
+            let file = get_writable_file(store.get().table, &fd);
+            write_via_stream(&mut store, file, data, WriteLocation::Offset(offset))
+        })
     }
 
-    fn append_via_stream(
-        mut store: Access<'_, U, Self>,
+    async fn append_via_stream(
+        store: &Accessor<U, Self>,
         fd: Resource<Descriptor>,
         data: StreamReader<u8>,
     ) -> wasmtime::Result<FutureReader<Result<(), ErrorCode>>> {
-        let file = get_writable_file(store.get().table, &fd);
-        write_via_stream(&mut store, file, data, WriteLocation::End)
+        store.with(|mut store| {
+            let file = get_writable_file(store.get().table, &fd);
+            write_via_stream(&mut store, file, data, WriteLocation::End)
+        })
     }
 
     async fn advise(
@@ -940,15 +946,17 @@ impl<U> types::HostDescriptorWithStore<U> for WasiFilesystem {
             .await
     }
 
-    fn read_directory(
-        mut store: Access<'_, U, Self>,
+    async fn read_directory(
+        store: &Accessor<U, Self>,
         fd: Resource<Descriptor>,
     ) -> wasmtime::Result<(
         StreamReader<DirectoryEntry>,
         FutureReader<Result<(), ErrorCode>>,
     )> {
-        let dir = get_dir(store.get().table, &fd).cloned();
-        read_directory(&mut store, dir)
+        store.with(|mut store| {
+            let dir = get_dir(store.get().table, &fd).cloned();
+            read_directory(&mut store, dir)
+        })
     }
 
     async fn sync(store: &Accessor<U, Self>, fd: Resource<Descriptor>) -> FilesystemResult<()> {
@@ -1137,7 +1145,7 @@ mod named {
     use crate::p3::bindings::named_imports::wasi::filesystem::{preopens, types};
     use crate::p3::filesystem::{FilesystemError, FilesystemResult};
     use crate::{NamedId, WasiCtxNamedView};
-    use wasmtime::component::{Access, Accessor, FutureReader, Resource, StreamReader};
+    use wasmtime::component::{Accessor, FutureReader, Resource, StreamReader};
 
     impl<T> types::Host for WasiCtxNamedView<'_, T>
     where
@@ -1148,39 +1156,50 @@ mod named {
         }
     }
 
-    impl<T, U> types::HostDescriptorWithStore<U> for WasiFilesystemNamed<T>
+    impl<T, U: Send> types::HostDescriptorWithStore<U> for WasiFilesystemNamed<T>
     where
         T: WasiFilesystemNamedView,
     {
-        fn read_via_stream(
-            mut store: Access<U, Self>,
+        async fn read_via_stream(
+            store: &Accessor<U, Self>,
             id: NamedId,
             fd: Resource<Descriptor>,
             offset: Filesize,
         ) -> wasmtime::Result<(StreamReader<u8>, FutureReader<Result<(), ErrorCode>>)> {
-            let fd = super::get_descriptor(store.get().0.filesystem(id).table, &fd)?.clone();
-            super::read_via_stream(&mut store, fd, offset)
+            store.with(|mut store| {
+                let fd = super::get_descriptor(store.get().0.filesystem(id).table, &fd)?.clone();
+                super::read_via_stream(&mut store, fd, offset)
+            })
         }
 
-        fn write_via_stream(
-            mut store: Access<'_, U, Self>,
+        async fn write_via_stream(
+            store: &Accessor<U, Self>,
             id: NamedId,
             fd: Resource<Descriptor>,
             data: StreamReader<u8>,
             offset: Filesize,
         ) -> wasmtime::Result<FutureReader<Result<(), ErrorCode>>> {
-            let file = super::get_writable_file(store.get().0.filesystem(id).table, &fd);
-            super::write_via_stream(&mut store, file, data, super::WriteLocation::Offset(offset))
+            store.with(|mut store| {
+                let file = super::get_writable_file(store.get().0.filesystem(id).table, &fd);
+                super::write_via_stream(
+                    &mut store,
+                    file,
+                    data,
+                    super::WriteLocation::Offset(offset),
+                )
+            })
         }
 
-        fn append_via_stream(
-            mut store: Access<'_, U, Self>,
+        async fn append_via_stream(
+            store: &Accessor<U, Self>,
             id: NamedId,
             fd: Resource<Descriptor>,
             data: StreamReader<u8>,
         ) -> wasmtime::Result<FutureReader<Result<(), ErrorCode>>> {
-            let file = super::get_writable_file(store.get().0.filesystem(id).table, &fd);
-            super::write_via_stream(&mut store, file, data, super::WriteLocation::End)
+            store.with(|mut store| {
+                let file = super::get_writable_file(store.get().0.filesystem(id).table, &fd);
+                super::write_via_stream(&mut store, file, data, super::WriteLocation::End)
+            })
         }
 
         async fn advise(
@@ -1261,16 +1280,18 @@ mod named {
             result.await
         }
 
-        fn read_directory(
-            mut store: Access<'_, U, Self>,
+        async fn read_directory(
+            store: &Accessor<U, Self>,
             id: NamedId,
             fd: Resource<Descriptor>,
         ) -> wasmtime::Result<(
             StreamReader<DirectoryEntry>,
             FutureReader<Result<(), ErrorCode>>,
         )> {
-            let dir = super::get_dir(store.get().0.filesystem(id).table, &fd).cloned();
-            super::read_directory(&mut store, dir)
+            store.with(|mut store| {
+                let dir = super::get_dir(store.get().0.filesystem(id).table, &fd).cloned();
+                super::read_directory(&mut store, dir)
+            })
         }
 
         async fn sync(

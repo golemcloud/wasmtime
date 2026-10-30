@@ -77,6 +77,10 @@ enum StdioOutputStream {
 const WRITE_BUDGET: usize = crate::MAX_READ_SIZE_ALLOC;
 
 impl OutputStream for StdioOutputStream {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
     fn write(&mut self, bytes: Bytes) -> p2::StreamResult<()> {
         if bytes.len() > WRITE_BUDGET {
             return Err(p2::StreamError::Trap(wasmtime::format_err!(

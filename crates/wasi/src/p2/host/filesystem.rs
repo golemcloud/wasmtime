@@ -11,10 +11,8 @@ use std::time::SystemTime;
 use wasmtime::component::Resource;
 use wasmtime_wasi_io::streams::{DynInputStream, DynOutputStream};
 
-mod sync;
-
 impl preopens::Host for WasiFilesystemCtxView<'_> {
-    fn get_directories(&mut self) -> wasmtime::Result<Vec<(Resource<Descriptor>, String)>> {
+    async fn get_directories(&mut self) -> wasmtime::Result<Vec<(Resource<Descriptor>, String)>> {
         self.get_directories()
     }
 }
@@ -359,7 +357,7 @@ impl HostDescriptor for WasiFilesystemCtxView<'_> {
         Ok(())
     }
 
-    fn read_via_stream(
+    async fn read_via_stream(
         &mut self,
         fd: Resource<types::Descriptor>,
         offset: types::Filesize,
@@ -380,7 +378,7 @@ impl HostDescriptor for WasiFilesystemCtxView<'_> {
         Ok(index)
     }
 
-    fn write_via_stream(
+    async fn write_via_stream(
         &mut self,
         fd: Resource<types::Descriptor>,
         offset: types::Filesize,
@@ -402,7 +400,7 @@ impl HostDescriptor for WasiFilesystemCtxView<'_> {
         Ok(index)
     }
 
-    fn append_via_stream(
+    async fn append_via_stream(
         &mut self,
         fd: Resource<types::Descriptor>,
     ) -> FsResult<Resource<DynOutputStream>> {
@@ -778,11 +776,11 @@ mod named {
     where
         T: WasiFilesystemNamedView,
     {
-        fn get_directories(
+        async fn get_directories(
             &mut self,
             id: NamedId,
         ) -> wasmtime::Result<Vec<(Resource<Descriptor>, String)>> {
-            super::preopens::Host::get_directories(&mut self.0.filesystem(id))
+            super::preopens::Host::get_directories(&mut self.0.filesystem(id)).await
         }
     }
 
@@ -1036,30 +1034,30 @@ mod named {
             super::HostDescriptor::unlink_file_at(&mut self.0.filesystem(id), fd, path).await
         }
 
-        fn read_via_stream(
+        async fn read_via_stream(
             &mut self,
             id: NamedId,
             fd: Resource<Descriptor>,
             offset: Filesize,
         ) -> FsResult<Resource<DynInputStream>> {
-            super::HostDescriptor::read_via_stream(&mut self.0.filesystem(id), fd, offset)
+            super::HostDescriptor::read_via_stream(&mut self.0.filesystem(id), fd, offset).await
         }
 
-        fn write_via_stream(
+        async fn write_via_stream(
             &mut self,
             id: NamedId,
             fd: Resource<Descriptor>,
             offset: Filesize,
         ) -> FsResult<Resource<DynOutputStream>> {
-            super::HostDescriptor::write_via_stream(&mut self.0.filesystem(id), fd, offset)
+            super::HostDescriptor::write_via_stream(&mut self.0.filesystem(id), fd, offset).await
         }
 
-        fn append_via_stream(
+        async fn append_via_stream(
             &mut self,
             id: NamedId,
             fd: Resource<Descriptor>,
         ) -> FsResult<Resource<DynOutputStream>> {
-            super::HostDescriptor::append_via_stream(&mut self.0.filesystem(id), fd)
+            super::HostDescriptor::append_via_stream(&mut self.0.filesystem(id), fd).await
         }
 
         async fn is_same_object(

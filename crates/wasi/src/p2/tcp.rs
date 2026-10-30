@@ -119,6 +119,10 @@ impl TcpReader {
 
 #[async_trait::async_trait]
 impl InputStream for TcpReader {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
     fn read(&mut self, size: usize) -> StreamResult<bytes::Bytes> {
         self.0.lock().unwrap().read(size)
     }
@@ -293,6 +297,10 @@ impl TcpWriter {
 
 #[async_trait::async_trait]
 impl OutputStream for TcpWriter {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
     fn write(&mut self, bytes: bytes::Bytes) -> StreamResult<()> {
         self.0.lock().unwrap().write(bytes)
     }

@@ -10,14 +10,15 @@ use wasmtime_wasi_tls::{
 
 struct Ctx {
     table: ResourceTable,
-    wasi_ctx: WasiCtx,
+    wasi_ctx: (WasiCtx, wasmtime_wasi::IoCtx),
     wasi_tls_ctx: WasiTlsCtx,
 }
 
 impl WasiView for Ctx {
     fn ctx(&mut self) -> WasiCtxView<'_> {
         WasiCtxView {
-            ctx: &mut self.wasi_ctx,
+            ctx: &mut self.wasi_ctx.0,
+            io_ctx: &mut self.wasi_ctx.1,
             table: &mut self.table,
         }
     }

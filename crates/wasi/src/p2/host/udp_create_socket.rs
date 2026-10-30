@@ -15,27 +15,6 @@ impl udp_create_socket::Host for WasiSocketsCtxView<'_> {
     }
 }
 
-pub mod sync {
-    use wasmtime::component::Resource;
-
-    use crate::p2::{
-        SocketResult, UdpSocket,
-        bindings::sockets::udp_create_socket::Host as AsyncHost,
-        bindings::sync::sockets::{udp::IpAddressFamily, udp_create_socket},
-    };
-    use crate::runtime::in_tokio;
-    use crate::sockets::WasiSocketsCtxView;
-
-    impl udp_create_socket::Host for WasiSocketsCtxView<'_> {
-        fn create_udp_socket(
-            &mut self,
-            address_family: IpAddressFamily,
-        ) -> SocketResult<Resource<UdpSocket>> {
-            in_tokio(async { AsyncHost::create_udp_socket(self, address_family).await })
-        }
-    }
-}
-
 mod named {
     use crate::p2::SocketError;
     use crate::p2::bindings::named_imports::wasi::sockets::udp_create_socket;

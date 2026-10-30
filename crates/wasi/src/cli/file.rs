@@ -47,6 +47,10 @@ impl Pollable for OutputFile {
 }
 
 impl OutputStream for OutputFile {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
     fn write(&mut self, bytes: Bytes) -> StreamResult<()> {
         (&*self.file)
             .write_all(&bytes)
@@ -134,6 +138,9 @@ impl InputStream for InputFile {
         }
         buf.truncate(bytes_read);
         StreamResult::Ok(buf.into())
+    }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
     }
 }
 

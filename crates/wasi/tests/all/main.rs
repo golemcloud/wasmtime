@@ -7,8 +7,6 @@ macro_rules! assert_test_exists {
 
 mod store;
 
-#[cfg(feature = "p1")]
-mod p1;
 #[cfg(feature = "p2")]
 mod p2;
 #[cfg(feature = "p3")]

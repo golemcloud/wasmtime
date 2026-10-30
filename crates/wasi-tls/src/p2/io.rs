@@ -252,6 +252,10 @@ where
     async fn cancel(&mut self) {
         self.lock().await.cancel().await
     }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
 }
 
 #[async_trait]

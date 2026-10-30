@@ -8,7 +8,6 @@
 //! their native platform equivalents by default.
 //!
 //! For components and WASIp2, see [`p2`].
-//! For WASIp1 and core modules, see the [`p1`] module documentation.
 //!
 //! For WASIp3, see [`p3`]. WASIp3 support is experimental, unstable and incomplete.
 
@@ -35,10 +34,6 @@ pub mod clocks;
 mod ctx;
 mod error;
 pub mod filesystem;
-#[cfg(feature = "p1")]
-pub mod p0;
-#[cfg(feature = "p1")]
-pub mod p1;
 // FIXME: should gate this module on the `p2` feature but that will require more
 // internal refactoring to get that aligned right.
 // #[cfg(feature = "p2")]
@@ -62,3 +57,12 @@ pub use async_trait::async_trait;
 pub use rand::Rng;
 #[doc(no_inline)]
 pub use wasmtime::component::{ResourceTable, ResourceTableError};
+pub use wasmtime_wasi_io::poll::{
+    DynFuture, DynPollable, DynamicPollable, MakeFuture, OverrideSelf, Pollable, dynamic_subscribe,
+    subscribe,
+};
+pub use wasmtime_wasi_io::streams::{
+    DynInputStream, DynOutputStream, Error as IoError, InputStream, OutputStream, StreamError,
+    StreamResult,
+};
+pub use wasmtime_wasi_io::{IoCtx, IoData, IoView};

@@ -4,6 +4,7 @@ use crate::runtime::{AbortOnDropJoinHandle, spawn_blocking};
 use crate::{NamedId, WasiCtxNamedView};
 use std::collections::hash_map;
 use std::marker;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::SystemTime;
 use tracing::debug;
@@ -688,6 +689,8 @@ pub struct File {
     pub open_mode: OpenMode,
 
     allow_blocking_current_thread: bool,
+
+    pub path: PathBuf,
 }
 
 impl File {
@@ -696,12 +699,14 @@ impl File {
         perms: FsPerms,
         open_mode: OpenMode,
         allow_blocking_current_thread: bool,
+        path: PathBuf,
     ) -> Self {
         Self {
             file: Arc::new(file),
             perms,
             open_mode,
             allow_blocking_current_thread,
+            path,
         }
     }
 
@@ -800,6 +805,8 @@ pub struct Dir {
     pub open_mode: OpenMode,
 
     pub(crate) allow_blocking_current_thread: bool,
+
+    pub path: PathBuf,
 }
 
 impl Dir {
@@ -808,12 +815,14 @@ impl Dir {
         perms: FsPerms,
         open_mode: OpenMode,
         allow_blocking_current_thread: bool,
+        path: PathBuf,
     ) -> Self {
         Dir {
             dir: Arc::new(dir),
             perms,
             open_mode,
             allow_blocking_current_thread,
+            path,
         }
     }
 
@@ -1016,6 +1025,7 @@ impl Dir {
             NotDir,
         }
 
+        let child_path = self.path.join(&path);
         let opened = self
             .run_blocking::<_, std::io::Result<OpenResult>>(move |d| {
                 let opened = crate::filesystem::primitives::open(d, path.as_ref(), &opts)?;
@@ -1043,6 +1053,7 @@ impl Dir {
                 self.perms,
                 open_mode,
                 allow_blocking_current_thread,
+                child_path.clone(),
             ))),
 
             OpenResult::File(file) => Ok(Descriptor::File(File::new(
@@ -1050,6 +1061,7 @@ impl Dir {
                 self.perms,
                 open_mode,
                 allow_blocking_current_thread,
+                child_path,
             ))),
 
             OpenResult::NotDir => Err(ErrorCode::NotDirectory),

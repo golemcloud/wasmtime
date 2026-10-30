@@ -51,7 +51,7 @@ impl TryFrom<SystemTime> for Datetime {
 }
 
 impl wall_clock::Host for WasiClocksCtxView<'_> {
-    fn now(&mut self) -> wasmtime::Result<Datetime> {
+    async fn now(&mut self) -> wasmtime::Result<Datetime> {
         let now = self.ctx.wall_clock.now();
         Ok(Datetime {
             seconds: now.as_secs(),
@@ -59,7 +59,7 @@ impl wall_clock::Host for WasiClocksCtxView<'_> {
         })
     }
 
-    fn resolution(&mut self) -> wasmtime::Result<Datetime> {
+    async fn resolution(&mut self) -> wasmtime::Result<Datetime> {
         let res = self.ctx.wall_clock.resolution();
         Ok(Datetime {
             seconds: res.as_secs(),
@@ -72,8 +72,14 @@ fn subscribe_to_duration(
     table: &mut wasmtime::component::ResourceTable,
     duration: tokio::time::Duration,
 ) -> wasmtime::Result<Resource<DynPollable>> {
-    let sleep = if duration.is_zero() {
-        table.push(Deadline::Past { yielded: false })?
+    let supports_suspend = if duration.is_zero() {
+        None
+    } else {
+        std::time::Instant::now().checked_add(duration)
+    };
+    let is_past = duration.is_zero();
+    let sleep = if is_past {
+        table.push(Deadline::Past)?
     } else if let Some(deadline) = tokio::time::Instant::now().checked_add(duration) {
         // NB: this resource created here is not actually exposed to wasm, it's
         // only an internal implementation detail used to match the signature
@@ -84,19 +90,34 @@ fn subscribe_to_duration(
         // represent it, wait forever rather than trap.
         table.push(Deadline::Never)?
     };
-    subscribe(table, sleep)
+    let pollable_resource = subscribe(table, sleep, supports_suspend)?;
+    if is_past {
+        // For zero-duration deadlines we want `pollable.ready()` to report
+        // `true` synchronously (so guests using a past pollable as an "is
+        // ready now?" probe behave correctly), while still ensuring that a
+        // guest using a zero-duration timer as a cooperative yield via
+        // `wasi:io/poll#poll` (see upstream wasmtime issue #13040) actually
+        // yields control to the host async runtime so that other tasks
+        // (e.g. `mio`-driven sockets) can make progress.
+        let pollable: &mut DynPollable = table.get_mut(&pollable_resource)?;
+        pollable.set_yield_on_immediate_return(true);
+    }
+    Ok(pollable_resource)
 }
 
 impl monotonic_clock::Host for WasiClocksCtxView<'_> {
-    fn now(&mut self) -> wasmtime::Result<Instant> {
+    async fn now(&mut self) -> wasmtime::Result<Instant> {
         Ok(self.ctx.monotonic_clock.now())
     }
 
-    fn resolution(&mut self) -> wasmtime::Result<Instant> {
+    async fn resolution(&mut self) -> wasmtime::Result<Instant> {
         Ok(self.ctx.monotonic_clock.resolution())
     }
 
-    fn subscribe_instant(&mut self, when: Instant) -> wasmtime::Result<Resource<DynPollable>> {
+    async fn subscribe_instant(
+        &mut self,
+        when: Instant,
+    ) -> wasmtime::Result<Resource<DynPollable>> {
         let clock_now = self.ctx.monotonic_clock.now();
         let duration = if when > clock_now {
             Duration::from_nanos(when - clock_now)
@@ -106,7 +127,7 @@ impl monotonic_clock::Host for WasiClocksCtxView<'_> {
         subscribe_to_duration(self.table, duration)
     }
 
-    fn subscribe_duration(
+    async fn subscribe_duration(
         &mut self,
         duration: WasiDuration,
     ) -> wasmtime::Result<Resource<DynPollable>> {
@@ -115,7 +136,7 @@ impl monotonic_clock::Host for WasiClocksCtxView<'_> {
 }
 
 enum Deadline {
-    Past { yielded: bool },
+    Past,
     Instant(tokio::time::Instant),
     Never,
 }
@@ -124,28 +145,14 @@ enum Deadline {
 impl Pollable for Deadline {
     async fn ready(&mut self) {
         match self {
-            Deadline::Past { yielded: true } => {}
-            Deadline::Past { yielded } => {
-                // It is important we yield to Tokio here; otherwise we risk
-                // starving `mio` such that it is unable to signal readiness for
-                // other pollables (e.g. TCP sockets) when the guest is polling
-                // in a busy loop.
-                //
-                // This is somewhat of a hack to ensure that
-                // `wasmtime-wasi-io`'s implementation of `wasi:io/poll` does
-                // not starve `mio` when the guest calls `wasi:io/poll#poll` in
-                // a busy loop with a zero timeout.  It relies on the guest
-                // using the most natural approach to making a non-blocking call
-                // to `wasi:io/poll#poll`, which is to include a zero-duration
-                // `monotonic_clock::subscribe_{instant,duration}` in the list
-                // of pollables.  That's what `wasi-libc`'s `poll(2)`
-                // implementation does as of this writing, for example.  There
-                // are hypothetically other ways to generate a pollable that's
-                // always immediately ready, which this hack doesn't cover, but
-                // we consider this sufficient for now.
-                *yielded = true;
-                tokio::task::yield_now().await
-            }
+            // Past deadlines resolve immediately. Cooperative yielding for the
+            // zero-duration `wasi:io/poll#poll` case (upstream wasmtime issue
+            // #13040) is handled in `wasmtime-wasi-io`'s `poll`/`block` impls
+            // via the `yield_on_immediate_return` flag set when constructing
+            // `Deadline::Past` pollables. Yielding here would also poison
+            // `pollable.ready()` (which uses `poll_immediate`), making it
+            // erroneously report `false` for an already-ready pollable.
+            Deadline::Past => {}
             Deadline::Instant(instant) => tokio::time::sleep_until(*instant).await,
             Deadline::Never => std::future::pending().await,
         }
@@ -165,12 +172,12 @@ mod named {
     where
         T: WasiClocksNamedView,
     {
-        fn now(&mut self, id: NamedId) -> wasmtime::Result<Datetime> {
-            super::wall_clock::Host::now(&mut self.0.clocks(id))
+        async fn now(&mut self, id: NamedId) -> wasmtime::Result<Datetime> {
+            super::wall_clock::Host::now(&mut self.0.clocks(id)).await
         }
 
-        fn resolution(&mut self, id: NamedId) -> wasmtime::Result<Datetime> {
-            super::wall_clock::Host::resolution(&mut self.0.clocks(id))
+        async fn resolution(&mut self, id: NamedId) -> wasmtime::Result<Datetime> {
+            super::wall_clock::Host::resolution(&mut self.0.clocks(id)).await
         }
     }
 
@@ -178,28 +185,28 @@ mod named {
     where
         T: WasiClocksNamedView,
     {
-        fn now(&mut self, id: NamedId) -> wasmtime::Result<Instant> {
-            super::monotonic_clock::Host::now(&mut self.0.clocks(id))
+        async fn now(&mut self, id: NamedId) -> wasmtime::Result<Instant> {
+            super::monotonic_clock::Host::now(&mut self.0.clocks(id)).await
         }
 
-        fn resolution(&mut self, id: NamedId) -> wasmtime::Result<Instant> {
-            super::monotonic_clock::Host::resolution(&mut self.0.clocks(id))
+        async fn resolution(&mut self, id: NamedId) -> wasmtime::Result<Instant> {
+            super::monotonic_clock::Host::resolution(&mut self.0.clocks(id)).await
         }
 
-        fn subscribe_instant(
+        async fn subscribe_instant(
             &mut self,
             id: NamedId,
             when: Instant,
         ) -> wasmtime::Result<Resource<DynPollable>> {
-            super::monotonic_clock::Host::subscribe_instant(&mut self.0.clocks(id), when)
+            super::monotonic_clock::Host::subscribe_instant(&mut self.0.clocks(id), when).await
         }
 
-        fn subscribe_duration(
+        async fn subscribe_duration(
             &mut self,
             id: NamedId,
             duration: WasiDuration,
         ) -> wasmtime::Result<Resource<DynPollable>> {
-            super::monotonic_clock::Host::subscribe_duration(&mut self.0.clocks(id), duration)
+            super::monotonic_clock::Host::subscribe_duration(&mut self.0.clocks(id), duration).await
         }
     }
 }

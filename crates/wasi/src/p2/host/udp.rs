@@ -152,7 +152,7 @@ impl udp::HostUdpSocket for WasiSocketsCtxView<'_> {
     }
 
     fn subscribe(&mut self, this: Resource<UdpSocket>) -> wasmtime::Result<Resource<DynPollable>> {
-        wasmtime_wasi_io::poll::subscribe(self.table, this)
+        wasmtime_wasi_io::poll::subscribe(self.table, this, None)
     }
 
     fn drop(&mut self, this: Resource<UdpSocket>) -> Result<(), wasmtime::Error> {
@@ -214,7 +214,7 @@ impl udp::HostIncomingDatagramStream for WasiSocketsCtxView<'_> {
         &mut self,
         this: Resource<udp::IncomingDatagramStream>,
     ) -> wasmtime::Result<Resource<DynPollable>> {
-        wasmtime_wasi_io::poll::subscribe(self.table, this)
+        wasmtime_wasi_io::poll::subscribe(self.table, this, None)
     }
 
     async fn drop(
@@ -253,7 +253,7 @@ impl udp::HostOutgoingDatagramStream for WasiSocketsCtxView<'_> {
         Ok(count.try_into().unwrap())
     }
 
-    fn send(
+    async fn send(
         &mut self,
         this: Resource<udp::OutgoingDatagramStream>,
         datagrams: Vec<udp::OutgoingDatagram>,
@@ -297,7 +297,7 @@ impl udp::HostOutgoingDatagramStream for WasiSocketsCtxView<'_> {
         &mut self,
         this: Resource<udp::OutgoingDatagramStream>,
     ) -> wasmtime::Result<Resource<DynPollable>> {
-        wasmtime_wasi_io::poll::subscribe(self.table, this)
+        wasmtime_wasi_io::poll::subscribe(self.table, this, None)
     }
 
     async fn drop(
@@ -330,215 +330,6 @@ impl From<SocketAddressFamily> for IpAddressFamily {
         }
     }
 }
-
-pub mod sync {
-    use wasmtime::component::Resource;
-
-    use crate::p2::{
-        SocketError, UdpSocket,
-        bindings::{
-            sockets::{
-                network::Network,
-                udp::{
-                    self as async_udp,
-                    HostIncomingDatagramStream as AsyncHostIncomingDatagramStream,
-                    HostOutgoingDatagramStream as AsyncHostOutgoingDatagramStream,
-                    HostUdpSocket as AsyncHostUdpSocket, IncomingDatagramStream,
-                    OutgoingDatagramStream,
-                },
-            },
-            sync::sockets::udp::{
-                self, HostIncomingDatagramStream, HostOutgoingDatagramStream, HostUdpSocket,
-                IncomingDatagram, IpAddressFamily, IpSocketAddress, OutgoingDatagram, Pollable,
-            },
-        },
-    };
-    use crate::runtime::in_tokio;
-    use crate::sockets::WasiSocketsCtxView;
-
-    impl udp::Host for WasiSocketsCtxView<'_> {}
-
-    impl HostUdpSocket for WasiSocketsCtxView<'_> {
-        fn start_bind(
-            &mut self,
-            self_: Resource<UdpSocket>,
-            network: Resource<Network>,
-            local_address: IpSocketAddress,
-        ) -> Result<(), SocketError> {
-            in_tokio(async {
-                AsyncHostUdpSocket::start_bind(self, self_, network, local_address).await
-            })
-        }
-
-        fn finish_bind(&mut self, self_: Resource<UdpSocket>) -> Result<(), SocketError> {
-            AsyncHostUdpSocket::finish_bind(self, self_)
-        }
-
-        fn stream(
-            &mut self,
-            self_: Resource<UdpSocket>,
-            remote_address: Option<IpSocketAddress>,
-        ) -> Result<
-            (
-                Resource<IncomingDatagramStream>,
-                Resource<OutgoingDatagramStream>,
-            ),
-            SocketError,
-        > {
-            in_tokio(async { AsyncHostUdpSocket::stream(self, self_, remote_address).await })
-        }
-
-        fn local_address(
-            &mut self,
-            self_: Resource<UdpSocket>,
-        ) -> Result<IpSocketAddress, SocketError> {
-            AsyncHostUdpSocket::local_address(self, self_)
-        }
-
-        fn remote_address(
-            &mut self,
-            self_: Resource<UdpSocket>,
-        ) -> Result<IpSocketAddress, SocketError> {
-            AsyncHostUdpSocket::remote_address(self, self_)
-        }
-
-        fn address_family(
-            &mut self,
-            self_: Resource<UdpSocket>,
-        ) -> wasmtime::Result<IpAddressFamily> {
-            AsyncHostUdpSocket::address_family(self, self_)
-        }
-
-        fn unicast_hop_limit(&mut self, self_: Resource<UdpSocket>) -> Result<u8, SocketError> {
-            AsyncHostUdpSocket::unicast_hop_limit(self, self_)
-        }
-
-        fn set_unicast_hop_limit(
-            &mut self,
-            self_: Resource<UdpSocket>,
-            value: u8,
-        ) -> Result<(), SocketError> {
-            AsyncHostUdpSocket::set_unicast_hop_limit(self, self_, value)
-        }
-
-        fn receive_buffer_size(&mut self, self_: Resource<UdpSocket>) -> Result<u64, SocketError> {
-            AsyncHostUdpSocket::receive_buffer_size(self, self_)
-        }
-
-        fn set_receive_buffer_size(
-            &mut self,
-            self_: Resource<UdpSocket>,
-            value: u64,
-        ) -> Result<(), SocketError> {
-            AsyncHostUdpSocket::set_receive_buffer_size(self, self_, value)
-        }
-
-        fn send_buffer_size(&mut self, self_: Resource<UdpSocket>) -> Result<u64, SocketError> {
-            AsyncHostUdpSocket::send_buffer_size(self, self_)
-        }
-
-        fn set_send_buffer_size(
-            &mut self,
-            self_: Resource<UdpSocket>,
-            value: u64,
-        ) -> Result<(), SocketError> {
-            AsyncHostUdpSocket::set_send_buffer_size(self, self_, value)
-        }
-
-        fn subscribe(
-            &mut self,
-            self_: Resource<UdpSocket>,
-        ) -> wasmtime::Result<Resource<Pollable>> {
-            AsyncHostUdpSocket::subscribe(self, self_)
-        }
-
-        fn drop(&mut self, rep: Resource<UdpSocket>) -> wasmtime::Result<()> {
-            AsyncHostUdpSocket::drop(self, rep)
-        }
-    }
-
-    impl HostIncomingDatagramStream for WasiSocketsCtxView<'_> {
-        fn receive(
-            &mut self,
-            self_: Resource<IncomingDatagramStream>,
-            max_results: u64,
-        ) -> Result<Vec<IncomingDatagram>, SocketError> {
-            Ok(
-                AsyncHostIncomingDatagramStream::receive(self, self_, max_results)?
-                    .into_iter()
-                    .map(Into::into)
-                    .collect(),
-            )
-        }
-
-        fn subscribe(
-            &mut self,
-            self_: Resource<IncomingDatagramStream>,
-        ) -> wasmtime::Result<Resource<Pollable>> {
-            AsyncHostIncomingDatagramStream::subscribe(self, self_)
-        }
-
-        fn drop(&mut self, rep: Resource<IncomingDatagramStream>) -> wasmtime::Result<()> {
-            in_tokio(async { AsyncHostIncomingDatagramStream::drop(self, rep).await })
-        }
-    }
-
-    impl From<async_udp::IncomingDatagram> for IncomingDatagram {
-        fn from(other: async_udp::IncomingDatagram) -> Self {
-            let async_udp::IncomingDatagram {
-                data,
-                remote_address,
-            } = other;
-            Self {
-                data,
-                remote_address,
-            }
-        }
-    }
-
-    impl HostOutgoingDatagramStream for WasiSocketsCtxView<'_> {
-        fn check_send(
-            &mut self,
-            self_: Resource<OutgoingDatagramStream>,
-        ) -> Result<u64, SocketError> {
-            AsyncHostOutgoingDatagramStream::check_send(self, self_)
-        }
-
-        fn send(
-            &mut self,
-            self_: Resource<OutgoingDatagramStream>,
-            datagrams: Vec<OutgoingDatagram>,
-        ) -> Result<u64, SocketError> {
-            let datagrams = datagrams.into_iter().map(Into::into).collect();
-            AsyncHostOutgoingDatagramStream::send(self, self_, datagrams)
-        }
-
-        fn subscribe(
-            &mut self,
-            self_: Resource<OutgoingDatagramStream>,
-        ) -> wasmtime::Result<Resource<Pollable>> {
-            AsyncHostOutgoingDatagramStream::subscribe(self, self_)
-        }
-
-        fn drop(&mut self, rep: Resource<OutgoingDatagramStream>) -> wasmtime::Result<()> {
-            in_tokio(async { AsyncHostOutgoingDatagramStream::drop(self, rep).await })
-        }
-    }
-
-    impl From<OutgoingDatagram> for async_udp::OutgoingDatagram {
-        fn from(other: OutgoingDatagram) -> Self {
-            let OutgoingDatagram {
-                data,
-                remote_address,
-            } = other;
-            Self {
-                data,
-                remote_address,
-            }
-        }
-    }
-}
-
 mod named {
     use crate::p2::SocketError;
     use crate::p2::bindings::named_imports::wasi::sockets::udp;
@@ -732,13 +523,14 @@ mod named {
             super::udp::HostOutgoingDatagramStream::check_send(&mut self.0.sockets(id), this)
         }
 
-        fn send(
+        async fn send(
             &mut self,
             id: NamedId,
             this: Resource<OutgoingDatagramStream>,
             datagrams: Vec<OutgoingDatagram>,
         ) -> SocketResult<u64> {
             super::udp::HostOutgoingDatagramStream::send(&mut self.0.sockets(id), this, datagrams)
+                .await
         }
 
         fn subscribe(

@@ -336,16 +336,17 @@ async fn p3_file_rename_across_perms() -> wasmtime::Result<()> {
 #[test_log::test(tokio::test(flavor = "multi_thread"))]
 async fn p3_environment_named_imports() -> Result<()> {
     struct StoreData {
-        default: WasiCtx,
-        a: WasiCtx,
-        b: WasiCtx,
+        default: (WasiCtx, wasmtime_wasi::IoCtx),
+        a: (WasiCtx, wasmtime_wasi::IoCtx),
+        b: (WasiCtx, wasmtime_wasi::IoCtx),
         table: ResourceTable,
     }
 
     impl WasiView for Ctx<StoreData> {
         fn ctx(&mut self) -> WasiCtxView<'_> {
             WasiCtxView {
-                ctx: &mut self.wasi.default,
+                ctx: &mut self.wasi.default.0,
+                io_ctx: &mut self.wasi.default.1,
                 table: &mut self.wasi.table,
             }
         }
@@ -353,12 +354,14 @@ async fn p3_environment_named_imports() -> Result<()> {
 
     impl WasiNamedView for Ctx<StoreData> {
         fn ctx(&mut self, id: NamedId) -> WasiCtxView<'_> {
+            let (ctx, io_ctx) = match id.0 {
+                0 => &mut self.wasi.a,
+                1 => &mut self.wasi.b,
+                _ => panic!("unexpected id: {}", id.0),
+            };
             WasiCtxView {
-                ctx: match id.0 {
-                    0 => &mut self.wasi.a,
-                    1 => &mut self.wasi.b,
-                    _ => panic!("unexpected id: {}", id.0),
-                },
+                ctx,
+                io_ctx,
                 table: &mut self.wasi.table,
             }
         }
