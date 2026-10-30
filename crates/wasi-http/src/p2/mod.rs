@@ -40,12 +40,9 @@
 //! customize how outgoing HTTP requests are handled. The `hooks` field can be
 //! initialized with the [`default_hooks`] function for the default behavior.
 //!
-//! # Async and Sync
+//! # Async
 //!
-//! There are both asynchronous and synchronous bindings in this crate. For
-//! example [`add_to_linker_async`] is for asynchronous embedders and
-//! [`add_to_linker_sync`] is for synchronous embedders. Note that under the
-//! hood both versions are implemented with `async` on top of [`tokio`].
+//! [`add_to_linker_async`] registers asynchronous host boundaries on top of [`tokio`].
 //!
 //! # Examples
 //!
@@ -143,11 +140,13 @@
 //!     ) -> Result<hyper::Response<HyperOutgoingBody>> {
 //!         // Create per-http-request state within a `Store` and prepare the
 //!         // initial resources  passed to the `handle` function.
+//!         let (wasi, io_ctx) = WasiCtx::builder().inherit_stdio().build();
 //!         let mut store = Store::new(
 //!             self.pre.engine(),
 //!             MyClientState {
 //!                 table: ResourceTable::new(),
-//!                 wasi: WasiCtx::builder().inherit_stdio().build(),
+//!                 io_ctx,
+//!                 wasi,
 //!                 http: WasiHttpCtx::new(),
 //!             },
 //!         );
@@ -200,11 +199,12 @@
 //!     wasi: WasiCtx,
 //!     http: WasiHttpCtx,
 //!     table: ResourceTable,
+//!     io_ctx: wasmtime_wasi::IoCtx,
 //! }
 //!
 //! impl WasiView for MyClientState {
 //!     fn ctx(&mut self) -> WasiCtxView<'_> {
-//!         WasiCtxView { ctx: &mut self.wasi, table: &mut self.table }
+//!         WasiCtxView { ctx: &mut self.wasi, table: &mut self.table, io_ctx: &mut self.io_ctx }
 //!     }
 //! }
 //!
@@ -252,8 +252,7 @@ pub const DEFAULT_OUTGOING_BODY_CHUNK_SIZE: usize = 1024 * 1024;
 /// Add all of the `wasi:http/proxy` world's interfaces to a [`wasmtime::component::Linker`].
 ///
 /// This function will add the `async` variant of all interfaces into the
-/// `Linker` provided. For embeddings with async support disabled see
-/// [`add_to_linker_sync`] instead.
+/// `Linker` provided. Async support must be enabled in the engine.
 ///
 /// # Example
 ///
@@ -277,6 +276,7 @@ pub const DEFAULT_OUTGOING_BODY_CHUNK_SIZE: usize = 1024 * 1024;
 ///     ctx: WasiCtx,
 ///     http_ctx: WasiHttpCtx,
 ///     table: ResourceTable,
+///     io_ctx: wasmtime_wasi::IoCtx,
 /// }
 ///
 /// impl WasiHttpView for MyState {
@@ -291,7 +291,7 @@ pub const DEFAULT_OUTGOING_BODY_CHUNK_SIZE: usize = 1024 * 1024;
 ///
 /// impl WasiView for MyState {
 ///     fn ctx(&mut self) -> WasiCtxView<'_> {
-///         WasiCtxView { ctx: &mut self.ctx, table: &mut self.table }
+///         WasiCtxView { ctx: &mut self.ctx, table: &mut self.table, io_ctx: &mut self.io_ctx }
 ///     }
 /// }
 /// ```
@@ -452,74 +452,5 @@ where
         &options.into(),
         |x| WasiCtxNamedView(x),
     )?;
-    Ok(())
-}
-
-/// Add all of the `wasi:http/proxy` world's interfaces to a [`wasmtime::component::Linker`].
-///
-/// This function will add the `sync` variant of all interfaces into the
-/// `Linker` provided. For embeddings with async support see
-/// [`add_to_linker_async`] instead.
-///
-/// # Example
-///
-/// ```
-/// use wasmtime::{Engine, Result, Config};
-/// use wasmtime::component::{ResourceTable, Linker};
-/// use wasmtime_wasi::{WasiCtx, WasiCtxView, WasiView};
-/// use wasmtime_wasi_http::{WasiHttpCtx, WasiHttpView, WasiHttpCtxView};
-///
-/// fn main() -> Result<()> {
-///     let config = Config::default();
-///     let engine = Engine::new(&config)?;
-///
-///     let mut linker = Linker::<MyState>::new(&engine);
-///     wasmtime_wasi_http::p2::add_to_linker_sync(&mut linker)?;
-///     // ... add any further functionality to `linker` if desired ...
-///
-///     Ok(())
-/// }
-///
-/// struct MyState {
-///     ctx: WasiCtx,
-///     http_ctx: WasiHttpCtx,
-///     table: ResourceTable,
-/// }
-/// impl WasiHttpView for MyState {
-///     fn http(&mut self) -> WasiHttpCtxView<'_> {
-///         WasiHttpCtxView {
-///             ctx: &mut self.http_ctx,
-///             table: &mut self.table,
-///             hooks: Default::default(),
-///         }
-///     }
-/// }
-/// impl WasiView for MyState {
-///     fn ctx(&mut self) -> WasiCtxView<'_> {
-///         WasiCtxView { ctx: &mut self.ctx, table: &mut self.table }
-///     }
-/// }
-/// ```
-pub fn add_to_linker_sync<T>(l: &mut Linker<T>) -> wasmtime::Result<()>
-where
-    T: WasiHttpView + wasmtime_wasi::WasiView + 'static,
-{
-    wasmtime_wasi::p2::add_to_linker_proxy_interfaces_sync(l)?;
-    add_only_http_to_linker_sync(l)
-}
-
-/// A slimmed down version of [`add_to_linker_sync`] which only adds
-/// `wasi:http` interfaces to the linker.
-///
-/// This is useful when using [`wasmtime_wasi::p2::add_to_linker_sync`] for
-/// example to avoid re-adding the same interfaces twice.
-pub fn add_only_http_to_linker_sync<T>(l: &mut Linker<T>) -> wasmtime::Result<()>
-where
-    T: WasiHttpView + 'static,
-{
-    let options = bindings::LinkOptions::default(); // FIXME: Thread through to the CLI options.
-    bindings::sync::http::outgoing_handler::add_to_linker::<_, WasiHttp>(l, T::http)?;
-    bindings::sync::http::types::add_to_linker::<_, WasiHttp>(l, &options.into(), T::http)?;
-
     Ok(())
 }

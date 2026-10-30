@@ -18,12 +18,14 @@ use std::pin::Pin;
 use wasmtime::component::Resource;
 
 impl outgoing_handler::Host for WasiHttpCtxView<'_> {
-    fn handle(
+    async fn handle(
         &mut self,
         request_id: Resource<HostOutgoingRequest>,
         options: Option<Resource<types::RequestOptions>>,
     ) -> HttpResult<Resource<HostFutureIncomingResponse>> {
-        let opts = options.and_then(|opts| self.table.get(&opts).ok()).cloned();
+        let opts = options
+            .map(|opts| self.table.get(&opts).cloned())
+            .transpose()?;
 
         let req = self.table.delete(request_id)?;
 
@@ -76,7 +78,10 @@ impl outgoing_handler::Host for WasiHttpCtxView<'_> {
                 .ok_or(types::ErrorCode::HttpProtocolError)?,
         };
 
-        let authority = req.authority.unwrap_or_else(String::new);
+        let authority = req
+            .authority
+            .filter(|a| !a.is_empty())
+            .ok_or(types::ErrorCode::HttpRequestUriInvalid)?;
 
         let mut uri = http::Uri::builder()
             .scheme(scheme)
@@ -103,30 +108,45 @@ impl outgoing_handler::Host for WasiHttpCtxView<'_> {
         });
         let body = body.map_err(Into::into).boxed_unsync();
 
-        let request = builder
+        let mut request = builder
             .body(body)
             .map_err(|err| internal_error(err.to_string()))?;
+        request.extensions_mut().insert(crate::P2Request);
 
+        if let Some(completion) = req.body_completion {
+            request
+                .extensions_mut()
+                .insert(crate::p2::body::RequestBodyCompletion(std::sync::Arc::new(
+                    std::sync::Mutex::new(Some(completion)),
+                )));
+        }
         let future = self
             .hooks
             .send_request(request, opts, Box::new(async { Ok(()) }));
-        let future = wasmtime_wasi::runtime::spawn(async move {
-            let (res, io) = Pin::from(future).await?;
-            let io = wasmtime_wasi::runtime::spawn(async move {
-                match Pin::from(io).await {
-                    Ok(()) => {}
-                    // TODO: shouldn't throw away this error and ideally should
-                    // surface somewhere.
-                    Err(e) => tracing::warn!("dropping error {e}"),
-                }
+        let activate: Box<dyn FnOnce() -> HostFutureIncomingResponse + Send> =
+            Box::new(move || {
+                HostFutureIncomingResponse::Pending(wasmtime_wasi::runtime::spawn(async move {
+                    let (res, io) = Pin::from(future).await?;
+                    let error = std::sync::Arc::new(std::sync::Mutex::new(None));
+                    let worker_error = error.clone();
+                    let io = wasmtime_wasi::runtime::spawn(async move {
+                        if let Err(err) = Pin::from(io).await {
+                            *worker_error.lock().unwrap() = Some(err);
+                        }
+                    });
+                    let res = res.map(|body| {
+                        crate::p2::body::WorkerErrorBody { body, error }.boxed_unsync()
+                    });
+                    Ok((res, io))
+                }))
             });
-            let res = res.map(|b| b.boxed_unsync());
-            Ok((res, io))
-        });
 
-        Ok(self
-            .table
-            .push(HostFutureIncomingResponse::Pending(future))?)
+        let future = if self.hooks.p2_defer_send_request() {
+            HostFutureIncomingResponse::deferred(activate)
+        } else {
+            activate()
+        };
+        Ok(self.table.push(future)?)
     }
 }
 
@@ -143,13 +163,13 @@ mod named {
     where
         T: WasiHttpNamedView,
     {
-        fn handle(
+        async fn handle(
             &mut self,
             id: NamedId,
             request_id: Resource<HostOutgoingRequest>,
             options: Option<Resource<types::RequestOptions>>,
         ) -> HttpResult<Resource<HostFutureIncomingResponse>> {
-            super::outgoing_handler::Host::handle(&mut self.0.http(id), request_id, options)
+            super::outgoing_handler::Host::handle(&mut self.0.http(id), request_id, options).await
         }
 
         fn convert_error_code(&mut self, err: HttpError) -> wasmtime::Result<types::ErrorCode> {

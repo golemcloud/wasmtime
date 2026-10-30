@@ -11,12 +11,19 @@
 
 use http::{HeaderName, header};
 
+#[derive(Clone)]
+pub(crate) struct P2Request;
+
 #[cfg(any(feature = "p2", feature = "p3"))]
 mod authority;
 #[cfg(any(feature = "p2", feature = "p3"))]
 pub(crate) use authority::parse_authority;
 
+#[cfg(feature = "default-send-request")]
+mod connection_pool;
 mod ctx;
+#[cfg(feature = "default-send-request")]
+pub use connection_pool::*;
 #[cfg(feature = "default-send-request")]
 mod default_send_request;
 mod error;

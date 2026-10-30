@@ -262,14 +262,17 @@ mod tests {
     struct TestCtx {
         table: ResourceTable,
         wasi: WasiCtx,
+        io_ctx: wasmtime_wasi::IoCtx,
         http: WasiHttpCtx,
     }
 
     impl TestCtx {
         fn new() -> Self {
+            let (wasi, io_ctx) = WasiCtxBuilder::new().build();
             Self {
                 table: ResourceTable::default(),
-                wasi: WasiCtxBuilder::new().build(),
+                wasi,
+                io_ctx,
                 http: Default::default(),
             }
         }
@@ -280,6 +283,7 @@ mod tests {
             WasiCtxView {
                 ctx: &mut self.wasi,
                 table: &mut self.table,
+                io_ctx: &mut self.io_ctx,
             }
         }
     }

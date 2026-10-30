@@ -1,6 +1,15 @@
 use std::fmt;
 use std::io;
 
+/// Details about an HTTP field that exceeds a size limit.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FieldSizePayload {
+    /// The field name, when known.
+    pub field_name: Option<String>,
+    /// The field size in bytes, when known.
+    pub field_size: Option<u32>,
+}
+
 /// Error type for `wasi:http` embedder interactions.
 ///
 /// This error type is a superset of the wasip2/wasip3 error types for example
@@ -43,10 +52,7 @@ pub enum Error {
     HttpRequestUriInvalid,
     HttpRequestUriTooLong,
     HttpRequestHeaderSectionSize(Option<u32>),
-    HttpRequestHeaderSize {
-        field_name: Option<String>,
-        field_size: Option<u32>,
-    },
+    HttpRequestHeaderSize(Option<FieldSizePayload>),
     HttpRequestTrailerSectionSize(Option<u32>),
     HttpRequestTrailerSize {
         field_name: Option<String>,
@@ -158,16 +164,15 @@ impl fmt::Display for Error {
                 }
                 Ok(())
             }
-            Self::HttpRequestHeaderSize {
-                field_name,
-                field_size,
-            } => {
+            Self::HttpRequestHeaderSize(payload) => {
                 write!(f, "HTTP request header size exceeds limit")?;
-                if let Some(name) = field_name {
-                    write!(f, ": field {name:?}")?;
-                }
-                if let Some(size) = field_size {
-                    write!(f, " ({size} bytes)")?;
+                if let Some(payload) = payload {
+                    if let Some(name) = &payload.field_name {
+                        write!(f, ": field {name:?}")?;
+                    }
+                    if let Some(size) = payload.field_size {
+                        write!(f, " ({size} bytes)")?;
+                    }
                 }
                 Ok(())
             }

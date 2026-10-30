@@ -197,6 +197,8 @@ pub struct HostOutgoingRequest {
     pub headers: FieldMap,
     /// The request body.
     pub body: Option<HyperOutgoingBody>,
+    /// Completion of the guest's explicit outgoing-body finish operation.
+    pub body_completion: Option<tokio::sync::oneshot::Receiver<Result<(), types::ErrorCode>>>,
 }
 
 /// The concrete type behind a `wasi:http/types.incoming-response` resource.
@@ -208,6 +210,19 @@ pub struct HostIncomingResponse {
     pub headers: FieldMap,
     /// The response body
     pub body: Option<HostIncomingBody>,
+    /// Connection identity, retained independently of body concurrency permits.
+    #[cfg(feature = "default-send-request")]
+    pub pooled_connection: Option<std::sync::Arc<crate::PooledConnection>>,
+}
+
+#[cfg(feature = "default-send-request")]
+impl HostIncomingResponse {
+    /// Prevent reuse without releasing body concurrency permits.
+    pub fn poison_pooled_connection(&self) {
+        if let Some(connection) = &self.pooled_connection {
+            connection.poison();
+        }
+    }
 }
 
 /// A handle to a future incoming response.
@@ -235,14 +250,35 @@ pub enum HostFutureIncomingResponse {
     Ready(SendRequestResult),
     /// The response has been consumed.
     Consumed,
+    /// Transport activation delayed until readiness or get is requested.
+    Deferred(Box<dyn FnOnce() -> HostFutureIncomingResponse + Send>),
 }
 
 impl HostFutureIncomingResponse {
+    /// Construct a response whose transport has not started yet.
+    pub fn deferred(activate: Box<dyn FnOnce() -> Self + Send>) -> Self {
+        Self::Deferred(activate)
+    }
+
+    pub(crate) fn activate(&mut self) {
+        if matches!(self, Self::Deferred(_)) {
+            let Self::Deferred(activate) = std::mem::replace(self, Self::Consumed) else {
+                unreachable!()
+            };
+            *self = match activate() {
+                state @ (Self::Pending(_) | Self::Ready(_)) => state,
+                _ => Self::Ready(Err(crate::Error::InternalError(Some(
+                    "deferred activation returned invalid state".into(),
+                )))),
+            };
+        }
+    }
+
     /// Unwrap the response, panicking if it is not ready.
     pub(crate) fn unwrap_ready(self) -> SendRequestResult {
         match self {
             Self::Ready(res) => res,
-            Self::Pending(_) | Self::Consumed => {
+            Self::Pending(_) | Self::Consumed | Self::Deferred(_) => {
                 panic!("unwrap_ready called on a pending HostFutureIncomingResponse")
             }
         }
@@ -252,8 +288,39 @@ impl HostFutureIncomingResponse {
 #[async_trait::async_trait]
 impl Pollable for HostFutureIncomingResponse {
     async fn ready(&mut self) {
+        self.activate();
         if let Self::Pending(handle) = self {
             *self = Self::Ready(handle.await);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures::FutureExt;
+
+    #[tokio::test]
+    async fn deferred_activation_and_cancelled_ready_keep_pending_transport() {
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let activated = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let check = activated.clone();
+        let mut response = HostFutureIncomingResponse::deferred(Box::new(move || {
+            activated.store(true, std::sync::atomic::Ordering::SeqCst);
+            HostFutureIncomingResponse::Pending(wasmtime_wasi::runtime::spawn(async move {
+                rx.await.unwrap();
+                Err(crate::Error::ConnectionRefused)
+            }))
+        }));
+        assert!(!check.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(response.ready().now_or_never().is_none());
+        assert!(check.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(matches!(response, HostFutureIncomingResponse::Pending(_)));
+        tx.send(()).unwrap();
+        response.ready().await;
+        assert!(matches!(
+            response.unwrap_ready(),
+            Err(crate::Error::ConnectionRefused)
+        ));
     }
 }

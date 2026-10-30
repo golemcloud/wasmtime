@@ -483,7 +483,7 @@ impl http_body::Body for GuestBody {
 }
 
 /// [StreamProducer] implementation for bodies originating in the host.
-pub(crate) struct HostBodyStreamProducer {
+pub struct HostBodyStreamProducer {
     pub(crate) body: UnsyncBoxBody<Bytes, Error>,
     trailers: Option<oneshot::Sender<Result<Option<HeaderMap>, Error>>>,
 }
@@ -495,6 +495,18 @@ impl Drop for HostBodyStreamProducer {
 }
 
 impl HostBodyStreamProducer {
+    /// Extract the body for host-managed consumption. Dropping this producer
+    /// settles its original trailers channel with no trailers.
+    pub fn take_body(&mut self) -> crate::WasiBody {
+        use http_body_util::BodyExt;
+        std::mem::replace(
+            &mut self.body,
+            http_body_util::Empty::new()
+                .map_err(Error::from)
+                .boxed_unsync(),
+        )
+    }
+
     fn close(&mut self, res: Result<Option<HeaderMap>, Error>) {
         if let Some(tx) = self.trailers.take() {
             _ = tx.send(res);
@@ -800,6 +812,22 @@ mod tests {
     use http_body::Body as _;
     use http_body_util::{BodyExt as _, Full};
     use tokio::sync::oneshot;
+
+    #[tokio::test]
+    async fn extracted_body_survives_producer_and_settles_old_trailers() {
+        let (tx, rx) = oneshot::channel();
+        let mut producer = super::HostBodyStreamProducer {
+            body: Full::new(Bytes::from_static(b"durable"))
+                .map_err(Error::from)
+                .boxed_unsync(),
+            trailers: Some(tx),
+        };
+        let body = producer.take_body();
+        assert!(producer.body.is_end_stream());
+        drop(producer);
+        assert!(matches!(rx.await, Ok(Ok(None))));
+        assert_eq!(body.collect().await.unwrap().to_bytes(), "durable");
+    }
 
     /// A body shorter than its `Content-Length` must not report end of stream
     /// or a size hint based on its actual length, otherwise a consumer like

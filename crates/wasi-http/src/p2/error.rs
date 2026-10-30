@@ -225,14 +225,10 @@ impl From<ErrorCode> for Error {
                 Self::HttpRequestHeaderSectionSize(payload)
             }
             ErrorCode::HttpRequestHeaderSize(payload) => {
-                let (field_name, field_size) = match payload {
-                    Some(p) => (p.field_name, p.field_size),
-                    None => (None, None),
-                };
-                Self::HttpRequestHeaderSize {
-                    field_name,
-                    field_size,
-                }
+                Self::HttpRequestHeaderSize(payload.map(|p| crate::FieldSizePayload {
+                    field_name: p.field_name,
+                    field_size: p.field_size,
+                }))
             }
             ErrorCode::HttpRequestTrailerSectionSize(payload) => {
                 Self::HttpRequestTrailerSectionSize(payload)
@@ -245,7 +241,7 @@ impl From<ErrorCode> for Error {
             ErrorCode::HttpResponseHeaderSectionSize(payload) => {
                 Self::HttpResponseHeaderSectionSize(payload)
             }
-            ErrorCode::HttpResponseHeaderSize(payload) => Self::HttpRequestHeaderSize {
+            ErrorCode::HttpResponseHeaderSize(payload) => Self::HttpResponseHeaderSize {
                 field_name: payload.field_name,
                 field_size: payload.field_size,
             },
@@ -274,7 +270,8 @@ impl From<ErrorCode> for Error {
 }
 
 impl WasiHttpCtxView<'_> {
-    pub(crate) fn error_to_p2(&mut self, e: Error) -> ErrorCode {
+    /// Convert a transport error with this view's P2 error-classification hooks.
+    pub fn error_to_p2(&mut self, e: Error) -> ErrorCode {
         match e {
             Error::Hyper(err) => {
                 // If there's a source, we might be able to extract a wasi-http error from it.
@@ -341,13 +338,12 @@ impl WasiHttpCtxView<'_> {
             Error::HttpRequestHeaderSectionSize(payload) => {
                 ErrorCode::HttpRequestHeaderSectionSize(payload)
             }
-            Error::HttpRequestHeaderSize {
-                field_name,
-                field_size,
-            } => ErrorCode::HttpRequestHeaderSize(Some(types::FieldSizePayload {
-                field_name,
-                field_size,
-            })),
+            Error::HttpRequestHeaderSize(payload) => {
+                ErrorCode::HttpRequestHeaderSize(payload.map(|p| types::FieldSizePayload {
+                    field_name: p.field_name,
+                    field_size: p.field_size,
+                }))
+            }
             Error::HttpRequestTrailerSectionSize(payload) => {
                 ErrorCode::HttpRequestTrailerSectionSize(payload)
             }
@@ -392,6 +388,46 @@ impl WasiHttpCtxView<'_> {
             Error::LoopDetected => ErrorCode::LoopDetected,
             Error::ConfigurationError => ErrorCode::ConfigurationError,
             Error::InternalError(payload) => ErrorCode::InternalError(payload),
+        }
+    }
+}
+
+#[cfg(all(test, feature = "default-send-request"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn field_size_errors_roundtrip_without_losing_optional_payloads() {
+        let mut ctx = crate::WasiHttpCtx::new();
+        let mut table = wasmtime::component::ResourceTable::new();
+        let mut view = WasiHttpCtxView {
+            ctx: &mut ctx,
+            table: &mut table,
+            hooks: crate::default_hooks(),
+        };
+        let absent = Error::from(ErrorCode::HttpRequestHeaderSize(None));
+        assert!(matches!(absent, Error::HttpRequestHeaderSize(None)));
+        assert!(matches!(
+            view.error_to_p2(absent),
+            ErrorCode::HttpRequestHeaderSize(None)
+        ));
+        for field_name in [None, Some(String::new()), Some("x-large".into())] {
+            for field_size in [None, Some(0), Some(1234)] {
+                let payload = types::FieldSizePayload {
+                    field_name: field_name.clone(),
+                    field_size,
+                };
+                for original in [
+                    ErrorCode::HttpRequestHeaderSize(Some(payload.clone())),
+                    ErrorCode::HttpRequestTrailerSize(payload.clone()),
+                    ErrorCode::HttpResponseHeaderSize(payload.clone()),
+                    ErrorCode::HttpResponseTrailerSize(payload),
+                ] {
+                    let expected = format!("{original:?}");
+                    let actual = view.error_to_p2(Error::from(original));
+                    assert_eq!(format!("{actual:?}"), expected);
+                }
+            }
         }
     }
 }

@@ -94,6 +94,7 @@ impl WasiHttpHooks for TestHooks {
 
 struct Ctx {
     table: ResourceTable,
+    io_ctx: wasmtime_wasi::IoCtx,
     wasi: WasiCtx,
     http: WasiHttpCtx,
     hooks: TestHooks,
@@ -101,9 +102,11 @@ struct Ctx {
 
 impl Ctx {
     fn new(request_tx: oneshot::Sender<http::Request<WasiBody>>) -> Self {
+        let (wasi, io_ctx) = WasiCtxBuilder::new().inherit_stdio().build();
         Self {
             table: ResourceTable::default(),
-            wasi: WasiCtxBuilder::new().inherit_stdio().build(),
+            io_ctx,
+            wasi,
             http: WasiHttpCtx::new(),
             hooks: TestHooks {
                 request_tx: Some(request_tx),
@@ -117,6 +120,7 @@ impl WasiView for Ctx {
         WasiCtxView {
             ctx: &mut self.wasi,
             table: &mut self.table,
+            io_ctx: &mut self.io_ctx,
         }
     }
 }
@@ -137,13 +141,15 @@ async fn run_cli(path: &str, server: &Server) -> wasmtime::Result<()> {
         config.wasm_component_model_async(true);
     });
     let component = Component::from_file(&engine, path)?;
+    let (wasi, io_ctx) = WasiCtxBuilder::new()
+        .env("HTTP_SERVER", server.addr())
+        .inherit_stdio()
+        .build();
     let mut store = Store::new(
         &engine,
         Ctx {
-            wasi: wasmtime_wasi::WasiCtx::builder()
-                .env("HTTP_SERVER", server.addr())
-                .inherit_stdio()
-                .build(),
+            wasi,
+            io_ctx,
             ..Ctx::new(oneshot::channel().0)
         },
     );

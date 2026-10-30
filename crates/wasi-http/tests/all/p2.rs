@@ -31,6 +31,7 @@ type RequestSender = Arc<
 
 struct Ctx {
     table: ResourceTable,
+    io_ctx: wasmtime_wasi::IoCtx,
     wasi: WasiCtx,
     http: WasiHttpCtx,
     stdout: MemoryOutputPipe,
@@ -49,6 +50,7 @@ impl WasiView for Ctx {
         WasiCtxView {
             ctx: &mut self.wasi,
             table: &mut self.table,
+            io_ctx: &mut self.io_ctx,
         }
     }
 }
@@ -118,9 +120,11 @@ fn store(engine: &Engine, server: &Server) -> Store<Ctx> {
     builder.stdout(stdout.clone());
     builder.stderr(stderr.clone());
     builder.env("HTTP_SERVER", &server.addr());
+    let (wasi, io_ctx) = builder.build();
     let ctx = Ctx {
         table: ResourceTable::new(),
-        wasi: builder.build(),
+        io_ctx,
+        wasi,
         http: WasiHttpCtx::new(),
         stderr,
         stdout,
@@ -147,7 +151,6 @@ impl Drop for Ctx {
 }
 
 mod async_;
-mod sync;
 
 async fn run_wasi_http(
     component_filename: &str,
@@ -172,13 +175,14 @@ async fn run_wasi_http(
     let mut builder = WasiCtx::builder();
     builder.stdout(stdout.clone());
     builder.stderr(stderr.clone());
-    let wasi = builder.build();
+    let (wasi, io_ctx) = builder.build();
     let mut http = WasiHttpCtx::new();
     if let Some(limit) = field_size_limit {
         http.set_field_size_limit(limit);
     }
     let ctx = Ctx {
         table,
+        io_ctx,
         wasi,
         http,
         stderr,

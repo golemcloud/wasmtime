@@ -10,6 +10,46 @@ use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 
+pub(crate) struct ResponseTimeout {
+    interval: tokio::time::Interval,
+    demand_relative: bool,
+    reset: bool,
+}
+
+impl ResponseTimeout {
+    pub(crate) fn new(duration: Duration, demand_relative: bool) -> Self {
+        let mut interval = tokio::time::interval(duration.max(Duration::from_nanos(1)));
+        interval.reset();
+        Self {
+            interval,
+            demand_relative,
+            reset: true,
+        }
+    }
+
+    pub(crate) fn before_frame(&mut self, cx: &mut core::task::Context<'_>) -> bool {
+        if !self.demand_relative {
+            return false;
+        }
+        if self.reset {
+            self.interval.reset();
+            self.reset = false;
+        }
+        self.interval.poll_tick(cx).is_ready()
+    }
+
+    pub(crate) fn delivered(&mut self) {
+        self.reset = true;
+        if !self.demand_relative {
+            self.interval.reset();
+        }
+    }
+
+    pub(crate) fn poll_pending(&mut self, cx: &mut core::task::Context<'_>) -> Poll<()> {
+        self.interval.poll_tick(cx).map(|_| ())
+    }
+}
+
 trait TokioStream: AsyncRead + AsyncWrite + Send + Sync + Unpin + 'static {
     fn boxed(self) -> Box<dyn TokioStream>
     where
@@ -32,7 +72,7 @@ impl<T> TokioStream for T where T: AsyncRead + AsyncWrite + Send + Sync + Unpin 
 ///
 /// This function performs no `Content-Length` validation.
 pub async fn default_send_request(
-    mut req: Request<impl Body<Data = Bytes, Error = Error> + Send + 'static>,
+    req: Request<impl Body<Data = Bytes, Error = Error> + Send + 'static>,
     options: Option<RequestOptions>,
 ) -> Result<
     (
@@ -41,6 +81,14 @@ pub async fn default_send_request(
     ),
     Error,
 > {
+    #[cfg(not(feature = "p2"))]
+    let mut req = req;
+    #[cfg(feature = "p2")]
+    let mut req = {
+        use http_body_util::BodyExt;
+        crate::p2::body::prepare_request(req.map(BodyExt::boxed_unsync)).await?
+    };
+    let p2 = req.extensions().get::<crate::P2Request>().is_some();
     let uri = req.uri();
     let authority = uri.authority().ok_or(Error::HttpRequestUriInvalid)?;
     let use_tls = uri.scheme() == Some(&Scheme::HTTPS);
@@ -113,7 +161,7 @@ pub async fn default_send_request(
         /// account for request option timeout configuration
         struct IncomingResponseBody {
             incoming: hyper::body::Incoming,
-            timeout: tokio::time::Interval,
+            timeout: ResponseTimeout,
         }
         impl http_body::Body for IncomingResponseBody {
             type Data = <hyper::body::Incoming as http_body::Body>::Data;
@@ -123,6 +171,9 @@ pub async fn default_send_request(
                 mut self: Pin<&mut Self>,
                 cx: &mut Context<'_>,
             ) -> Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+                if self.timeout.before_frame(cx) {
+                    return Poll::Ready(Some(Err(Error::ConnectionReadTimeout)));
+                }
                 match Pin::new(&mut self.as_mut().incoming).poll_frame(cx) {
                     Poll::Ready(None) => Poll::Ready(None),
                     Poll::Ready(Some(Err(err))) => {
@@ -134,11 +185,11 @@ pub async fn default_send_request(
                         Poll::Ready(Some(Err(err)))
                     }
                     Poll::Ready(Some(Ok(frame))) => {
-                        self.timeout.reset();
+                        self.timeout.delivered();
                         Poll::Ready(Some(Ok(frame)))
                     }
                     Poll::Pending => {
-                        ready!(self.timeout.poll_tick(cx));
+                        ready!(self.timeout.poll_pending(cx));
                         Poll::Ready(Some(Err(Error::ConnectionReadTimeout)))
                     }
                 }
@@ -162,8 +213,7 @@ pub async fn default_send_request(
         } else {
             between_bytes_timeout
         };
-        let mut timeout = tokio::time::interval(between_bytes_timeout);
-        timeout.reset();
+        let timeout = ResponseTimeout::new(between_bytes_timeout, p2);
         Ok(res.map(|incoming| IncomingResponseBody { incoming, timeout }))
     };
     let mut send = pin!(send);
@@ -184,8 +234,11 @@ pub async fn default_send_request(
             match res {
                 // `hyper` connection has successfully completed, optimistically poll for response
                 Ok(()) => send.as_mut().poll(cx),
-                // `hyper` connection has failed, return the error
-                Err(err) => Poll::Ready(Err(Error::from(err))),
+                // Driving I/O may have delivered the response head before failing.
+                Err(err) => match send.as_mut().poll(cx) {
+                    Poll::Ready(res) => Poll::Ready(res),
+                    Poll::Pending => Poll::Ready(Err(Error::from(err))),
+                },
             }
         }
     })
@@ -236,6 +289,100 @@ pub(crate) fn tls_server_name(
 mod tls_server_name_tests {
     use super::tls_server_name;
     use rustls::pki_types::ServerName;
+
+    #[tokio::test]
+    async fn p2_transports_allow_guest_processing_between_frames() {
+        use futures::FutureExt;
+        use http_body_util::{BodyExt, Empty};
+        use std::{pin::Pin, time::Duration};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for pooled in [false, true] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let (next, ready) = tokio::sync::oneshot::channel();
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut header = Vec::new();
+                while !header.ends_with(b"\r\n\r\n") {
+                    header.push(socket.read_u8().await.unwrap());
+                }
+                socket
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nfirst")
+                    .await
+                    .unwrap();
+                ready.await.unwrap();
+                socket.write_all(b"later").await.unwrap();
+            });
+            let mut request = http::Request::builder()
+                .uri(format!("http://{address}/"))
+                .body(Empty::new().map_err(crate::Error::from).boxed_unsync())
+                .unwrap();
+            request.extensions_mut().insert(crate::P2Request);
+            let options = Some(crate::RequestOptions {
+                between_bytes_timeout: Some(Duration::from_secs(1)),
+                ..Default::default()
+            });
+            let pool = crate::HttpConnectionPool::new(Default::default());
+            let (response, worker) = if pooled {
+                let (response, sent, _) = pool.send_request(request, options).await.unwrap();
+                (response, tokio::spawn(Pin::from(sent)))
+            } else {
+                let (response, io) = super::default_send_request(request, options).await.unwrap();
+                (response.map(BodyExt::boxed_unsync), tokio::spawn(io))
+            };
+            let mut body = response.into_body();
+            assert_eq!(
+                body.frame().await.unwrap().unwrap().into_data().unwrap(),
+                "first"
+            );
+            tokio::time::pause();
+            tokio::time::advance(Duration::from_secs(10)).await;
+            assert!(body.frame().now_or_never().is_none());
+            tokio::time::resume();
+            next.send(()).unwrap();
+            assert_eq!(
+                body.frame().await.unwrap().unwrap().into_data().unwrap(),
+                "later"
+            );
+            server.await.unwrap();
+            worker.await.unwrap().unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn truncated_redirect_keeps_response_head() {
+        use http_body_util::{BodyExt, Empty};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut header = Vec::new();
+            while !header.ends_with(b"\r\n\r\n") {
+                header.push(socket.read_u8().await.unwrap());
+            }
+            socket
+                .write_all(
+                    b"HTTP/1.1 302 Found\r\nLocation: /next\r\nContent-Length: 100\r\n\r\nshort",
+                )
+                .await
+                .unwrap();
+        });
+        let req = http::Request::builder()
+            .uri(format!("http://{address}/"))
+            .body(Empty::new().map_err(crate::Error::from))
+            .unwrap();
+        let (response, _io) = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            super::default_send_request(req, None),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(response.status(), 302);
+        assert_eq!(response.headers()["location"], "/next");
+        server.await.unwrap();
+    }
 
     #[test]
     fn resolves_server_name_from_authority() {

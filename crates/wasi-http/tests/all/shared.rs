@@ -8,6 +8,7 @@ use wasmtime_wasi_http::{
 
 pub struct NamedImportsData {
     wasi: WasiCtx,
+    io_ctx: wasmtime_wasi::IoCtx,
     http: WasiHttpCtx,
     table: ResourceTable,
     a: NamedImportsHooks,
@@ -21,6 +22,7 @@ impl WasiView for NamedImportsData {
         WasiCtxView {
             ctx: &mut self.wasi,
             table: &mut self.table,
+            io_ctx: &mut self.io_ctx,
         }
     }
 }
@@ -74,10 +76,12 @@ pub async fn run_named_imports_test<T>(
         config.wasm_component_model_implements(true);
     });
     let component = Component::from_file(&engine, component)?;
+    let (wasi, io_ctx) = WasiCtx::builder().inherit_stdio().build();
     let mut store = Store::new(
         &engine,
         NamedImportsData {
-            wasi: WasiCtx::builder().inherit_stdio().build(),
+            wasi,
+            io_ctx,
             table: ResourceTable::new(),
             http: Default::default(),
             a: NamedImportsHooks("a"),

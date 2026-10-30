@@ -203,6 +203,7 @@ impl types::HostOutgoingRequest for WasiHttpCtxView<'_> {
                 headers,
                 scheme: None,
                 body: None,
+                body_completion: None,
             })
             .context("[new_outgoing_request] pushing request")
     }
@@ -227,9 +228,12 @@ impl types::HostOutgoingRequest for WasiHttpCtxView<'_> {
             Err(..) => return Ok(Err(())),
         };
 
-        let (host_body, hyper_body) =
+        let (mut host_body, hyper_body) =
             HostOutgoingBody::new(StreamContext::Request, size, buffer_chunks, chunk_size);
 
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        host_body.set_completion_sender(tx);
+        req.body_completion = Some(rx);
         req.body = Some(hyper_body);
 
         // The output stream will necessarily outlive the request, because we could be still
@@ -388,7 +392,7 @@ impl types::HostResponseOutparam for WasiHttpCtxView<'_> {
 }
 
 impl types::HostIncomingResponse for WasiHttpCtxView<'_> {
-    fn drop(&mut self, response: Resource<HostIncomingResponse>) -> wasmtime::Result<()> {
+    async fn drop(&mut self, response: Resource<HostIncomingResponse>) -> wasmtime::Result<()> {
         let _ = self
             .table
             .delete(response)
@@ -446,10 +450,10 @@ impl types::HostFutureTrailers for WasiHttpCtxView<'_> {
         &mut self,
         index: Resource<HostFutureTrailers>,
     ) -> wasmtime::Result<Resource<DynPollable>> {
-        wasmtime_wasi::p2::subscribe(self.table, index)
+        wasmtime_wasi::p2::subscribe(self.table, index, None)
     }
 
-    fn get(
+    async fn get(
         &mut self,
         id: Resource<HostFutureTrailers>,
     ) -> wasmtime::Result<Option<Result<Result<Option<Resource<Trailers>>, types::ErrorCode>, ()>>>
@@ -491,7 +495,7 @@ impl types::HostIncomingBody for WasiHttpCtxView<'_> {
         let body = self.table.get_mut(&id)?;
 
         if let Some(stream) = body.take_stream() {
-            let stream: DynInputStream = Box::new(stream);
+            let stream: DynInputStream = stream;
             let stream = self.table.push_child(stream, &id)?;
             return Ok(Ok(stream));
         }
@@ -499,7 +503,7 @@ impl types::HostIncomingBody for WasiHttpCtxView<'_> {
         Ok(Err(()))
     }
 
-    fn finish(
+    async fn finish(
         &mut self,
         id: Resource<HostIncomingBody>,
     ) -> wasmtime::Result<Resource<HostFutureTrailers>> {
@@ -508,7 +512,7 @@ impl types::HostIncomingBody for WasiHttpCtxView<'_> {
         Ok(trailers)
     }
 
-    fn drop(&mut self, id: Resource<HostIncomingBody>) -> wasmtime::Result<()> {
+    async fn drop(&mut self, id: Resource<HostIncomingBody>) -> wasmtime::Result<()> {
         let _ = self.table.delete(id)?;
         Ok(())
     }
@@ -595,23 +599,24 @@ impl types::HostOutgoingResponse for WasiHttpCtxView<'_> {
 }
 
 impl types::HostFutureIncomingResponse for WasiHttpCtxView<'_> {
-    fn drop(&mut self, id: Resource<HostFutureIncomingResponse>) -> wasmtime::Result<()> {
+    async fn drop(&mut self, id: Resource<HostFutureIncomingResponse>) -> wasmtime::Result<()> {
         let _ = self.table.delete(id)?;
         Ok(())
     }
 
-    fn get(
+    async fn get(
         &mut self,
         id: Resource<HostFutureIncomingResponse>,
     ) -> wasmtime::Result<
         Option<Result<Result<Resource<HostIncomingResponse>, types::ErrorCode>, ()>>,
     > {
         let resp = self.table.get_mut(&id)?;
-
+        resp.activate();
         match resp {
             HostFutureIncomingResponse::Pending(_) => return Ok(None),
             HostFutureIncomingResponse::Consumed => return Ok(Some(Err(()))),
             HostFutureIncomingResponse::Ready(_) => {}
+            HostFutureIncomingResponse::Deferred(_) => unreachable!(),
         }
 
         let (resp, io) =
@@ -629,8 +634,20 @@ impl types::HostFutureIncomingResponse for WasiHttpCtxView<'_> {
         let resp = self.table.push(HostIncomingResponse {
             status: parts.status.as_u16(),
             headers,
+            #[cfg(feature = "default-send-request")]
+            pooled_connection: parts
+                .extensions
+                .get::<std::sync::Arc<crate::PooledConnection>>()
+                .cloned(),
             body: Some({
                 let mut body = HostIncomingBody::new(body);
+                #[cfg(feature = "default-send-request")]
+                {
+                    body.connection_lease = parts
+                        .extensions
+                        .get::<crate::connection_pool::P2ConnectionLease>()
+                        .cloned();
+                }
                 body.retain_worker(io);
                 body
             }),
@@ -643,7 +660,7 @@ impl types::HostFutureIncomingResponse for WasiHttpCtxView<'_> {
         &mut self,
         id: Resource<HostFutureIncomingResponse>,
     ) -> wasmtime::Result<Resource<DynPollable>> {
-        wasmtime_wasi::p2::subscribe(self.table, id)
+        wasmtime_wasi::p2::subscribe(self.table, id, None)
     }
 }
 
@@ -1109,12 +1126,12 @@ mod named {
     where
         T: WasiHttpNamedView,
     {
-        fn drop(
+        async fn drop(
             &mut self,
             id: NamedId,
             response: Resource<HostIncomingResponse>,
         ) -> wasmtime::Result<()> {
-            super::types::HostIncomingResponse::drop(&mut self.0.http(id), response)
+            super::types::HostIncomingResponse::drop(&mut self.0.http(id), response).await
         }
 
         fn status(
@@ -1162,14 +1179,14 @@ mod named {
             super::types::HostFutureTrailers::subscribe(&mut self.0.http(id), index)
         }
 
-        fn get(
+        async fn get(
             &mut self,
             id: NamedId,
             this: Resource<HostFutureTrailers>,
         ) -> wasmtime::Result<
             Option<Result<Result<Option<Resource<Trailers>>, types::ErrorCode>, ()>>,
         > {
-            super::types::HostFutureTrailers::get(&mut self.0.http(id), this)
+            super::types::HostFutureTrailers::get(&mut self.0.http(id), this).await
         }
     }
 
@@ -1185,16 +1202,20 @@ mod named {
             super::types::HostIncomingBody::stream(&mut self.0.http(id), this)
         }
 
-        fn finish(
+        async fn finish(
             &mut self,
             id: NamedId,
             this: Resource<HostIncomingBody>,
         ) -> wasmtime::Result<Resource<HostFutureTrailers>> {
-            super::types::HostIncomingBody::finish(&mut self.0.http(id), this)
+            super::types::HostIncomingBody::finish(&mut self.0.http(id), this).await
         }
 
-        fn drop(&mut self, id: NamedId, this: Resource<HostIncomingBody>) -> wasmtime::Result<()> {
-            super::types::HostIncomingBody::drop(&mut self.0.http(id), this)
+        async fn drop(
+            &mut self,
+            id: NamedId,
+            this: Resource<HostIncomingBody>,
+        ) -> wasmtime::Result<()> {
+            super::types::HostIncomingBody::drop(&mut self.0.http(id), this).await
         }
     }
 
@@ -1256,22 +1277,22 @@ mod named {
     where
         T: WasiHttpNamedView,
     {
-        fn drop(
+        async fn drop(
             &mut self,
             id: NamedId,
             this: Resource<HostFutureIncomingResponse>,
         ) -> wasmtime::Result<()> {
-            super::types::HostFutureIncomingResponse::drop(&mut self.0.http(id), this)
+            super::types::HostFutureIncomingResponse::drop(&mut self.0.http(id), this).await
         }
 
-        fn get(
+        async fn get(
             &mut self,
             id: NamedId,
             this: Resource<HostFutureIncomingResponse>,
         ) -> wasmtime::Result<
             Option<Result<Result<Resource<HostIncomingResponse>, types::ErrorCode>, ()>>,
         > {
-            super::types::HostFutureIncomingResponse::get(&mut self.0.http(id), this)
+            super::types::HostFutureIncomingResponse::get(&mut self.0.http(id), this).await
         }
 
         fn subscribe(

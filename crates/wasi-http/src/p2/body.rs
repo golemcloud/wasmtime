@@ -21,10 +21,50 @@ pub type HyperIncomingBody = UnsyncBoxBody<Bytes, Error>;
 /// Common type for outgoing bodies.
 pub type HyperOutgoingBody = UnsyncBoxBody<Bytes, Error>;
 
+/// Completion signal attached to a P2 request's HTTP extensions.
+///
+/// The default and pooled transports consume this through [`prepare_request`].
+/// Custom transports should do the same before dispatching the request.
+#[derive(Clone)]
+pub struct RequestBodyCompletion(
+    pub Arc<std::sync::Mutex<Option<oneshot::Receiver<Result<(), types::ErrorCode>>>>>,
+);
+
+/// Drain non-streaming-method request bodies before opening the connection.
+/// Drain and finish must run concurrently because the guest's channel is bounded.
+pub async fn prepare_request(
+    mut request: http::Request<crate::WasiBody>,
+) -> Result<http::Request<crate::WasiBody>, Error> {
+    let Some(completion) = request.extensions_mut().remove::<RequestBodyCompletion>() else {
+        return Ok(request);
+    };
+    if matches!(
+        *request.method(),
+        http::Method::POST | http::Method::PUT | http::Method::PATCH
+    ) {
+        return Ok(request);
+    }
+    let completion = completion.0.lock().unwrap().take();
+    let Some(completion) = completion else {
+        return Ok(request);
+    };
+    let (parts, body) = request.into_parts();
+    let (completion, body) = futures::future::join(completion, body.collect()).await;
+    completion
+        .map_err(|_| Error::HttpProtocolError)?
+        .map_err(Error::from)?;
+    Ok(http::Request::from_parts(
+        parts,
+        body?.map_err(Error::from).boxed_unsync(),
+    ))
+}
+
 /// The concrete type behind a `was:http/types.incoming-body` resource.
 #[derive(Debug)]
 pub struct HostIncomingBody {
     body: IncomingBodyState,
+    #[cfg(feature = "default-send-request")]
+    pub(crate) connection_lease: Option<crate::connection_pool::P2ConnectionLease>,
     /// An optional worker task to keep alive while this body is being read.
     /// This ensures that if the parent of this body is dropped before the body
     /// then the backing data behind this worker is kept alive.
@@ -37,6 +77,8 @@ impl HostIncomingBody {
         HostIncomingBody {
             body: IncomingBodyState::Start(body),
             worker: None,
+            #[cfg(feature = "default-send-request")]
+            connection_lease: None,
         }
     }
 
@@ -46,22 +88,35 @@ impl HostIncomingBody {
         self.worker = Some(worker);
     }
 
+    /// Construct a body whose stream reports a durable host failure.
+    pub fn failing(error: String) -> Self {
+        Self {
+            body: IncomingBodyState::Failing(error.into()),
+            worker: None,
+            #[cfg(feature = "default-send-request")]
+            connection_lease: None,
+        }
+    }
+
     /// Try taking the stream of this body, if it's available.
-    pub fn take_stream(&mut self) -> Option<HostIncomingBodyStream> {
+    pub fn take_stream(&mut self) -> Option<Box<dyn InputStream>> {
         match &mut self.body {
             IncomingBodyState::Start(_) => {}
             IncomingBodyState::InBodyStream(_) => return None,
+            IncomingBodyState::Failing(error) => {
+                return Some(Box::new(FailingStream(error.clone())));
+            }
         }
         let (tx, rx) = oneshot::channel();
         let body = match mem::replace(&mut self.body, IncomingBodyState::InBodyStream(rx)) {
             IncomingBodyState::Start(b) => b,
-            IncomingBodyState::InBodyStream(_) => unreachable!(),
+            IncomingBodyState::InBodyStream(_) | IncomingBodyState::Failing(_) => unreachable!(),
         };
-        Some(HostIncomingBodyStream {
+        Some(Box::new(HostIncomingBodyStream {
             state: IncomingBodyStreamState::Open { body, tx },
             buffer: Bytes::new(),
             error: None,
-        })
+        }))
     }
 
     /// Convert this body into a `HostFutureTrailers` resource.
@@ -81,6 +136,7 @@ enum IncomingBodyState {
     /// currently owned here. The body will be sent back over this channel when
     /// it's done, however.
     InBodyStream(oneshot::Receiver<StreamEnd>),
+    Failing(Arc<str>),
 }
 
 /// Message sent when a `HostIncomingBodyStream` is done to the
@@ -171,6 +227,10 @@ enum IncomingBodyStreamState {
 
 #[async_trait::async_trait]
 impl InputStream for HostIncomingBodyStream {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
     fn read(&mut self, size: usize) -> Result<Bytes, StreamError> {
         loop {
             // Handle buffered data/errors if any
@@ -301,6 +361,10 @@ impl Pollable for HostFutureTrailers {
         let hyper_body = match &mut body.body {
             IncomingBodyState::Start(body) => body,
             IncomingBodyState::InBodyStream(_) => unreachable!(),
+            IncomingBodyState::Failing(_) => {
+                *self = Self::Done(Ok(None));
+                return;
+            }
         };
         let result = loop {
             match hyper_body.frame().await {
@@ -356,6 +420,7 @@ pub struct HostOutgoingBody {
     context: StreamContext,
     written: Option<WrittenState>,
     finish_sender: Option<tokio::sync::oneshot::Sender<FinishMessage>>,
+    completion_sender: Option<oneshot::Sender<Result<(), types::ErrorCode>>>,
 }
 
 impl HostOutgoingBody {
@@ -430,6 +495,7 @@ impl HostOutgoingBody {
                 context,
                 written,
                 finish_sender: Some(finish_sender),
+                completion_sender: None,
             },
             body_impl,
         )
@@ -438,6 +504,12 @@ impl HostOutgoingBody {
     /// Take the output stream, if it's available.
     pub fn take_output_stream(&mut self) -> Option<Box<dyn OutputStream>> {
         self.body_output_stream.take()
+    }
+
+    /// Signal explicit finish or abort independently of transport consumption.
+    pub fn set_completion_sender(&mut self, sender: oneshot::Sender<Result<(), types::ErrorCode>>) {
+        assert!(self.completion_sender.is_none());
+        self.completion_sender = Some(sender);
     }
 
     /// Finish the body, optionally with trailers.
@@ -455,7 +527,11 @@ impl HostOutgoingBody {
             let written = w.written();
             if written != w.expected {
                 let _ = sender.send(FinishMessage::Abort);
-                return Err(self.context.as_body_size_error(written));
+                let err = self.context.as_body_size_error(written);
+                if let Some(tx) = self.completion_sender.take() {
+                    let _ = tx.send(Err(err.clone()));
+                }
+                return Err(err);
             }
         }
 
@@ -468,6 +544,9 @@ impl HostOutgoingBody {
         // Ignoring failure: receiver died sending body, but we can't report that here.
         let _ = sender.send(message);
 
+        if let Some(tx) = self.completion_sender.take() {
+            let _ = tx.send(Ok(()));
+        }
         Ok(())
     }
 
@@ -483,6 +562,9 @@ impl HostOutgoingBody {
             .expect("outgoing-body trailer_sender consumed by a non-owning function");
 
         let _ = sender.send(FinishMessage::Abort);
+        if let Some(tx) = self.completion_sender.take() {
+            let _ = tx.send(Err(types::ErrorCode::HttpProtocolError));
+        }
     }
 }
 
@@ -543,6 +625,10 @@ impl BodyWriteStream {
 
 #[async_trait::async_trait]
 impl OutputStream for BodyWriteStream {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
     fn write(&mut self, bytes: Bytes) -> Result<(), StreamError> {
         let len = bytes.len();
         if len > self.write_budget {
@@ -611,5 +697,160 @@ impl Pollable for BodyWriteStream {
         // the channel or it's already closed then this will return immediately.
         // If the channel is full this will block until capacity opens up.
         let _ = self.writer.reserve().await;
+    }
+}
+
+/// Input stream that repeatedly reports a durable host failure.
+pub struct FailingStream(pub Arc<str>);
+
+#[async_trait::async_trait]
+impl InputStream for FailingStream {
+    fn read(&mut self, _size: usize) -> Result<Bytes, StreamError> {
+        Err(StreamError::LastOperationFailed(wasmtime::Error::msg(
+            self.0.clone(),
+        )))
+    }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+#[async_trait::async_trait]
+impl Pollable for FailingStream {
+    async fn ready(&mut self) {}
+}
+
+pub(crate) struct WorkerErrorBody {
+    pub body: crate::WasiBody,
+    pub error: Arc<std::sync::Mutex<Option<Error>>>,
+}
+
+impl Body for WorkerErrorBody {
+    type Data = Bytes;
+    type Error = Error;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, Error>>> {
+        let result = Pin::new(&mut self.body).poll_frame(cx);
+        if matches!(&result, Poll::Ready(None))
+            || matches!(&result, Poll::Ready(Some(Ok(frame))) if frame.is_trailers())
+        {
+            if let Some(error) = self.error.lock().unwrap().take() {
+                return Poll::Ready(Some(Err(error)));
+            }
+        }
+        result
+    }
+    fn size_hint(&self) -> http_body::SizeHint {
+        self.body.size_hint()
+    }
+}
+
+#[cfg(test)]
+mod fork_contract_tests {
+    use super::*;
+
+    #[cfg(feature = "default-send-request")]
+    #[test]
+    fn response_header_size_keeps_its_variant_and_payload() {
+        let mut ctx = crate::WasiHttpCtx::new();
+        let mut table = wasmtime::component::ResourceTable::new();
+        let mut view = crate::WasiHttpCtxView {
+            ctx: &mut ctx,
+            table: &mut table,
+            hooks: crate::default_hooks(),
+        };
+        let error = Error::from(types::ErrorCode::HttpResponseHeaderSize(
+            types::FieldSizePayload {
+                field_name: Some("large-header".into()),
+                field_size: Some(1234),
+            },
+        ));
+        assert!(matches!(&error, Error::HttpResponseHeaderSize { .. }));
+        let types::ErrorCode::HttpResponseHeaderSize(payload) = view.error_to_p2(error) else {
+            panic!("response header error changed variant");
+        };
+        assert_eq!(payload.field_name.as_deref(), Some("large-header"));
+        assert_eq!(payload.field_size, Some(1234));
+    }
+
+    fn request(
+        body: HyperOutgoingBody,
+        completion: oneshot::Receiver<Result<(), types::ErrorCode>>,
+    ) -> http::Request<crate::WasiBody> {
+        let mut req = http::Request::new(body);
+        req.extensions_mut()
+            .insert(RequestBodyCompletion(Arc::new(std::sync::Mutex::new(
+                Some(completion),
+            ))));
+        req
+    }
+
+    #[tokio::test]
+    async fn drain_runs_before_finish_on_bounded_channel() {
+        let (mut body, transport) = HostOutgoingBody::new(StreamContext::Request, None, 1, 1);
+        let (tx, rx) = oneshot::channel();
+        body.set_completion_sender(tx);
+        let mut writer = body.take_output_stream().unwrap();
+        let write = async move {
+            for _ in 0..10 {
+                writer.ready().await;
+                assert_eq!(writer.check_write().unwrap(), 1);
+                writer.write(Bytes::from_static(b"x")).unwrap();
+            }
+            drop(writer);
+            body.finish(None).unwrap();
+        };
+        let (prepared, ()) = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            futures::future::join(prepare_request(request(transport, rx)), write),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            prepared
+                .unwrap()
+                .into_body()
+                .collect()
+                .await
+                .unwrap()
+                .to_bytes(),
+            "xxxxxxxxxx"
+        );
+    }
+
+    #[tokio::test]
+    async fn finish_error_takes_precedence_over_generic_body_abort() {
+        let (mut body, transport) = HostOutgoingBody::new(StreamContext::Request, Some(10), 1, 1);
+        let (tx, rx) = oneshot::channel();
+        body.set_completion_sender(tx);
+        assert!(body.finish(None).is_err());
+        assert!(matches!(
+            prepare_request(request(transport, rx)).await,
+            Err(Error::HttpRequestBodySize(Some(0)))
+        ));
+    }
+
+    #[tokio::test]
+    async fn worker_error_reaches_eof_and_trailers() {
+        use futures::stream;
+        use http_body_util::{Empty, StreamBody};
+        let bodies: Vec<crate::WasiBody> = vec![
+            Empty::new().map_err(Error::from).boxed_unsync(),
+            StreamBody::new(stream::iter([Ok(Frame::trailers(http::HeaderMap::new()))]))
+                .boxed_unsync(),
+        ];
+        for body in bodies {
+            let mut body = WorkerErrorBody {
+                body,
+                error: Arc::new(std::sync::Mutex::new(Some(Error::ConnectionTerminated))),
+            };
+            assert!(matches!(
+                body.frame().await,
+                Some(Err(Error::ConnectionTerminated))
+            ));
+        }
     }
 }

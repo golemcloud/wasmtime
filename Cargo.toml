@@ -456,6 +456,8 @@ native-tls = "0.2.11"
 tokio-openssl = "0.6.5"
 openssl = "0.10.80"
 webpki-roots = "1.0.7"
+hyper-util = { version = "0.1", default-features = false }
+hyper-rustls = { version = "0.27", default-features = false }
 itertools = "0.14.0"
 base64 = "0.22.1"
 termcolor = "1.4.1"

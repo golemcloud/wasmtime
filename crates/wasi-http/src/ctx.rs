@@ -125,7 +125,8 @@ const DEFAULT_FIELD_SIZE_LIMIT: usize = 128 * 1024;
 /// Capture the state necessary for use in the wasi-http API implementation.
 #[derive(Debug, Clone)]
 pub struct WasiHttpCtx {
-    pub(crate) field_size_limit: usize,
+    /// Maximum in-memory size of a fields resource.
+    pub field_size_limit: usize,
 }
 
 impl WasiHttpCtx {
@@ -336,6 +337,12 @@ pub trait WasiHttpHooks: Send {
         crate::p2::DEFAULT_OUTGOING_BODY_CHUNK_SIZE
     }
 
+    /// Defer polling an outgoing P2 transport until its response is observed.
+    #[cfg(feature = "p2")]
+    fn p2_defer_send_request(&mut self) -> bool {
+        false
+    }
+
     /// Optional hook to configure the error code for hyper errors.
     #[cfg(feature = "p2")]
     fn p2_error_from_hyper(&mut self, err: &hyper::Error) -> p2::ErrorCode {
@@ -374,10 +381,7 @@ pub trait WasiHttpHooks: Send {
     fn p2_error_from_tls(&mut self, err: &std::io::Error) -> p2::ErrorCode {
         tracing::warn!("tls error: {err:?}");
         #[cfg(feature = "default-send-request")]
-        if let Some(err) = err
-            .get_ref()
-            .and_then(|err| err.downcast_ref::<rustls::Error>())
-        {
+        if let Some(err) = crate::connection_pool::find_rustls_error(err) {
             return match err {
                 rustls::Error::InvalidCertificate(_) => p2::ErrorCode::TlsCertificateError,
                 rustls::Error::AlertReceived(alert) => {
@@ -453,10 +457,7 @@ pub trait WasiHttpHooks: Send {
     fn p3_error_from_tls(&mut self, err: &std::io::Error) -> p3::ErrorCode {
         tracing::warn!("tls error: {err:?}");
         #[cfg(feature = "default-send-request")]
-        if let Some(err) = err
-            .get_ref()
-            .and_then(|err| err.downcast_ref::<rustls::Error>())
-        {
+        if let Some(err) = crate::connection_pool::find_rustls_error(err) {
             return match err {
                 rustls::Error::InvalidCertificate(_) => p3::ErrorCode::TlsCertificateError,
                 rustls::Error::AlertReceived(alert) => {

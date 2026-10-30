@@ -10,7 +10,9 @@
 
 pub mod bindings;
 mod body;
+pub use body::HostBodyStreamProducer;
 mod conv;
+pub use conv::error_to_p3;
 mod helpers;
 mod host;
 mod proxy;
