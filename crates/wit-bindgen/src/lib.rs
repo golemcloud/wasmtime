@@ -218,6 +218,14 @@ pub struct TrappableError {
 
 impl Opts {
     pub fn generate(&self, resolve: &mut Resolve, world: WorldId) -> anyhow::Result<String> {
+        anyhow::ensure!(
+            !self.exports.has_concurrent(),
+            "`concurrent` is only supported for imports"
+        );
+        anyhow::ensure!(
+            !self.imports.has_concurrent() || cfg!(feature = "component-model-async"),
+            "`concurrent` imports require the `component-model-async` feature"
+        );
         resolve.generate_nominal_type_ids(world);
         // TODO: Should we refine this test to inspect only types reachable from
         // the specified world?
@@ -2828,7 +2836,7 @@ pub fn add_to_linker<T, D>(
         uwrite!(
             self.src,
             "{linker}.{}(\"{}\", ",
-            if func.kind.is_async() {
+            if func.kind.is_async() || flags.contains(FunctionFlags::CONCURRENT) {
                 "func_wrap_concurrent"
             } else if flags.contains(FunctionFlags::ASYNC) {
                 "func_wrap_async"
@@ -2859,7 +2867,8 @@ pub fn add_to_linker<T, D>(
         // codegen here.
 
         let wt = self.generator.wasmtime_path();
-        if func.kind.is_async() {
+        let concurrent = func.kind.is_async() || flags.contains(FunctionFlags::CONCURRENT);
+        if concurrent {
             uwrite!(self.src, "move |caller: &{wt}::component::Accessor::<T>, (");
         } else {
             uwrite!(
@@ -2911,7 +2920,7 @@ pub fn add_to_linker<T, D>(
         }
 
         if flags.contains(FunctionFlags::ASYNC) {
-            let ctor = if func.kind.is_async() { "pin" } else { "new" };
+            let ctor = if concurrent { "pin" } else { "new" };
             uwriteln!(
                 self.src,
                 "{wt}::component::__internal::Box::{ctor}(async move {{"
@@ -2943,7 +2952,7 @@ pub fn add_to_linker<T, D>(
             );
         }
 
-        if func.kind.is_async() {
+        if concurrent {
             uwriteln!(
                 self.src,
                 "let host = &caller.with_getter::<D>(host_getter);"
@@ -3026,7 +3035,7 @@ pub fn add_to_linker<T, D>(
                 None => format!("Host"),
             };
             let convert = format!("{}::convert_{}", convert_trait, err_name.to_snake_case());
-            let convert = if func.kind.is_async() {
+            let convert = if concurrent {
                 format!("caller.with(|mut host| {convert}(&mut host_getter(host.get()), e))")
             } else if flags.contains(FunctionFlags::STORE) {
                 format!("{convert}(&mut host_getter(caller.data_mut()), e)")
@@ -3067,7 +3076,7 @@ pub fn add_to_linker<T, D>(
 
         self.push_str("fn ");
         self.push_str(&rust_function_name(func)?);
-        if func.kind.is_async() {
+        if func.kind.is_async() || flags.contains(FunctionFlags::CONCURRENT) {
             uwrite!(self.src, "(accessor: &{wt}::component::Accessor<T, Self>, ");
         } else if flags.contains(FunctionFlags::STORE) {
             uwrite!(self.src, "(host: {wt}::component::Access<T, Self>, ");

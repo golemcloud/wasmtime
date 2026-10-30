@@ -313,8 +313,19 @@ pub(crate) use self::store::ComponentStoreData;
 ///         // If the WIT function itself is `async`, then the function will
 ///         // already have this flag and will take an `&Accessor<T, Self>`. If
 ///         // the WIT function is not `async`, however, then the function will
-///         // take `Access<T, Self>`.
+///         // take `Access<T, Self>` unless `concurrent` is specified.
 ///         "wasi:clocks/monotonic-clock.now": store,
+///
+///         // The import-only `concurrent` flag implies `async | store` and
+///         // selects an `&Accessor<T, Self>` handler registered with
+///         // `LinkerInstance::func_wrap_concurrent`, even for synchronous WIT.
+///         // Unlike `async | store`, it releases Store access across awaits.
+///         // It requires the `component-model-async` crate feature and engine
+///         // concurrency support. A synchronous canonical lowering still blocks
+///         // the guest until completion; this does not change its WIT type or
+///         // permit a non-suspendable guest task to block (`CannotBlockSyncTask`).
+///         // The flag also applies to resource-drop rules. It is not valid in
+///         // `exports`.
 ///
 ///         // This is an example of combining flags where the `async` and
 ///         // `store` flags are combined. This means that the generated

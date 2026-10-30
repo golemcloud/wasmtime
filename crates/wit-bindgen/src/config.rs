@@ -11,6 +11,9 @@ bitflags::bitflags! {
         const TRACING = 1 << 3;
         const VERBOSE_TRACING = 1 << 4;
         const EXACT = 1 << 5;
+        /// Use a concurrent host handler even for a synchronous WIT import.
+        /// Implies `ASYNC | STORE`; not supported for exports.
+        const CONCURRENT = 1 << 6;
     }
 }
 
@@ -43,7 +46,10 @@ impl FunctionConfig {
     ///
     /// Note that the order rules are added is significant as only the first
     /// matching rule is used for a function.
-    pub fn push(&mut self, filter: FunctionFilter, flags: FunctionFlags) {
+    pub fn push(&mut self, filter: FunctionFilter, mut flags: FunctionFlags) {
+        if flags.contains(FunctionFlags::CONCURRENT) {
+            flags |= FunctionFlags::ASYNC | FunctionFlags::STORE;
+        }
         match filter {
             FunctionFilter::Name(filter) => {
                 self.rules.push(FunctionRule {
@@ -162,5 +168,140 @@ impl FunctionConfig {
         }
 
         anyhow::bail!("unused `{kind}` rules found: {unused:?}");
+    }
+
+    pub(crate) fn has_concurrent(&self) -> bool {
+        self.default.contains(FunctionFlags::CONCURRENT)
+            || self
+                .rules
+                .iter()
+                .any(|rule| rule.flags.contains(FunctionFlags::CONCURRENT))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Opts;
+
+    fn world() -> (Resolve, wit_parser::WorldId) {
+        let mut resolve = Resolve::default();
+        let pkg = resolve
+            .push_str(
+                "test.wit",
+                r#"
+            package test:binding-options;
+            world bindings {
+                import api: interface {
+                    resource item;
+                    run: func();
+                }
+                export run: func();
+            }
+        "#,
+            )
+            .unwrap();
+        let world = resolve.select_world(&[pkg], Some("bindings")).unwrap();
+        (resolve, world)
+    }
+
+    #[test]
+    fn concurrent_export_rules_are_rejected() {
+        for filter in [FunctionFilter::Default, FunctionFilter::Name("run".into())] {
+            let (mut resolve, world) = world();
+            let mut opts = Opts::default();
+            opts.exports.push(filter, FunctionFlags::CONCURRENT);
+            assert!(
+                opts.generate(&mut resolve, world)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("only supported for imports")
+            );
+        }
+    }
+
+    #[test]
+    fn concurrent_programmatic_rules_imply_async_store() {
+        let (mut resolve, world) = world();
+        let mut opts = Opts::default();
+        opts.imports
+            .push(FunctionFilter::Default, FunctionFlags::CONCURRENT);
+        assert!(
+            opts.imports
+                .default
+                .contains(FunctionFlags::ASYNC | FunctionFlags::STORE)
+        );
+        let generated = opts.generate(&mut resolve, world);
+        if cfg!(feature = "component-model-async") {
+            let generated = generated.unwrap();
+            assert!(generated.contains("func_wrap_concurrent"));
+            assert!(generated.contains("resource_concurrent"));
+            assert!(generated.contains("fn run(accessor:"));
+            assert!(generated.contains("fn drop(accessor:"));
+            assert!(generated.contains("Box::pin(async move"));
+        } else {
+            assert!(
+                generated
+                    .unwrap_err()
+                    .to_string()
+                    .contains("component-model-async")
+            );
+        }
+    }
+
+    #[test]
+    fn async_store_function_keeps_borrowed_access() {
+        let (mut resolve, world) = world();
+        let mut opts = Opts::default();
+        opts.imports.push(
+            FunctionFilter::Name("api.run".into()),
+            FunctionFlags::ASYNC | FunctionFlags::STORE,
+        );
+        let generated = opts.generate(&mut resolve, world).unwrap();
+        assert!(generated.contains("func_wrap_async"));
+        assert!(!generated.contains("func_wrap_concurrent"));
+        assert!(generated.contains("fn run(host:"));
+        assert!(generated.contains("component::Access<T, Self>"));
+    }
+
+    #[test]
+    #[cfg(feature = "component-model-async")]
+    fn concurrent_trappable_error_conversion_uses_accessor() {
+        let mut resolve = Resolve::default();
+        let pkg = resolve
+            .push_str(
+                "errors.wit",
+                r#"
+            package test:errors;
+            interface api {
+                enum failure { denied }
+                run: func() -> result<u32, failure>;
+                resource item;
+                native: async func();
+            }
+            world bindings { import api; }
+        "#,
+            )
+            .unwrap();
+        let world = resolve.select_world(&[pkg], Some("bindings")).unwrap();
+        let mut opts = Opts::default();
+        opts.imports.push(
+            FunctionFilter::Name("test:errors/api.run".into()),
+            FunctionFlags::CONCURRENT | FunctionFlags::TRAPPABLE | FunctionFlags::TRACING,
+        );
+        opts.imports.push(
+            FunctionFilter::Name("test:errors/api.[drop]item".into()),
+            FunctionFlags::CONCURRENT,
+        );
+        opts.trappable_error_type.push(crate::TrappableError {
+            wit_path: "test:errors/api.failure".into(),
+            rust_type_name: "MyError".into(),
+        });
+        let generated = opts.generate(&mut resolve, world).unwrap();
+        assert!(generated.contains("caller.with(|mut host| Host::convert_failure"));
+        assert!(generated.contains("fn run(accessor:"));
+        assert!(generated.contains("fn native(accessor:"));
+        assert!(generated.contains("resource_concurrent"));
+        assert!(generated.contains("}.instrument(span)"));
     }
 }

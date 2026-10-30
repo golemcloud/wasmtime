@@ -4891,6 +4891,7 @@ dependencies = [
  "serde_json",
  "similar",
  "syn 3.0.5",
+ "tokio",
  "tracing",
  "wasmtime",
  "wasmtime-internal-component-util",

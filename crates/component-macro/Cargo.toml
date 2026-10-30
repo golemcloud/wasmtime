@@ -39,6 +39,7 @@ serde_json = { workspace = true }
 prettyplease = "0.3.0"
 similar = { workspace = true }
 wit-parser = { workspace = true, features = ["decoding"] }
+tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
 
 [features]
 async = ['wasmtime-wit-bindgen/async']

@@ -269,6 +269,7 @@ mod kw {
     syn::custom_keyword!(imports);
     syn::custom_keyword!(exports);
     syn::custom_keyword!(store);
+    syn::custom_keyword!(concurrent);
     syn::custom_keyword!(trappable);
     syn::custom_keyword!(exact);
 }
@@ -552,6 +553,9 @@ fn parse_function_config(input: ParseStream<'_>) -> Result<FunctionConfig> {
                 } else if l.peek(kw::store) {
                     input.parse::<kw::store>()?;
                     flags |= FunctionFlags::STORE;
+                } else if l.peek(kw::concurrent) {
+                    input.parse::<kw::concurrent>()?;
+                    flags |= FunctionFlags::CONCURRENT;
                 } else if l.peek(kw::trappable) {
                     input.parse::<kw::trappable>()?;
                     flags |= FunctionFlags::TRAPPABLE;
