@@ -640,6 +640,47 @@ impl<T: 'static> LinkerInstance<'_, T> {
         Ok(())
     }
 
+    /// Defines a host function whose invocation is selected between borrowed
+    /// asynchronous and concurrent execution before a borrowed future is created.
+    /// Returning `true` from `selector` prefers concurrent execution, which is used
+    /// only when the nearest guest task permits blocking. Otherwise the borrowed
+    /// handler is used, including when the selector returns `false`.
+    #[cfg(feature = "component-model-async")]
+    pub fn func_wrap_dispatch<Params, Return, S, B, C>(
+        &mut self,
+        name: &str,
+        selector: S,
+        borrowed: B,
+        concurrent: C,
+    ) -> Result<()>
+    where
+        Params: ComponentNamedList + Lift + 'static,
+        Return: ComponentNamedList + Lower + 'static,
+        S: Fn(&mut T, &Params) -> Result<bool> + Send + Sync + 'static,
+        B: Fn(
+                StoreContextMut<'_, T>,
+                Params,
+            ) -> Box<dyn Future<Output = Result<Return>> + Send + '_>
+            + Send
+            + Sync
+            + 'static,
+        C: Fn(&Accessor<T>, Params) -> Pin<Box<dyn Future<Output = Result<Return>> + Send + '_>>
+            + Send
+            + Sync
+            + 'static,
+    {
+        if !self.engine.tunables().concurrency_support {
+            bail!("dispatch host functions require `Config::concurrency_support`");
+        }
+        self.insert(
+            name,
+            Definition::Func(HostFunc::func_wrap_dispatch(
+                selector, borrowed, concurrent,
+            )?),
+        )?;
+        Ok(())
+    }
+
     /// Define a new host-provided function using dynamically typed values.
     ///
     /// The `name` provided is the name of the function to define and the
@@ -858,7 +899,20 @@ impl<T: 'static> LinkerInstance<'_, T> {
     ) -> Result<()> {
         let dtor = try_new::<Arc<_>>(crate::func::HostFunc::wrap(
             &self.engine,
-            move |mut cx: crate::Caller<'_, T>, (param,): (u32,)| dtor(cx.as_context_mut(), param),
+            move |mut cx: crate::Caller<'_, T>, (param,): (u32,)| {
+                #[cfg(feature = "component-model-async")]
+                {
+                    let mut store = cx.as_context_mut();
+                    let context = store.guest_task_context_opaque()?;
+                    crate::component::concurrent::with_guest_task_context(context, || {
+                        dtor(store, param)
+                    })
+                }
+                #[cfg(not(feature = "component-model-async"))]
+                {
+                    dtor(cx.as_context_mut(), param)
+                }
+            },
         )?)?;
         self.insert(name, Definition::Resource(ty, dtor))?;
         Ok(())
@@ -876,7 +930,27 @@ impl<T: 'static> LinkerInstance<'_, T> {
     {
         let dtor = try_new::<Arc<_>>(crate::func::HostFunc::wrap_async(
             &self.engine,
-            move |cx: crate::Caller<'_, T>, (param,): (u32,)| dtor(cx.into(), param),
+            move |cx: crate::Caller<'_, T>, (param,): (u32,)| {
+                #[cfg(feature = "component-model-async")]
+                {
+                    let mut store = StoreContextMut::from(cx);
+                    let context = match store.guest_task_context_opaque() {
+                        Ok(context) => context,
+                        Err(error) => return Box::new(core::future::ready(Err(error))),
+                    };
+                    let future = crate::component::concurrent::with_guest_task_context(
+                        context.clone(),
+                        || Pin::from(dtor(store, param)),
+                    );
+                    Box::new(crate::component::concurrent::poll_with_guest_task_context(
+                        context, future,
+                    ))
+                }
+                #[cfg(not(feature = "component-model-async"))]
+                {
+                    dtor(cx.into(), param)
+                }
+            },
         )?)?;
         self.insert(name, Definition::Resource(ty, dtor))?;
         Ok(())
@@ -907,8 +981,11 @@ impl<T: 'static> LinkerInstance<'_, T> {
                 let dtor = dtor.clone();
                 Box::new(async move {
                     let mut store = cx.as_context_mut();
-                    let accessor =
-                        &Accessor::new(crate::store::StoreToken::new(store.as_context_mut()));
+                    let context = store.guest_task_context_opaque()?;
+                    let accessor = &Accessor::new_with_guest_task_context(
+                        crate::store::StoreToken::new(store.as_context_mut()),
+                        context,
+                    );
                     let mut future = core::pin::pin!(dtor(accessor, param));
                     core::future::poll_fn(|cx| {
                         crate::component::concurrent::tls::set(store.0, || future.as_mut().poll(cx))

@@ -63,6 +63,52 @@ impl core::fmt::Debug for HostFunc {
 #[cfg(feature = "component-model-async")]
 type HostFuture<R> = Pin<Box<dyn Future<Output = Result<R>> + Send>>;
 
+#[cfg(feature = "component-model-async")]
+enum HostResult<R> {
+    Done(Result<R>),
+    Future(HostFuture<R>),
+}
+
+#[cfg(feature = "component-model-async")]
+impl<R: Send + Sync + 'static> HostOutput<R> for HostResult<R> {
+    fn finish_sync(self, store: &mut dyn VMStore, task: EnteredHostTask) -> Result<R> {
+        match self {
+            Self::Done(result) => result.finish_sync(store, task),
+            Self::Future(future) => future.finish_sync(store, task),
+        }
+    }
+
+    fn finish_async<T: 'static>(
+        self,
+        store: StoreContextMut<'_, T>,
+        instance: Instance,
+        task: EnteredHostTask,
+        lower: impl FnOnce(StoreContextMut<T>, Option<R>, bool, Option<TableId<HostTask>>) -> Result<()>
+        + Send
+        + 'static,
+    ) -> Result<u32> {
+        match self {
+            Self::Done(result) => result.finish_async(store, instance, task, lower),
+            Self::Future(future) => future.finish_async(store, instance, task, lower),
+        }
+    }
+}
+
+fn with_current_guest_task_context<'a, T: 'static, R>(
+    mut store: StoreContextMut<'a, T>,
+    fun: impl FnOnce(StoreContextMut<'a, T>) -> R,
+) -> Result<R> {
+    #[cfg(feature = "component-model-async")]
+    {
+        let context = store.guest_task_context_opaque()?;
+        Ok(concurrent::with_guest_task_context(context, || fun(store)))
+    }
+    #[cfg(not(feature = "component-model-async"))]
+    {
+        Ok(fun(store))
+    }
+}
+
 /// Only the future impl references `poll_and_block`/`first_poll`, so
 /// non-concurrent host functions don't instantiate them.
 trait HostOutput<R> {
@@ -152,7 +198,12 @@ impl HostFunc {
         P: ComponentNamedList + Lift + 'static,
         R: ComponentNamedList + Lower + 'static,
     {
-        Self::new(Asyncness::No, StaticHostFn::<_, false>::new(func))
+        Self::new(
+            Asyncness::No,
+            StaticHostFn::<_, false>::new(move |store, params| {
+                with_current_guest_task_context(store, |store| func(store, params)).and_then(|r| r)
+            }),
+        )
     }
 
     /// Equivalent for `Linker::func_wrap_async`
@@ -170,11 +221,38 @@ impl HostFunc {
         Self::new(
             Asyncness::Yes,
             StaticHostFn::<_, false>::new(move |store: StoreContextMut<'_, T>, params| {
-                store
-                    .block_on(|store| Pin::from(func(store, params)))
-                    .and_then(|r| r)
+                Self::borrowed_host_call(&func, store, params)
             }),
         )
+    }
+
+    #[cfg(feature = "async")]
+    fn borrowed_host_call<T: 'static, F, P, R: 'static>(
+        func: &F,
+        mut store: StoreContextMut<'_, T>,
+        params: P,
+    ) -> Result<R>
+    where
+        F: Fn(StoreContextMut<'_, T>, P) -> Box<dyn Future<Output = Result<R>> + Send + '_>,
+    {
+        #[cfg(feature = "component-model-async")]
+        {
+            let context = store.guest_task_context_opaque()?;
+            store
+                .block_on(|store| {
+                    let future = concurrent::with_guest_task_context(context.clone(), || {
+                        Pin::from(func(store, params))
+                    });
+                    Box::pin(concurrent::poll_with_guest_task_context(context, future))
+                })
+                .and_then(|r| r)
+        }
+        #[cfg(not(feature = "component-model-async"))]
+        {
+            store
+                .block_on(|store| Pin::from(func(store, params)))
+                .and_then(|r| r)
+        }
     }
 
     /// Equivalent for `Linker::func_wrap_concurrent`
@@ -199,6 +277,55 @@ impl HostFunc {
         )
     }
 
+    /// Equivalent for `Linker::func_wrap_dispatch`
+    #[cfg(feature = "component-model-async")]
+    pub(crate) fn func_wrap_dispatch<T, P, R, S, B, C>(
+        select: S,
+        borrowed: B,
+        concurrent: C,
+    ) -> Result<Arc<HostFunc>>
+    where
+        T: 'static,
+        P: ComponentNamedList + Lift + 'static,
+        R: ComponentNamedList + Lower + 'static,
+        S: Fn(&mut T, &P) -> Result<bool> + Send + Sync + 'static,
+        B: Fn(StoreContextMut<'_, T>, P) -> Box<dyn Future<Output = Result<R>> + Send + '_>
+            + Send
+            + Sync
+            + 'static,
+        C: Fn(&Accessor<T>, P) -> Pin<Box<dyn Future<Output = Result<R>> + Send + '_>>
+            + Send
+            + Sync
+            + 'static,
+    {
+        let concurrent = Arc::new(concurrent);
+        Self::new(
+            Asyncness::Yes,
+            StaticHostFn::<_, false>::new(move |mut store: StoreContextMut<'_, T>, params| {
+                let use_concurrent = match select(store.data_mut(), &params) {
+                    Err(error) => return HostResult::Done(Err(error)),
+                    // Concurrent dispatch is a preference constrained by whether the nearest
+                    // guest task can release the Store. Synchronous guest tasks must keep using
+                    // the borrowed handler, even when the selector prefers concurrency.
+                    Ok(true) => match store.nearest_guest_task_may_block() {
+                        Ok(use_concurrent) => use_concurrent,
+                        Err(error) => return HostResult::Done(Err(error)),
+                    },
+                    Ok(false) => false,
+                };
+                match use_concurrent {
+                    true => {
+                        let concurrent = concurrent.clone();
+                        HostResult::Future(Box::pin(
+                            store.wrap_call(move |accessor| concurrent(accessor, params)),
+                        ))
+                    }
+                    false => HostResult::Done(Self::borrowed_host_call(&borrowed, store, params)),
+                }
+            }),
+        )
+    }
+
     /// Equivalent of `Linker::func_new`
     pub(crate) fn func_new<T, F>(func: F) -> Result<Arc<HostFunc>>
     where
@@ -213,7 +340,9 @@ impl HostFunc {
             DynamicHostFn::<_, false>::new(
                 move |store, ty, mut params_and_results, result_start| {
                     let (params, results) = params_and_results.split_at_mut(result_start);
-                    func(store, ty, params, results).map(move |()| params_and_results)
+                    with_current_guest_task_context(store, |store| func(store, ty, params, results))
+                        .and_then(|r| r)
+                        .map(move |()| params_and_results)
                 },
             ),
         )
@@ -237,11 +366,29 @@ impl HostFunc {
         Self::new(
             Asyncness::Yes,
             DynamicHostFn::<_, false>::new(
-                move |store, ty, mut params_and_results, result_start| {
+                move |mut store: StoreContextMut<'_, T>,
+                      ty,
+                      mut params_and_results,
+                      result_start| {
                     let (params, results) = params_and_results.split_at_mut(result_start);
+                    #[cfg(feature = "component-model-async")]
+                    let context = store.guest_task_context_opaque()?;
                     let result = store
                         .with_blocking(|store, cx| {
-                            cx.block_on(Pin::from(func(store, ty, params, results)))
+                            #[cfg(feature = "component-model-async")]
+                            {
+                                let future =
+                                    concurrent::with_guest_task_context(context.clone(), || {
+                                        Pin::from(func(store, ty, params, results))
+                                    });
+                                cx.block_on(Box::pin(concurrent::poll_with_guest_task_context(
+                                    context, future,
+                                )))
+                            }
+                            #[cfg(not(feature = "component-model-async"))]
+                            {
+                                cx.block_on(Pin::from(func(store, ty, params, results)))
+                            }
                         })
                         .and_then(|r| r);
                     result.map(move |()| params_and_results)
@@ -464,11 +611,18 @@ where
         lower.validate_scope_exit()?;
         // Check if running the future created an actual host task in the store.
         let materialized_host_task = lower.store.0.current_materialized_host_task()?;
+        #[cfg(feature = "component-model-async")]
+        let observer = lower.store.0.take_current_terminal_observer()?;
         lower
             .store
             .0
             .host_task_delete(entered_host_task, materialized_host_task)?;
-        Self::lower_result(&mut lower, ty, ret, dst)
+        Self::lower_result(&mut lower, ty, ret, dst)?;
+        #[cfg(feature = "component-model-async")]
+        if let Some(observer) = observer {
+            observer(concurrent::TerminalConsumption::Delivered);
+        }
+        Ok(())
     }
 
     /// Implementation of the "async" ABI of the component model.
@@ -521,6 +675,11 @@ where
             move |store, ret, immediate, materialized_host_task| {
                 let mut lower = LowerContext::new(store, options, instance);
                 lower.validate_scope_exit()?;
+                let observer = if immediate {
+                    lower.store.0.take_current_terminal_observer()?
+                } else {
+                    None
+                };
                 if immediate {
                     lower
                         .store
@@ -534,6 +693,9 @@ where
                 // right answer here, hence the upstream issue.
                 if let Some(result) = ret {
                     Self::lower_result(&mut lower, ty, result, Destination::Memory(retptr))?;
+                    if let Some(observer) = observer {
+                        observer(concurrent::TerminalConsumption::Delivered);
+                    }
                 }
                 Ok(())
             },
@@ -583,38 +745,21 @@ where
     }
 }
 
-/// Checks that a host function's `ASYNC`-ness (as encoded by which of
-/// `func_new`/`func_new_async`/`func_new_concurrent` — or their `_wrap`
-/// counterparts — constructed it) matches whether the component's WIT type
-/// for this import is declared `async func`.
-///
-/// This isn't a case of one or the other being "correct": `func_new_async`/
-/// `func_wrap_async` intentionally implement a *sync*-WIT-typed function via
-/// blocking/async host code (see their docs), so they can never satisfy an
-/// `async func` import — only `func_new_concurrent`/`func_wrap_concurrent`
-/// can. The error message names which specific mismatch occurred and points
-/// at the API that would work, since "type mismatch with async" alone gives
-/// no indication of *why* or what to use instead.
+/// Concurrent host functions can satisfy either WIT function type: a sync
+/// lowering blocks on their future. Sync-style host functions cannot satisfy
+/// an `async func` import, including `func_wrap_async` and `func_new_async`,
+/// which implement sync-WIT functions using borrowed-store futures.
 fn typecheck_async(host_async: bool, wit_async: bool) -> Result<()> {
-    if host_async == wit_async {
+    if host_async || !wit_async {
         return Ok(());
     }
-    if wit_async {
-        bail!(
-            "type mismatch with async: this import is declared `async func` in WIT, but was \
-             satisfied with a sync-style host function (`func_new`/`func_wrap`, or \
-             `func_new_async`/`func_wrap_async` — despite the name, these implement a \
-             *sync*-WIT-typed function via blocking host code, not an `async func` import); \
-             use `func_new_concurrent`/`func_wrap_concurrent` instead"
-        );
-    } else {
-        bail!(
-            "type mismatch with async: this import's WIT type is a plain (non-`async`) \
-             function, but was satisfied with `func_new_concurrent`/`func_wrap_concurrent`, \
-             which is only for `async func`-typed imports; use `func_new`/`func_wrap` (or \
-             `func_new_async`/`func_wrap_async` for blocking host code) instead"
-        );
-    }
+    bail!(
+        "type mismatch with async: this import is declared `async func` in WIT, but was \
+         satisfied with a sync-style host function (`func_new`/`func_wrap`, or \
+         `func_new_async`/`func_wrap_async` — despite the name, these implement a \
+         *sync*-WIT-typed function via blocking host code, not an `async func` import); \
+         use `func_new_concurrent`/`func_wrap_concurrent` instead"
+    );
 }
 
 /// Implementation of a "static" host function where the parameters and results

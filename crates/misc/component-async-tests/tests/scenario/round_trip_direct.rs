@@ -2,9 +2,8 @@ use super::util::{config, make_component};
 use component_async_tests::Ctx;
 use component_async_tests::util::yield_times;
 use futures::stream::{FuturesUnordered, TryStreamExt};
-use wasmtime::component::{Linker, ResourceTable, Val};
+use wasmtime::component::{Linker, Val};
 use wasmtime::{Engine, Result, Store, format_err};
-use wasmtime_wasi::WasiCtxBuilder;
 
 #[tokio::test]
 pub async fn async_round_trip_direct_stackless() -> Result<()> {
@@ -30,16 +29,7 @@ async fn test_round_trip_direct(
 ) -> Result<()> {
     let engine = Engine::new(&config())?;
 
-    let make_store = || {
-        Store::new(
-            &engine,
-            Ctx {
-                wasi: WasiCtxBuilder::new().inherit_stdio().build(),
-                table: ResourceTable::default(),
-                continue_: false,
-            },
-        )
-    };
+    let make_store = || Store::new(&engine, Ctx::default());
 
     let component = make_component(&engine, components).await?;
 

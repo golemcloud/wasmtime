@@ -369,6 +369,14 @@ impl StoreOpaque {
     }
 
     #[cfg(feature = "component-model-async")]
+    pub(crate) fn concurrent_state(&self) -> Option<&ConcurrentState> {
+        match &self.component_data().task_state {
+            ComponentTaskState::Concurrent(state) => Some(state),
+            ComponentTaskState::NotConcurrent(_) => None,
+        }
+    }
+
+    #[cfg(feature = "component-model-async")]
     pub(crate) fn concurrent_state_mut_without_forcing_current_thread(
         &mut self,
     ) -> &mut ConcurrentState {

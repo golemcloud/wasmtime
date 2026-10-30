@@ -124,9 +124,11 @@ pub use self::concurrent::TaskGroupId;
 pub use self::concurrent::{
     Access, Accessor, AccessorTask, AsAccessor, Destination, DirectDestination, DirectSource,
     ErrorContext, FuncCallConcurrent, FutureAny, FutureConsumer, FutureProducer, FutureReader,
-    GuardedFutureReader, GuardedStreamReader, JoinHandle, ReadBuffer, Source, StreamAny,
-    StreamConsumer, StreamProducer, StreamReader, StreamResult, TypedFuncCallConcurrent,
-    VMComponentAsyncStore, VecBuffer, WriteBuffer,
+    GuardedFutureReader, GuardedStreamReader, JoinHandle, ReadBuffer, RuntimeActivityId,
+    RuntimeActivityKind, RuntimeInvalidation, RuntimeObservation, RuntimeObserver, RuntimeRunId,
+    Source, StreamAny, StreamConsumer, StreamProducer, StreamReader, StreamResult,
+    TerminalConsumption, TypedFuncCallConcurrent, VMComponentAsyncStore, VecBuffer, WriteBuffer,
+    current_guest_task_context,
 };
 pub use self::func::{
     ComponentNamedList, ComponentType, Func, Lift, Lower, TypedFunc, WasmList, WasmStr,

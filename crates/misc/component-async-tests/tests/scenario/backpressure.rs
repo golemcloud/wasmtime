@@ -5,11 +5,7 @@ use std::{
     task::{Context, Poll},
     time::Duration,
 };
-use wasmtime::{
-    Engine, Result, Store,
-    component::{Linker, ResourceTable},
-};
-use wasmtime_wasi::WasiCtxBuilder;
+use wasmtime::{Engine, Result, Store, component::Linker};
 
 use super::util::{config, make_component, test_run};
 
@@ -39,14 +35,7 @@ pub async fn async_backpressure_callee() -> Result<()> {
     let mut linker = Linker::new(&engine);
     wasmtime_wasi::p2::add_to_linker_async(&mut linker)?;
 
-    let mut store = Store::new(
-        &engine,
-        Ctx {
-            wasi: WasiCtxBuilder::new().inherit_stdio().build(),
-            table: ResourceTable::default(),
-            continue_: false,
-        },
-    );
+    let mut store = Store::new(&engine, Ctx::default());
 
     if env::var_os("MIRI_TEST_CWASM_DIR").is_none() {
         store.set_epoch_deadline(1);

@@ -19,11 +19,10 @@ use {
     wasmtime::{
         Engine, Result, Store, StoreContextMut,
         component::{
-            Destination, FutureReader, Lift, Linker, ResourceTable, Source, StreamConsumer,
-            StreamProducer, StreamReader, StreamResult, VecBuffer,
+            Destination, FutureReader, Lift, Linker, Source, StreamConsumer, StreamProducer,
+            StreamReader, StreamResult, VecBuffer,
         },
     },
-    wasmtime_wasi::WasiCtxBuilder,
 };
 
 pub struct DirectPipeProducer<S>(S);
@@ -112,14 +111,7 @@ impl<D, S: Sink<u8, Error: std::error::Error + Send + Sync> + Send + 'static> St
 pub async fn async_closed_streams() -> Result<()> {
     let engine = Engine::new(&config())?;
 
-    let mut store = Store::new(
-        &engine,
-        Ctx {
-            wasi: WasiCtxBuilder::new().inherit_stdio().build(),
-            table: ResourceTable::default(),
-            continue_: false,
-        },
-    );
+    let mut store = Store::new(&engine, Ctx::default());
 
     let mut linker = Linker::new(&engine);
 
@@ -279,14 +271,7 @@ pub async fn async_closed_stream() -> Result<()> {
 
     wasmtime_wasi::p2::add_to_linker_async(&mut linker)?;
 
-    let mut store = Store::new(
-        &engine,
-        Ctx {
-            wasi: WasiCtxBuilder::new().inherit_stdio().build(),
-            table: ResourceTable::default(),
-            continue_: false,
-        },
-    );
+    let mut store = Store::new(&engine, Ctx::default());
 
     let instance = linker.instantiate_async(&mut store, &component).await?;
     let guest = closed_stream::ClosedStreamGuest::new(&mut store, &instance)?;
@@ -322,14 +307,7 @@ pub async fn async_cross_instance_source() -> Result<()> {
 
     wasmtime_wasi::p2::add_to_linker_async(&mut linker)?;
 
-    let mut store = Store::new(
-        &engine,
-        Ctx {
-            wasi: WasiCtxBuilder::new().inherit_stdio().build(),
-            table: ResourceTable::default(),
-            continue_: false,
-        },
-    );
+    let mut store = Store::new(&engine, Ctx::default());
 
     let source_instance = linker
         .instantiate_async(&mut store, &source_component)
@@ -476,14 +454,7 @@ async fn test_async_short_reads(delay: bool) -> Result<()> {
 
     wasmtime_wasi::p2::add_to_linker_async(&mut linker)?;
 
-    let mut store = Store::new(
-        &engine,
-        Ctx {
-            wasi: WasiCtxBuilder::new().inherit_stdio().build(),
-            table: ResourceTable::default(),
-            continue_: false,
-        },
-    );
+    let mut store = Store::new(&engine, Ctx::default());
 
     let guest =
         short_reads::ShortReadsGuest::instantiate_async(&mut store, &component, &linker).await?;
