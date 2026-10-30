@@ -226,9 +226,9 @@ impl<'a, T: AsContextMut> From<&'a mut T> for StoreContextMut<'a, T::Data> {
 ///
 /// This structure is similar to [`StoreContextMut`] except that it does not
 /// implement [`AsContextMut`] and instead only implements [`AsContext`]. This
-/// means that the store can be inspected and read but not mutated. This
-/// structure does allow mutable access to the underlying `T` within the
-/// store, however.
+/// means that WebAssembly-facing state can be inspected but not mutated. This
+/// structure allows mutable access to the underlying `T` and adjustment of the
+/// store's epoch deadline.
 ///
 /// This type is used in APIs such as [`Store::epoch_deadline_callback`] and
 /// [`Store::call_hook`] where the embedder is given access to the store at
@@ -236,8 +236,8 @@ impl<'a, T: AsContextMut> From<&'a mut T> for StoreContextMut<'a, T::Data> {
 /// For example when an epoch deadline happens WebAssembly is between two
 /// instructions and general state in the module cannot be mutated spec-wise.
 /// This type expresses this static guarantee by ensuring that store data
-/// can be read, embedder-specific data can be mutated, but nothing within the
-/// store otherwise can be mutated.
+/// can be read and embedder-specific data and interruption metadata can be
+/// updated without exposing mutable access to guest state.
 pub struct StoreHookState<'a, T: 'static> {
     inner: StoreContextMut<'a, T>,
 }
@@ -255,6 +255,17 @@ impl<'a, T> StoreHookState<'a, T> {
     /// Returns a mutable reference to the underlying store data.
     pub fn data_mut(&mut self) -> &mut T {
         self.inner.data_mut()
+    }
+
+    /// Sets the epoch deadline relative to the engine's current epoch.
+    ///
+    /// This changes interruption metadata without mutating guest state. When
+    /// called from an epoch callback, the returned [`crate::UpdateDeadline`]
+    /// still determines the deadline installed after that callback completes.
+    /// See [`Store::set_epoch_deadline`] for details.
+    #[cfg(target_has_atomic = "64")]
+    pub fn set_epoch_deadline(&mut self, ticks_beyond_current: u64) {
+        self.inner.set_epoch_deadline(ticks_beyond_current);
     }
 }
 

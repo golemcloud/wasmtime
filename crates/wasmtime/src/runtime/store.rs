@@ -2609,6 +2609,83 @@ impl core::ops::BitOr for Asyncness {
 mod tests {
     use super::*;
 
+    #[cfg(all(
+        feature = "cranelift",
+        feature = "wat",
+        feature = "call-hook",
+        not(miri)
+    ))]
+    #[test]
+    fn call_hook_rearms_epoch_before_guest_entry() -> Result<()> {
+        use crate::{Caller, Config, Linker, Module};
+
+        #[derive(Default)]
+        struct State {
+            live: bool,
+            checks: usize,
+        }
+
+        let mut config = Config::new();
+        config.epoch_interruption(true);
+        let engine = Engine::new(&config)?;
+        let module = Module::new(
+            &engine,
+            r#"
+            (module
+                (type $f (func))
+                (import "host" "live" (func $live))
+                (global $sentinel (export "sentinel") (mut i32) (i32.const 0))
+                (table 1 funcref)
+                (elem (i32.const 0) $work)
+                (func $work i32.const 1 global.set $sentinel)
+                (func (export "run")
+                    call $live
+                    i32.const 0
+                    call_indirect (type $f)))
+        "#,
+        )?;
+        for live in [false, true] {
+            for rearm in [false, true] {
+                let mut store = Store::new(&engine, State { live, checks: 0 });
+                store.set_epoch_deadline(u64::MAX);
+                store.epoch_deadline_callback(|mut state| {
+                    state.data_mut().checks += 1;
+                    bail!("capacity exhausted")
+                });
+                store.call_hook(move |mut state, boundary| {
+                    if rearm && boundary.exiting_host() && state.data().live {
+                        state.set_epoch_deadline(0);
+                    }
+                    Ok(())
+                });
+                let mut linker = Linker::new(&engine);
+                linker.func_wrap("host", "live", |mut caller: Caller<'_, State>| {
+                    caller.data_mut().live = true;
+                })?;
+                let instance = linker.instantiate(&mut store, &module)?;
+                let result = instance
+                    .get_typed_func::<(), ()>(&mut store, "run")?
+                    .call(&mut store, ());
+                if rearm {
+                    assert!(format!("{:?}", result.unwrap_err()).contains("capacity exhausted"));
+                    assert_eq!(store.data().checks, 1);
+                } else {
+                    result?;
+                    assert_eq!(store.data().checks, 0);
+                }
+                assert_eq!(
+                    instance
+                        .get_global(&mut store, "sentinel")
+                        .unwrap()
+                        .get(&mut store)
+                        .i32(),
+                    Some(i32::from(!rearm)),
+                );
+            }
+        }
+        Ok(())
+    }
+
     struct FuelTank {
         pub consumed_fuel: i64,
         pub reserve_fuel: u64,
