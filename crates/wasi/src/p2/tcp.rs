@@ -314,9 +314,18 @@ impl OutputStream for TcpWriter {
     }
 
     async fn cancel(&mut self) {
-        // Wait for background writes to finish in order to prevent silently
-        // dropping data that (from the guest's perspective) was already written.
-        self.ready().await
+        // Resource destruction must not wait for the peer to consume buffered
+        // bytes: the guest may need this call to return before it closes that peer.
+        let state = self.0.lock().unwrap().take();
+        match state {
+            WriteState::Writing(MaybeSpawned::Pending(task)) => {
+                _ = task.cancel().await;
+            }
+            WriteState::Closing(MaybeSpawned::Pending(task)) => {
+                _ = task.cancel().await;
+            }
+            _ => {}
+        }
     }
 }
 
@@ -324,5 +333,56 @@ impl OutputStream for TcpWriter {
 impl Pollable for TcpWriter {
     async fn ready(&mut self) {
         poll_fn(|cx| self.0.lock().unwrap().poll_ready(cx).map(|_| ())).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{WasiCtxBuilder, sockets::SocketAddressFamily};
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn cancelling_backpressured_tcp_output_does_not_wait_for_peer() {
+        for shutdown in [false, true] {
+            let mut ctx = WasiCtxBuilder::new();
+            ctx.inherit_network().allow_tcp(true);
+            let (ctx, _) = ctx.build();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let mut client = P3Socket::new(&ctx.sockets, SocketAddressFamily::Ipv4).unwrap();
+            client
+                .start_connect(listener.local_addr().unwrap())
+                .unwrap();
+            poll_fn(|cx| client.poll_finish_connect(cx)).await.unwrap();
+            let (_peer, _) = listener.accept().await.unwrap();
+            let mut socket = TcpSocket::new(client);
+            let (_input, mut output) = socket.take_streams().unwrap();
+
+            // Keep the peer open without reading until the OS buffers are full.
+            tokio::time::timeout(Duration::from_secs(30), async {
+                loop {
+                    let permit = match tokio::time::timeout(
+                        Duration::from_millis(100),
+                        output.write_ready(),
+                    )
+                    .await
+                    {
+                        Ok(permit) => permit.unwrap(),
+                        Err(_) => break,
+                    };
+                    output.write(bytes::Bytes::from(vec![42; permit])).unwrap();
+                }
+            })
+            .await
+            .expect("the socket must reach backpressure");
+            if shutdown {
+                socket.shutdown(Shutdown::Write).unwrap();
+            }
+
+            tokio::time::timeout(Duration::from_secs(1), output.cancel())
+                .await
+                .expect("cancellation must not wait for the peer to read");
+            assert!(matches!(output.check_write(), Err(StreamError::Closed)));
+        }
     }
 }
