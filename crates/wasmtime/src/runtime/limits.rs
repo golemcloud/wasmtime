@@ -1079,4 +1079,121 @@ mod tests {
         );
         store.data().assert_growth_protocol(1);
     }
+
+    /// The error a limiter returns to refuse GC heap growth.
+    #[cfg(feature = "gc")]
+    #[derive(Debug)]
+    struct GcHeapLimitExceeded;
+
+    #[cfg(feature = "gc")]
+    impl core::fmt::Display for GcHeapLimitExceeded {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            f.write_str("GC heap limit exceeded")
+        }
+    }
+
+    #[cfg(feature = "gc")]
+    impl core::error::Error for GcHeapLimitExceeded {}
+
+    /// Admits the initial GC heap allocation and returns an error for every
+    /// later GC heap growth.
+    #[cfg(feature = "gc")]
+    struct ErroringOnGcHeapGrowth {
+        failed: usize,
+    }
+
+    #[cfg(feature = "gc")]
+    impl ResourceLimiter for ErroringOnGcHeapGrowth {
+        fn memory_growing(
+            &mut self,
+            current: usize,
+            _desired: usize,
+            _maximum: Option<usize>,
+            kind: MemoryKind,
+        ) -> Result<bool> {
+            if kind == MemoryKind::GcHeap && current > 0 {
+                return Err(GcHeapLimitExceeded.into());
+            }
+            Ok(true)
+        }
+
+        fn memory_grow_failed(&mut self, _error: crate::Error, _kind: MemoryKind) -> Result<()> {
+            self.failed += 1;
+            Ok(())
+        }
+
+        fn table_growing(
+            &mut self,
+            _current: usize,
+            _desired: usize,
+            _maximum: Option<usize>,
+        ) -> Result<bool> {
+            Ok(true)
+        }
+    }
+
+    /// An error that a limiter returns for GC heap growth propagates to the
+    /// caller, as it does for linear memory growth. It is not converted into a
+    /// recoverable growth failure followed by a GC heap out-of-memory error.
+    #[cfg(feature = "gc")]
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn gc_heap_growth_limiter_error_propagates_from_host_allocation() {
+        use crate::ExternRef;
+
+        let engine = Engine::new(&gc_config()).unwrap();
+        let mut store = Store::new(&engine, ErroringOnGcHeapGrowth { failed: 0 });
+        store.limiter(|r| r);
+
+        let mut roots = Vec::new();
+        let error = (0..100_000u32)
+            .find_map(|i| match ExternRef::new(&mut store, i) {
+                Ok(r) => {
+                    roots.push(r);
+                    None
+                }
+                Err(e) => Some(e),
+            })
+            .expect("GC heap growth must eventually be refused");
+        assert!(
+            error.is::<GcHeapLimitExceeded>(),
+            "expected the limiter's error, got: {error:?}"
+        );
+        assert!(!roots.is_empty(), "the initial GC heap must be admitted");
+    }
+
+    #[cfg(feature = "gc")]
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn gc_heap_growth_limiter_error_propagates_from_wasm_allocation() {
+        let engine = Engine::new(&gc_config()).unwrap();
+        let module = Module::new(
+            &engine,
+            r#"
+            (module
+              (type $arr (array (mut i32)))
+              (global $keep (mut (ref null $arr)) (ref.null $arr))
+              (func (export "alloc") (param i32)
+                (global.set $keep (array.new_default $arr (local.get 0)))))
+            "#,
+        )
+        .unwrap();
+        let mut store = Store::new(&engine, ErroringOnGcHeapGrowth { failed: 0 });
+        store.limiter(|r| r);
+        let instance = Instance::new(&mut store, &module, &[]).unwrap();
+        let alloc = instance
+            .get_typed_func::<i32, ()>(&mut store, "alloc")
+            .unwrap();
+
+        // Allocates the initial GC heap.
+        alloc.call(&mut store, 1).unwrap();
+
+        let error = alloc
+            .call(&mut store, 1 << 20)
+            .expect_err("an allocation larger than the initial GC heap must fail");
+        assert!(
+            error.is::<GcHeapLimitExceeded>(),
+            "expected the limiter's error, got: {error:?}"
+        );
+    }
 }

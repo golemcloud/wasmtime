@@ -223,8 +223,25 @@ impl<'a, T> StoreContextMut<'a, T> {
     }
 }
 
+/// The GC heap could not grow, without an error from the resource limiter.
+///
+/// Callers may recover from this by collecting or by failing the allocation.
+/// An error that a resource limiter returns is not wrapped in this type: like
+/// for linear memories, it propagates to the caller as a trap.
 #[derive(Debug)]
 struct GcHeapGrowthFailed;
+
+/// Ignores a recoverable GC heap growth failure and propagates any other error,
+/// including errors that a resource limiter returns.
+pub(crate) fn ignore_gc_heap_growth_failure(result: Result<()>) -> Result<()> {
+    match result {
+        Err(e) if e.is::<GcHeapGrowthFailed>() => {
+            log::trace!("ignoring GC heap growth failure: {e}");
+            Ok(())
+        }
+        other => other,
+    }
+}
 
 impl fmt::Display for GcHeapGrowthFailed {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -297,13 +314,7 @@ impl StoreOpaque {
                 }),
             )
         {
-            if let Err(e) = self.grow_gc_heap(limiter, n, asyncness).await {
-                if e.is::<GcHeapGrowthFailed>() {
-                    log::trace!("ignoring GC heap growth failure: {e}");
-                } else {
-                    return Err(e);
-                }
-            }
+            ignore_gc_heap_growth_failure(self.grow_gc_heap(limiter, n, asyncness).await)?;
         }
         Ok(())
     }
@@ -384,8 +395,7 @@ impl StoreOpaque {
         let (old_byte_size, new_byte_size) = unsafe {
             heap.memory
                 .grow(delta_pages_for_alloc, limiter.as_deref_mut())
-                .await
-                .context(GcHeapGrowthFailed)?
+                .await?
                 .ok_or(GcHeapGrowthFailed)?
         };
         *heap.store.vm_store_context.gc_heap.get_mut() = heap.memory.vmmemory();
@@ -523,11 +533,12 @@ impl StoreOpaque {
                                     // Collection wasn't enough; grow and try
                                     // one final time.
                                     let (value, _) = oom2.take_inner();
-                                    // Ignore error; we'll get one from
-                                    // `alloc_func` below if growth failed and
-                                    // failure to grow was fatal.
-                                    let _ =
-                                        store.grow_gc_heap(limiter, bytes_needed, asyncness).await;
+                                    // Ignore a growth failure; we'll get an
+                                    // error from `alloc_func` below if growth
+                                    // failed and failure to grow was fatal.
+                                    ignore_gc_heap_growth_failure(
+                                        store.grow_gc_heap(limiter, bytes_needed, asyncness).await,
+                                    )?;
 
                                     alloc_func(&mut store, value)
                                 }
@@ -539,11 +550,11 @@ impl StoreOpaque {
                             "Grow GC heap first, collecting if growth failed, then retrying"
                         );
 
-                        if let Err(e) = store
+                        let grown = store
                             .grow_gc_heap(limiter.as_deref_mut(), bytes_needed.max(1), asyncness)
-                            .await
-                        {
-                            log::trace!("growing GC heap failed: {e}");
+                            .await;
+                        if grown.is_err() {
+                            ignore_gc_heap_growth_failure(grown)?;
                             store.gc(limiter, None, None, asyncness).await?;
                         }
 

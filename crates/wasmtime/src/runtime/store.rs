@@ -126,6 +126,8 @@ pub use self::async_::CallHookHandler;
 
 #[cfg(feature = "gc")]
 mod gc;
+#[cfg(feature = "gc")]
+pub(crate) use gc::ignore_gc_heap_growth_failure;
 #[cfg(not(feature = "gc"))]
 mod gc_disabled;
 

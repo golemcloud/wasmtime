@@ -459,12 +459,14 @@ fn grow_gc_heap(store: &mut dyn VMStore, _instance: InstanceId, bytes_needed: u6
 
     let (mut limiter, store) = store.resource_limiter_and_store_opaque();
     block_on!(store, async |store, asyncness| {
-        // We error below if there's still not enough space; swallow
-        // any growth failures here.
-        let _ = store
-            .grow_gc_heap(limiter.as_mut(), bytes_needed, asyncness)
-            .await;
-    })?;
+        // We error below if there's still not enough space; ignore a
+        // recoverable growth failure here.
+        crate::store::ignore_gc_heap_growth_failure(
+            store
+                .grow_gc_heap(limiter.as_mut(), bytes_needed, asyncness)
+                .await,
+        )
+    })??;
 
     // JIT code relies on the memory having grown by `bytes_needed` bytes if
     // this libcall returns successfully, so trap if we didn't grow that much.
