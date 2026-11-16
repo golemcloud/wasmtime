@@ -133,7 +133,7 @@ impl HostUdpSocket for WasiSocketsCtxView<'_> {
         Ok(sock.address_family().into())
     }
 
-    fn get_unicast_hop_limit(&mut self, socket: Resource<UdpSocket>) -> SocketResult<u8> {
+    async fn get_unicast_hop_limit(&mut self, socket: Resource<UdpSocket>) -> SocketResult<u8> {
         let sock = get_socket(self.table, &socket)?;
         Ok(sock.unicast_hop_limit()?)
     }
@@ -148,7 +148,7 @@ impl HostUdpSocket for WasiSocketsCtxView<'_> {
         Ok(())
     }
 
-    fn get_receive_buffer_size(&mut self, socket: Resource<UdpSocket>) -> SocketResult<u64> {
+    async fn get_receive_buffer_size(&mut self, socket: Resource<UdpSocket>) -> SocketResult<u64> {
         let sock = get_socket(self.table, &socket)?;
         Ok(sock.receive_buffer_size()?)
     }
@@ -163,7 +163,7 @@ impl HostUdpSocket for WasiSocketsCtxView<'_> {
         Ok(())
     }
 
-    fn get_send_buffer_size(&mut self, socket: Resource<UdpSocket>) -> SocketResult<u64> {
+    async fn get_send_buffer_size(&mut self, socket: Resource<UdpSocket>) -> SocketResult<u64> {
         let sock = get_socket(self.table, &socket)?;
         Ok(sock.send_buffer_size()?)
     }
@@ -281,12 +281,12 @@ mod named {
             super::HostUdpSocket::get_address_family(&mut self.0.sockets(id), socket)
         }
 
-        fn get_unicast_hop_limit(
+        async fn get_unicast_hop_limit(
             &mut self,
             id: NamedId,
             socket: Resource<UdpSocket>,
         ) -> SocketResult<u8> {
-            super::HostUdpSocket::get_unicast_hop_limit(&mut self.0.sockets(id), socket)
+            super::HostUdpSocket::get_unicast_hop_limit(&mut self.0.sockets(id), socket).await
         }
 
         fn set_unicast_hop_limit(
@@ -298,12 +298,12 @@ mod named {
             super::HostUdpSocket::set_unicast_hop_limit(&mut self.0.sockets(id), socket, value)
         }
 
-        fn get_receive_buffer_size(
+        async fn get_receive_buffer_size(
             &mut self,
             id: NamedId,
             socket: Resource<UdpSocket>,
         ) -> SocketResult<u64> {
-            super::HostUdpSocket::get_receive_buffer_size(&mut self.0.sockets(id), socket)
+            super::HostUdpSocket::get_receive_buffer_size(&mut self.0.sockets(id), socket).await
         }
 
         fn set_receive_buffer_size(
@@ -315,12 +315,12 @@ mod named {
             super::HostUdpSocket::set_receive_buffer_size(&mut self.0.sockets(id), socket, value)
         }
 
-        fn get_send_buffer_size(
+        async fn get_send_buffer_size(
             &mut self,
             id: NamedId,
             socket: Resource<UdpSocket>,
         ) -> SocketResult<u64> {
-            super::HostUdpSocket::get_send_buffer_size(&mut self.0.sockets(id), socket)
+            super::HostUdpSocket::get_send_buffer_size(&mut self.0.sockets(id), socket).await
         }
 
         fn set_send_buffer_size(

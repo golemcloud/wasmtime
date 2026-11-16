@@ -43,7 +43,7 @@ impl udp::HostUdpSocket for WasiSocketsCtxView<'_> {
         Ok(())
     }
 
-    fn finish_bind(&mut self, this: Resource<UdpSocket>) -> SocketResult<()> {
+    async fn finish_bind(&mut self, this: Resource<UdpSocket>) -> SocketResult<()> {
         let socket = self.table.get_mut(&this)?;
         if socket.in_progress_operation != Some(AsyncOperation::Bind) {
             return Err(ErrorCode::NotInProgress.into());
@@ -114,7 +114,7 @@ impl udp::HostUdpSocket for WasiSocketsCtxView<'_> {
         Ok(socket.address_family().into())
     }
 
-    fn unicast_hop_limit(&mut self, this: Resource<UdpSocket>) -> SocketResult<u8> {
+    async fn unicast_hop_limit(&mut self, this: Resource<UdpSocket>) -> SocketResult<u8> {
         let socket = self.table.get(&this)?.lock();
         Ok(socket.unicast_hop_limit()?)
     }
@@ -125,7 +125,7 @@ impl udp::HostUdpSocket for WasiSocketsCtxView<'_> {
         Ok(())
     }
 
-    fn receive_buffer_size(&mut self, this: Resource<UdpSocket>) -> SocketResult<u64> {
+    async fn receive_buffer_size(&mut self, this: Resource<UdpSocket>) -> SocketResult<u64> {
         let socket = self.table.get(&this)?.lock();
         Ok(socket.receive_buffer_size()?)
     }
@@ -140,7 +140,7 @@ impl udp::HostUdpSocket for WasiSocketsCtxView<'_> {
         Ok(())
     }
 
-    fn send_buffer_size(&mut self, this: Resource<UdpSocket>) -> SocketResult<u64> {
+    async fn send_buffer_size(&mut self, this: Resource<UdpSocket>) -> SocketResult<u64> {
         let socket = self.table.get(&this)?.lock();
         Ok(socket.send_buffer_size()?)
     }
@@ -173,7 +173,7 @@ impl Pollable for UdpSocket {
 }
 
 impl udp::HostIncomingDatagramStream for WasiSocketsCtxView<'_> {
-    fn receive(
+    async fn receive(
         &mut self,
         this: Resource<udp::IncomingDatagramStream>,
         max_results: u64,
@@ -235,7 +235,10 @@ impl Pollable for IncomingDatagramStream {
 }
 
 impl udp::HostOutgoingDatagramStream for WasiSocketsCtxView<'_> {
-    fn check_send(&mut self, this: Resource<udp::OutgoingDatagramStream>) -> SocketResult<u64> {
+    async fn check_send(
+        &mut self,
+        this: Resource<udp::OutgoingDatagramStream>,
+    ) -> SocketResult<u64> {
         let stream = self.table.get_mut(&this)?;
 
         let count = if let Some(()) = poll_now(|cx| stream.poll_send_ready(cx)) {
@@ -373,8 +376,12 @@ mod named {
             .await
         }
 
-        fn finish_bind(&mut self, id: NamedId, this: Resource<UdpSocket>) -> SocketResult<()> {
-            super::udp::HostUdpSocket::finish_bind(&mut self.0.sockets(id), this)
+        async fn finish_bind(
+            &mut self,
+            id: NamedId,
+            this: Resource<UdpSocket>,
+        ) -> SocketResult<()> {
+            super::udp::HostUdpSocket::finish_bind(&mut self.0.sockets(id), this).await
         }
 
         async fn stream(
@@ -413,12 +420,12 @@ mod named {
             super::udp::HostUdpSocket::address_family(&mut self.0.sockets(id), this)
         }
 
-        fn unicast_hop_limit(
+        async fn unicast_hop_limit(
             &mut self,
             id: NamedId,
             this: Resource<UdpSocket>,
         ) -> SocketResult<u8> {
-            super::udp::HostUdpSocket::unicast_hop_limit(&mut self.0.sockets(id), this)
+            super::udp::HostUdpSocket::unicast_hop_limit(&mut self.0.sockets(id), this).await
         }
 
         fn set_unicast_hop_limit(
@@ -430,12 +437,12 @@ mod named {
             super::udp::HostUdpSocket::set_unicast_hop_limit(&mut self.0.sockets(id), this, value)
         }
 
-        fn receive_buffer_size(
+        async fn receive_buffer_size(
             &mut self,
             id: NamedId,
             this: Resource<UdpSocket>,
         ) -> SocketResult<u64> {
-            super::udp::HostUdpSocket::receive_buffer_size(&mut self.0.sockets(id), this)
+            super::udp::HostUdpSocket::receive_buffer_size(&mut self.0.sockets(id), this).await
         }
 
         fn set_receive_buffer_size(
@@ -447,12 +454,12 @@ mod named {
             super::udp::HostUdpSocket::set_receive_buffer_size(&mut self.0.sockets(id), this, value)
         }
 
-        fn send_buffer_size(
+        async fn send_buffer_size(
             &mut self,
             id: NamedId,
             this: Resource<UdpSocket>,
         ) -> SocketResult<u64> {
-            super::udp::HostUdpSocket::send_buffer_size(&mut self.0.sockets(id), this)
+            super::udp::HostUdpSocket::send_buffer_size(&mut self.0.sockets(id), this).await
         }
 
         fn set_send_buffer_size(
@@ -481,7 +488,7 @@ mod named {
     where
         T: WasiSocketsNamedView,
     {
-        fn receive(
+        async fn receive(
             &mut self,
             id: NamedId,
             this: Resource<IncomingDatagramStream>,
@@ -492,6 +499,7 @@ mod named {
                 this,
                 max_results,
             )
+            .await
         }
 
         fn subscribe(
@@ -515,12 +523,12 @@ mod named {
     where
         T: WasiSocketsNamedView,
     {
-        fn check_send(
+        async fn check_send(
             &mut self,
             id: NamedId,
             this: Resource<OutgoingDatagramStream>,
         ) -> SocketResult<u64> {
-            super::udp::HostOutgoingDatagramStream::check_send(&mut self.0.sockets(id), this)
+            super::udp::HostOutgoingDatagramStream::check_send(&mut self.0.sockets(id), this).await
         }
 
         async fn send(

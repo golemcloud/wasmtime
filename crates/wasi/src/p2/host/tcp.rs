@@ -40,7 +40,7 @@ impl crate::p2::host::tcp::tcp::HostTcpSocket for WasiSocketsCtxView<'_> {
         Ok(())
     }
 
-    fn finish_bind(&mut self, this: Resource<TcpSocket>) -> SocketResult<()> {
+    async fn finish_bind(&mut self, this: Resource<TcpSocket>) -> SocketResult<()> {
         let socket = self.table.get_mut(&this)?;
         if socket.in_progress_operation != Some(AsyncOperation::Bind) {
             return Err(ErrorCode::NotInProgress.into());
@@ -71,7 +71,7 @@ impl crate::p2::host::tcp::tcp::HostTcpSocket for WasiSocketsCtxView<'_> {
         Ok(())
     }
 
-    fn finish_connect(
+    async fn finish_connect(
         &mut self,
         this: Resource<TcpSocket>,
     ) -> SocketResult<(Resource<DynInputStream>, Resource<DynOutputStream>)> {
@@ -181,7 +181,7 @@ impl crate::p2::host::tcp::tcp::HostTcpSocket for WasiSocketsCtxView<'_> {
         Ok(())
     }
 
-    fn keep_alive_enabled(&mut self, this: Resource<TcpSocket>) -> SocketResult<bool> {
+    async fn keep_alive_enabled(&mut self, this: Resource<TcpSocket>) -> SocketResult<bool> {
         let socket = self.table.get(&this)?;
         Ok(socket.inner.keep_alive_enabled()?)
     }
@@ -196,7 +196,7 @@ impl crate::p2::host::tcp::tcp::HostTcpSocket for WasiSocketsCtxView<'_> {
         Ok(())
     }
 
-    fn keep_alive_idle_time(&mut self, this: Resource<TcpSocket>) -> SocketResult<u64> {
+    async fn keep_alive_idle_time(&mut self, this: Resource<TcpSocket>) -> SocketResult<u64> {
         let socket = self.table.get(&this)?;
         Ok(socket.inner.keep_alive_idle_time()?)
     }
@@ -211,7 +211,7 @@ impl crate::p2::host::tcp::tcp::HostTcpSocket for WasiSocketsCtxView<'_> {
         Ok(())
     }
 
-    fn keep_alive_interval(&mut self, this: Resource<TcpSocket>) -> SocketResult<u64> {
+    async fn keep_alive_interval(&mut self, this: Resource<TcpSocket>) -> SocketResult<u64> {
         let socket = self.table.get(&this)?;
         Ok(socket.inner.keep_alive_interval()?)
     }
@@ -226,7 +226,7 @@ impl crate::p2::host::tcp::tcp::HostTcpSocket for WasiSocketsCtxView<'_> {
         Ok(())
     }
 
-    fn keep_alive_count(&mut self, this: Resource<TcpSocket>) -> SocketResult<u32> {
+    async fn keep_alive_count(&mut self, this: Resource<TcpSocket>) -> SocketResult<u32> {
         let socket = self.table.get(&this)?;
         Ok(socket.inner.keep_alive_count()?)
     }
@@ -237,7 +237,7 @@ impl crate::p2::host::tcp::tcp::HostTcpSocket for WasiSocketsCtxView<'_> {
         Ok(())
     }
 
-    fn hop_limit(&mut self, this: Resource<TcpSocket>) -> SocketResult<u8> {
+    async fn hop_limit(&mut self, this: Resource<TcpSocket>) -> SocketResult<u8> {
         let socket = self.table.get(&this)?;
         Ok(socket.inner.hop_limit()?)
     }
@@ -248,7 +248,7 @@ impl crate::p2::host::tcp::tcp::HostTcpSocket for WasiSocketsCtxView<'_> {
         Ok(())
     }
 
-    fn receive_buffer_size(&mut self, this: Resource<TcpSocket>) -> SocketResult<u64> {
+    async fn receive_buffer_size(&mut self, this: Resource<TcpSocket>) -> SocketResult<u64> {
         let socket = self.table.get(&this)?;
         Ok(socket.inner.receive_buffer_size()?)
     }
@@ -263,7 +263,7 @@ impl crate::p2::host::tcp::tcp::HostTcpSocket for WasiSocketsCtxView<'_> {
         Ok(())
     }
 
-    fn send_buffer_size(&mut self, this: Resource<TcpSocket>) -> SocketResult<u64> {
+    async fn send_buffer_size(&mut self, this: Resource<TcpSocket>) -> SocketResult<u64> {
         let socket = self.table.get(&this)?;
         Ok(socket.inner.send_buffer_size()?)
     }
@@ -278,7 +278,7 @@ impl crate::p2::host::tcp::tcp::HostTcpSocket for WasiSocketsCtxView<'_> {
         wasmtime_wasi_io::poll::subscribe(self.table, this, None)
     }
 
-    fn shutdown(
+    async fn shutdown(
         &mut self,
         this: Resource<TcpSocket>,
         shutdown_type: ShutdownType,
@@ -355,8 +355,12 @@ mod named {
             .await
         }
 
-        fn finish_bind(&mut self, id: NamedId, this: Resource<TcpSocket>) -> SocketResult<()> {
-            super::tcp::HostTcpSocket::finish_bind(&mut self.0.sockets(id), this)
+        async fn finish_bind(
+            &mut self,
+            id: NamedId,
+            this: Resource<TcpSocket>,
+        ) -> SocketResult<()> {
+            super::tcp::HostTcpSocket::finish_bind(&mut self.0.sockets(id), this).await
         }
 
         async fn start_connect(
@@ -375,12 +379,12 @@ mod named {
             .await
         }
 
-        fn finish_connect(
+        async fn finish_connect(
             &mut self,
             id: NamedId,
             this: Resource<TcpSocket>,
         ) -> SocketResult<(Resource<DynInputStream>, Resource<DynOutputStream>)> {
-            super::tcp::HostTcpSocket::finish_connect(&mut self.0.sockets(id), this)
+            super::tcp::HostTcpSocket::finish_connect(&mut self.0.sockets(id), this).await
         }
 
         async fn start_listen(
@@ -448,12 +452,12 @@ mod named {
             super::tcp::HostTcpSocket::set_listen_backlog_size(&mut self.0.sockets(id), this, value)
         }
 
-        fn keep_alive_enabled(
+        async fn keep_alive_enabled(
             &mut self,
             id: NamedId,
             this: Resource<TcpSocket>,
         ) -> SocketResult<bool> {
-            super::tcp::HostTcpSocket::keep_alive_enabled(&mut self.0.sockets(id), this)
+            super::tcp::HostTcpSocket::keep_alive_enabled(&mut self.0.sockets(id), this).await
         }
 
         fn set_keep_alive_enabled(
@@ -465,12 +469,12 @@ mod named {
             super::tcp::HostTcpSocket::set_keep_alive_enabled(&mut self.0.sockets(id), this, value)
         }
 
-        fn keep_alive_idle_time(
+        async fn keep_alive_idle_time(
             &mut self,
             id: NamedId,
             this: Resource<TcpSocket>,
         ) -> SocketResult<u64> {
-            super::tcp::HostTcpSocket::keep_alive_idle_time(&mut self.0.sockets(id), this)
+            super::tcp::HostTcpSocket::keep_alive_idle_time(&mut self.0.sockets(id), this).await
         }
 
         fn set_keep_alive_idle_time(
@@ -486,12 +490,12 @@ mod named {
             )
         }
 
-        fn keep_alive_interval(
+        async fn keep_alive_interval(
             &mut self,
             id: NamedId,
             this: Resource<TcpSocket>,
         ) -> SocketResult<u64> {
-            super::tcp::HostTcpSocket::keep_alive_interval(&mut self.0.sockets(id), this)
+            super::tcp::HostTcpSocket::keep_alive_interval(&mut self.0.sockets(id), this).await
         }
 
         fn set_keep_alive_interval(
@@ -503,12 +507,12 @@ mod named {
             super::tcp::HostTcpSocket::set_keep_alive_interval(&mut self.0.sockets(id), this, value)
         }
 
-        fn keep_alive_count(
+        async fn keep_alive_count(
             &mut self,
             id: NamedId,
             this: Resource<TcpSocket>,
         ) -> SocketResult<u32> {
-            super::tcp::HostTcpSocket::keep_alive_count(&mut self.0.sockets(id), this)
+            super::tcp::HostTcpSocket::keep_alive_count(&mut self.0.sockets(id), this).await
         }
 
         fn set_keep_alive_count(
@@ -520,8 +524,8 @@ mod named {
             super::tcp::HostTcpSocket::set_keep_alive_count(&mut self.0.sockets(id), this, value)
         }
 
-        fn hop_limit(&mut self, id: NamedId, this: Resource<TcpSocket>) -> SocketResult<u8> {
-            super::tcp::HostTcpSocket::hop_limit(&mut self.0.sockets(id), this)
+        async fn hop_limit(&mut self, id: NamedId, this: Resource<TcpSocket>) -> SocketResult<u8> {
+            super::tcp::HostTcpSocket::hop_limit(&mut self.0.sockets(id), this).await
         }
 
         fn set_hop_limit(
@@ -533,12 +537,12 @@ mod named {
             super::tcp::HostTcpSocket::set_hop_limit(&mut self.0.sockets(id), this, value)
         }
 
-        fn receive_buffer_size(
+        async fn receive_buffer_size(
             &mut self,
             id: NamedId,
             this: Resource<TcpSocket>,
         ) -> SocketResult<u64> {
-            super::tcp::HostTcpSocket::receive_buffer_size(&mut self.0.sockets(id), this)
+            super::tcp::HostTcpSocket::receive_buffer_size(&mut self.0.sockets(id), this).await
         }
 
         fn set_receive_buffer_size(
@@ -550,12 +554,12 @@ mod named {
             super::tcp::HostTcpSocket::set_receive_buffer_size(&mut self.0.sockets(id), this, value)
         }
 
-        fn send_buffer_size(
+        async fn send_buffer_size(
             &mut self,
             id: NamedId,
             this: Resource<TcpSocket>,
         ) -> SocketResult<u64> {
-            super::tcp::HostTcpSocket::send_buffer_size(&mut self.0.sockets(id), this)
+            super::tcp::HostTcpSocket::send_buffer_size(&mut self.0.sockets(id), this).await
         }
 
         fn set_send_buffer_size(
@@ -575,13 +579,13 @@ mod named {
             super::tcp::HostTcpSocket::subscribe(&mut self.0.sockets(id), this)
         }
 
-        fn shutdown(
+        async fn shutdown(
             &mut self,
             id: NamedId,
             this: Resource<TcpSocket>,
             shutdown_type: ShutdownType,
         ) -> SocketResult<()> {
-            super::tcp::HostTcpSocket::shutdown(&mut self.0.sockets(id), this, shutdown_type)
+            super::tcp::HostTcpSocket::shutdown(&mut self.0.sockets(id), this, shutdown_type).await
         }
 
         fn drop(&mut self, id: NamedId, this: Resource<TcpSocket>) -> Result<(), wasmtime::Error> {
