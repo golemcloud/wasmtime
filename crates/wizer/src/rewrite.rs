@@ -113,9 +113,7 @@ impl Wizer {
                             let glob_ty = RoundtripReencoder.global_type(glob_ty).unwrap();
                             globals.global(glob_ty, &init);
                         } else {
-                            // This global isn't mutable so preserve its value
-                            // as-is.
-                            assert!(!glob_ty.mutable);
+                            // Reference globals are restored with the GC graph.
                             RoundtripReencoder
                                 .parse_global(&mut globals, global)
                                 .unwrap();
