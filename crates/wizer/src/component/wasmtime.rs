@@ -149,6 +149,26 @@ impl<T: Send> WasmtimeWizerComponent<'_, T> {
 }
 
 impl<T: Send> ComponentInstanceState for WasmtimeWizerComponent<'_, T> {
+    async fn gc_read(
+        &mut self,
+        module: u32,
+        op: u32,
+        target: u32,
+        index: u64,
+        part: u32,
+    ) -> wasmtime::Result<u64> {
+        let read = self
+            .instance
+            .get_typed_func::<(u32, u32, u64, u32), (u64,)>(
+                &mut *self.store,
+                &format!("wizer-gc-read{module}"),
+            )?;
+        Ok(read
+            .call_async(&mut *self.store, (op, target, index, part))
+            .await?
+            .0)
+    }
+
     async fn call_func_ret_list_u8(
         &mut self,
         instance: &str,

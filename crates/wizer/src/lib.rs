@@ -5,6 +5,7 @@
 #![deny(missing_docs)]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
+mod gc;
 mod info;
 mod instrument;
 mod parse;
@@ -46,11 +47,10 @@ const DEFAULT_KEEP_INIT_FUNC: bool = false;
 ///
 /// * The Wasm module may not import globals, tables, or memories.
 ///
-/// * Reference types are not supported yet. This is tricky because it would
-///   allow the Wasm module to mutate tables, and we would need to be able to
-///   snapshot the new table state, but funcrefs and externrefs don't have
-///   identity and aren't comparable in the Wasm spec, which makes snapshotting
-///   difficult.
+/// * GC structs, arrays, reference globals, and tables are snapshotted together
+///   to preserve shared references and cycles. Non-null external, exception,
+///   and continuation references, and unknown host-owned function references
+///   or GC subtypes cannot be snapshotted.
 #[derive(Clone, Debug)]
 #[cfg_attr(feature = "clap", derive(clap::Parser))]
 pub struct Wizer {
@@ -219,6 +219,11 @@ impl Wizer {
         }
 
         let instrumented_wasm = instrument::instrument(&mut cx);
+        let instrumented_wasm = if gc::needs_snapshot(&cx)? {
+            gc::lower::preserving_types(&instrumented_wasm, 0)?
+        } else {
+            instrumented_wasm
+        };
         self.debug_assert_valid_wasm(&instrumented_wasm, "instrumented module");
 
         Ok((cx, instrumented_wasm))
@@ -240,6 +245,17 @@ impl Wizer {
 
         let snapshot = snapshot::snapshot(cx, instance).await;
         let rewritten_wasm = self.rewrite(cx, &snapshot, &renames, true);
+        let rewritten_wasm = if gc::needs_snapshot(cx)? {
+            let original = gc::original(cx);
+            let gc_snapshot =
+                gc::capture::capture(&original, 0, async |op, target, index, part| {
+                    instance.gc_read(op, target, index, part).await
+                })
+                .await?;
+            gc::restore::restore(&rewritten_wasm, 0, &gc_snapshot)?
+        } else {
+            rewritten_wasm
+        };
 
         self.debug_assert_valid_wasm(&rewritten_wasm, "rewritten module");
 
@@ -280,34 +296,6 @@ impl Wizer {
                     let mut ops = code.get_operators_reader()?;
                     while !ops.eof() {
                         match ops.read()? {
-                            // Table mutations aren't allowed as wizer has no
-                            // way to record a snapshot of a table at this time.
-                            // The only table mutations allowed are those from
-                            // active element segments which can be
-                            // deterministically replayed, so disallow all other
-                            // forms of mutating a table.
-                            //
-                            // Ideally Wizer could take a snapshot of a table
-                            // post-instantiation and then ensure that after
-                            // running initialization the table didn't get
-                            // mutated, allowing these instructions, but that's
-                            // also not possible at this time.
-                            wasmparser::Operator::TableCopy { .. } => {
-                                bail!("unsupported `table.copy` instruction")
-                            }
-                            wasmparser::Operator::TableInit { .. } => {
-                                bail!("unsupported `table.init` instruction")
-                            }
-                            wasmparser::Operator::TableSet { .. } => {
-                                bail!("unsupported `table.set` instruction")
-                            }
-                            wasmparser::Operator::TableGrow { .. } => {
-                                bail!("unsupported `table.grow` instruction")
-                            }
-                            wasmparser::Operator::TableFill { .. } => {
-                                bail!("unsupported `table.fill` instruction")
-                            }
-
                             // Wizer has no way of dynamically determining which
                             // element or data segments were dropped during
                             // execution so instead disallow these instructions
@@ -322,48 +310,7 @@ impl Wizer {
                                 bail!("unsupported `data.drop` instruction")
                             }
 
-                            // Wizer can't snapshot GC references, so disallow
-                            // any mutation of GC references. This prevents, for
-                            // example, reading something from a table and then
-                            // mutating it.
-                            wasmparser::Operator::StructSet { .. } => {
-                                bail!("unsupported `struct.set` instruction")
-                            }
-                            wasmparser::Operator::ArraySet { .. } => {
-                                bail!("unsupported `array.set` instruction")
-                            }
-                            wasmparser::Operator::ArrayFill { .. } => {
-                                bail!("unsupported `array.fill` instruction")
-                            }
-                            wasmparser::Operator::ArrayCopy { .. } => {
-                                bail!("unsupported `array.copy` instruction")
-                            }
-                            wasmparser::Operator::ArrayInitData { .. } => {
-                                bail!("unsupported `array.init_data` instruction")
-                            }
-                            wasmparser::Operator::ArrayInitElem { .. } => {
-                                bail!("unsupported `array.init_elem` instruction")
-                            }
-
                             _ => continue,
-                        }
-                    }
-                }
-                wasmparser::Payload::GlobalSection(globals) => {
-                    for g in globals {
-                        let g = g?.ty;
-                        if !g.mutable {
-                            continue;
-                        }
-                        match g.content_type {
-                            wasmparser::ValType::I32
-                            | wasmparser::ValType::I64
-                            | wasmparser::ValType::F32
-                            | wasmparser::ValType::F64
-                            | wasmparser::ValType::V128 => {}
-                            wasmparser::ValType::Ref(_) => {
-                                bail!("unsupported mutable global containing a reference type")
-                            }
                         }
                     }
                 }
@@ -385,6 +332,102 @@ impl Wizer {
 /// Abstract ability to load state from a WebAssembly instance after it's been
 /// instantiated and some exports have run.
 pub trait InstanceState {
+    /// Calls the GC state accessor added by [`Wizer::instrument`].
+    ///
+    /// References stay in the initialized instance; only scalar values and
+    /// instance-local identities cross this boundary. Wizer calls this after
+    /// initialization, only when reference state needs snapshotting. The guest
+    /// must not mutate that state during capture, including between reads of
+    /// different parts of one value.
+    ///
+    /// # Operations and indices
+    ///
+    /// All indices are zero-based. Global, table, function, element-segment,
+    /// and type indices refer to the original module, before instrumentation.
+    /// Imported entries count in their respective index spaces. A type index
+    /// counts individual types, not recursive groups. Object IDs instead index
+    /// the capture registry described below.
+    ///
+    /// | `op` | Operation | `target` | `index` | Result |
+    /// | --- | --- | --- | --- | --- |
+    /// | 0 | Read global | Global index | 0 | Encoded value |
+    /// | 1 | Read table length | Table index | 0 | Current element count |
+    /// | 2 | Read table entry | Table index | Element index | Encoded reference |
+    /// | 3 | Read object owner/type | Object ID | 0 | Module ID in high 32 bits, type index in low 32 bits |
+    /// | 4 | Read object length | Object ID | 0 | Struct field count or array element count |
+    /// | 5 | Read object field | Object ID | Field or array element index | Encoded value |
+    /// | 6 | Read registry length | 0 | 0 | Current object count |
+    /// | 7 | Read passive element | Original element-segment index | Element index | Encoded reference |
+    ///
+    /// Length and owner/type queries use `part = 0`. Value queries select the
+    /// encoding below using the original global, field, or element type.
+    /// Unsupported operations and out-of-range operands have no defined result;
+    /// the generated accessor can trap. Propagate accessor and runtime errors.
+    ///
+    /// # Value encoding
+    ///
+    /// For `i32` and `f32`, `part = 0` returns the raw 32 bits, zero-extended
+    /// to `u64`. For `i64` and `f64`, it returns the raw 64 bits. Floating-point
+    /// values are not numerically converted. Packed `i8` and `i16` fields are
+    /// read unsigned and zero-extended. For `v128`, `part = 0` returns bits
+    /// 0..64 and `part = 1` returns bits 64..128.
+    ///
+    /// For references, first read the tag with `part = 0`, then read the same
+    /// location with the payload part specified here:
+    ///
+    /// | Tag | Meaning | Payload part | Payload |
+    /// | --- | --- | --- | --- |
+    /// | 0 | Null | 1 | 0 |
+    /// | 1 | `i31ref` | 1 | Signed 31-bit value sign-extended to 64 bits |
+    /// | 2 | Struct or array | 1 | Object ID, zero-extended to 64 bits |
+    /// | 3 | Function | 2 | Module ID in high 32 bits, original function index in low 32 bits |
+    /// | 4 | Unsupported reference | 1 | Not used; capture fails |
+    ///
+    /// Other tags are invalid and cause capture to fail. Non-null exception
+    /// and continuation references produce the unsupported tag; their nulls
+    /// use tag 0. Payloads for unsupported tags have no meaning. Parts other
+    /// than those specified above are not part of the protocol.
+    ///
+    /// # Registry and ownership
+    ///
+    /// Reading an object payload registers that object if necessary. Repeated
+    /// reads of aliases must return the same ID; distinct objects must have
+    /// distinct IDs. IDs are consecutive from zero, stable for the capture,
+    /// and keep their objects rooted in the instance. Reading fields can
+    /// register more objects, so capture rechecks operation 6 while traversing
+    /// the graph. IDs are not addresses and cannot be reused across instances
+    /// or captures. No guest reference or runtime pointer is serialized.
+    ///
+    /// Operation 3 must identify the object's exact original heap type, not
+    /// merely a known supertype. Return an error for an unknown host-created
+    /// subtype rather than truncating its fields. Function identities must
+    /// resolve to an original module function index, including imports, without
+    /// invoking the function; return an error for an unknown host-owned
+    /// function. Core-module capture uses module ID 0 for objects and functions.
+    ///
+    /// # Core backend implementation
+    ///
+    /// The generated `__wizer_gc_read` export has core signature
+    /// `(i32, i32, i64, i32) -> i64`, with the same argument order and raw bits
+    /// as this method. It handles queries other than function payloads. For
+    /// `part = 2`, use `__wizer_gc_function`, whose signature is
+    /// `(i32, i32, i64) -> funcref`, and match the returned handle against
+    /// `__wizer_function_{index}` exports to produce the original function index.
+    /// Do not forward `part = 2` to the scalar export.
+    ///
+    /// After operation 3, validate the registry entry in the exported
+    /// `__wizer_gc_objects` table against the parameter heap type of
+    /// `__wizer_gc_type_{type_index}` using exact runtime type equality. The
+    /// generated type query alone can match a supertype of a host-created
+    /// object. The marker function is for type inspection, not invocation.
+    fn gc_read(
+        &mut self,
+        op: u32,
+        target: u32,
+        index: u64,
+        part: u32,
+    ) -> impl Future<Output = Result<u64>> + Send;
+
     /// Loads the global specified by `name`, returning a `SnapshotVal`.
     ///
     /// # Panics

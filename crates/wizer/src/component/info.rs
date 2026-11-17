@@ -95,6 +95,15 @@ impl<'a> ComponentContext<'a> {
         u32::try_from(self.core_modules().count()).unwrap()
     }
 
+    pub(crate) fn needs_gc_snapshot(&self) -> wasmtime::Result<bool> {
+        for (id, module) in self.core_modules() {
+            if self.core_instantiations.contains_key(&id) && crate::gc::needs_snapshot(module)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     pub(crate) fn inc(&mut self, kind: wasmparser::ComponentExternalKind) {
         match kind {
             wasmparser::ComponentExternalKind::Type => {

@@ -82,6 +82,18 @@ impl<S> InstanceState for ViaComponent<'_, '_, S>
 where
     S: ComponentInstanceState,
 {
+    async fn gc_read(
+        &mut self,
+        op: u32,
+        target: u32,
+        index: u64,
+        part: u32,
+    ) -> wasmtime::Result<u64> {
+        self.ctx
+            .gc_read(self.module_index, op, target, index, part)
+            .await
+    }
+
     async fn global_get(&mut self, name: &str, _: ValType) -> SnapshotVal {
         let Accessor::Global {
             accessor_export_name,
