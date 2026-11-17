@@ -1920,11 +1920,30 @@ pub unsafe extern "C" fn path_open(
 
         #[cfg(not(feature = "proxy"))]
         State::with(|state| {
-            let result = state
-                .descriptors()
-                .get_dir(fd)?
-                .fd
-                .open_at(at_flags, path, o_flags, flags)?;
+            let descriptors = state.descriptors();
+            let dir = &descriptors.get_dir(fd)?.fd;
+            let result = match dir.open_at(at_flags, path, o_flags, flags) {
+                // Directory-mutation rights ask for `mutate-directory`, but
+                // libcs request them on every open, including opens under a
+                // base that cannot be mutated. Such an open is retried without
+                // `mutate-directory` and yields a read-only descriptor.
+                Err(filesystem::ErrorCode::ReadOnly)
+                    if flags.contains(filesystem::DescriptorFlags::MUTATE_DIRECTORY)
+                        && !flags.contains(filesystem::DescriptorFlags::WRITE)
+                        && !o_flags.intersects(
+                            filesystem::OpenFlags::CREATE | filesystem::OpenFlags::TRUNCATE,
+                        ) =>
+                {
+                    dir.open_at(
+                        at_flags,
+                        path,
+                        o_flags,
+                        flags & !filesystem::DescriptorFlags::MUTATE_DIRECTORY,
+                    )?
+                }
+                result => result?,
+            };
+            drop(descriptors);
             let descriptor_type = result.get_type()?;
             let desc = Descriptor::Streams(Streams {
                 input: OnceCell::new(),
@@ -2499,6 +2518,18 @@ fn o_flags_from_oflags(flags: Oflags) -> filesystem::OpenFlags {
 }
 
 #[cfg(not(feature = "proxy"))]
+const DIRECTORY_MUTATION_RIGHTS: Rights = wasip1::RIGHTS_PATH_CREATE_DIRECTORY
+    | wasip1::RIGHTS_PATH_CREATE_FILE
+    | wasip1::RIGHTS_PATH_LINK_TARGET
+    | wasip1::RIGHTS_PATH_RENAME_SOURCE
+    | wasip1::RIGHTS_PATH_RENAME_TARGET
+    | wasip1::RIGHTS_PATH_SYMLINK
+    | wasip1::RIGHTS_PATH_REMOVE_DIRECTORY
+    | wasip1::RIGHTS_PATH_UNLINK_FILE
+    | wasip1::RIGHTS_PATH_FILESTAT_SET_SIZE
+    | wasip1::RIGHTS_PATH_FILESTAT_SET_TIMES;
+
+#[cfg(not(feature = "proxy"))]
 fn descriptor_flags_from_flags(rights: Rights, fdflags: Fdflags) -> filesystem::DescriptorFlags {
     let mut flags = filesystem::DescriptorFlags::empty();
     if rights & wasip1::RIGHTS_FD_READ == wasip1::RIGHTS_FD_READ {
@@ -2506,6 +2537,11 @@ fn descriptor_flags_from_flags(rights: Rights, fdflags: Fdflags) -> filesystem::
     }
     if rights & wasip1::RIGHTS_FD_WRITE == wasip1::RIGHTS_FD_WRITE {
         flags |= filesystem::DescriptorFlags::WRITE;
+    }
+    // A directory descriptor needs `mutate-directory` to create, rename or
+    // remove entries, or to change their metadata, through it.
+    if rights & DIRECTORY_MUTATION_RIGHTS != 0 {
+        flags |= filesystem::DescriptorFlags::MUTATE_DIRECTORY;
     }
     if fdflags & wasip1::FDFLAGS_SYNC == wasip1::FDFLAGS_SYNC {
         flags |= filesystem::DescriptorFlags::FILE_INTEGRITY_SYNC;
