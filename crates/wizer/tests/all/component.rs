@@ -2,7 +2,7 @@ use wasmtime::component::wasm_wave;
 use wasmtime::component::wit_parser::ItemName;
 use wasmtime::component::{Component, Instance, Linker, ResourceTable, Val};
 use wasmtime::{Engine, Result, Store, ToWasmtimeResult as _, bail, error::Context as _};
-use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView, p2};
+use wasmtime_wasi::{IoCtx, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView, p2};
 use wasmtime_wizer::Wizer;
 
 fn fail_wizening(msg: &str, wasm: &[u8]) -> Result<()> {
@@ -125,23 +125,27 @@ fn unsupported_constructs() -> Result<()> {
 struct Ctx {
     wasi: WasiCtx,
     table: ResourceTable,
+    io_ctx: IoCtx,
 }
 impl WasiView for Ctx {
     fn ctx(&mut self) -> WasiCtxView<'_> {
         WasiCtxView {
             ctx: &mut self.wasi,
             table: &mut self.table,
+            io_ctx: &mut self.io_ctx,
         }
     }
 }
 
 fn store() -> Result<Store<Ctx>> {
     let engine = Engine::default();
+    let (wasi, io_ctx) = WasiCtxBuilder::new().build();
     Ok(Store::new(
         &engine,
         Ctx {
-            wasi: WasiCtxBuilder::new().build(),
+            wasi,
             table: ResourceTable::new(),
+            io_ctx,
         },
     ))
 }

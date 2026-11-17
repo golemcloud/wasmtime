@@ -3,7 +3,7 @@ use wasmtime::{
     Config, Engine, Instance, Linker, Module, Result, Store, ToWasmtimeResult as _,
     error::Context as _,
 };
-use wasmtime_wasi::{WasiCtxBuilder, p1};
+use wasmtime_wasi::Rng as _;
 use wasmtime_wizer::Wizer;
 use wat::parse_str as wat_to_wasm;
 
@@ -17,19 +17,43 @@ fn get_wizer() -> Wizer {
     Wizer::new()
 }
 
-fn store() -> Result<Store<p1::WasiP1Ctx>> {
-    let mut wasi = WasiCtxBuilder::new();
+fn store() -> Result<Store<()>> {
     let mut config = Config::new();
     config.relaxed_simd_deterministic(true);
     let engine = Engine::new(&config)?;
-    Ok(Store::new(&engine, wasi.build_p1()))
+    Ok(Store::new(&engine, ()))
 }
 
-async fn instantiate(store: &mut Store<p1::WasiP1Ctx>, module: &Module) -> Result<Instance> {
+async fn instantiate(store: &mut Store<()>, module: &Module) -> Result<Instance> {
     let mut linker = Linker::new(store.engine());
-    p1::add_to_linker_async(&mut linker, |x| x)?;
+    add_random_get(&mut linker)?;
     linker.define_unknown_imports_as_traps(module)?;
     linker.instantiate_async(store, module).await
+}
+
+fn add_random_get(linker: &mut Linker<()>) -> Result<()> {
+    // The Rust regex fixture needs entropy for its hash maps. Other preview1
+    // imports stay trapping so an unexpected host effect fails the test.
+    linker.func_wrap(
+        "wasi_snapshot_preview1",
+        "random_get",
+        |mut caller: wasmtime::Caller<'_, ()>, ptr: u32, len: u32| -> Result<u32> {
+            let memory = caller
+                .get_export("memory")
+                .and_then(|export| export.into_memory())
+                .ok_or_else(|| wasmtime::format_err!("missing guest memory"))?;
+            let start = ptr as usize;
+            let end = start
+                .checked_add(len as usize)
+                .ok_or_else(|| wasmtime::format_err!("random buffer overflow"))?;
+            let Some(buffer) = memory.data_mut(&mut caller).get_mut(start..end) else {
+                return Ok(21);
+            };
+            wasmtime_wasi::thread_rng().fill_bytes(buffer);
+            Ok(0)
+        },
+    )?;
+    Ok(())
 }
 
 async fn wizen_and_run_wasm(
@@ -68,7 +92,8 @@ async fn wizen_and_run_wasm(
         .define(&mut store, "env", "f", thunk)?
         .define(&mut store, "x", "f", thunk)?;
 
-    p1::add_to_linker_async(&mut linker, |wasi| wasi)?;
+    add_random_get(&mut linker)?;
+    linker.define_unknown_imports_as_traps(&module)?;
 
     let instance = linker.instantiate_async(&mut store, &module).await?;
 
@@ -212,7 +237,7 @@ async fn reject_imported_table() -> Result<()> {
 }
 
 #[tokio::test]
-async fn reject_table_copy() -> Result<()> {
+async fn preserve_table_copy() -> Result<()> {
     let result = run_wat(
         &[],
         42,
@@ -220,47 +245,43 @@ async fn reject_table_copy() -> Result<()> {
 (module
   (table 3 funcref)
 
-  (func $f (result i32) (i32.const 0))
-  (func $g (result i32) (i32.const 0))
-  (func $h (result i32) (i32.const 0))
+  (type $f (func (result i32)))
+  (func $f (result i32) (i32.const 11))
+  (func $g (result i32) (i32.const 42))
+  (func $h (result i32) (i32.const 93))
 
-  (func (export "main")
+  (func (export "wizer-initialize")
     i32.const 0
     i32.const 1
     i32.const 1
     table.copy)
+  (func (export "run") (result i32) (call_indirect (type $f) (i32.const 0)))
 
   (elem (i32.const 0) $f $g $h)
 )
 "#,
     )
     .await;
-    assert!(result.is_err());
-
-    let err = result.unwrap_err();
-    assert!(
-        err.to_string()
-            .contains("unsupported `table.copy` instruction")
-    );
-
-    Ok(())
+    result
 }
 
 #[tokio::test]
-async fn reject_table_get_set() -> Result<()> {
+async fn preserve_table_get_set() -> Result<()> {
     let wat = r#"
 (module
   (table 3 funcref)
 
-  (func $f (result i32) (i32.const 0))
-  (func $g (result i32) (i32.const 0))
-  (func $h (result i32) (i32.const 0))
+  (type $f (func (result i32)))
+  (func $f (result i32) (i32.const 11))
+  (func $g (result i32) (i32.const 42))
+  (func $h (result i32) (i32.const 93))
 
-  (func (export "main")
+  (func (export "wizer-initialize")
     i32.const 0
     i32.const 1
     table.get
     table.set)
+  (func (export "run") (result i32) (call_indirect (type $f) (i32.const 0)))
 
   (elem (i32.const 0) $f $g $h)
 )
@@ -269,22 +290,11 @@ async fn reject_table_get_set() -> Result<()> {
     let _ = env_logger::try_init();
     let wizer = Wizer::new();
     let wasm = wat_to_wasm(wat)?;
-    let result = wizen_and_run_wasm("", &[], 42, &wasm, wizer).await;
-
-    assert!(result.is_err());
-
-    let err = result.unwrap_err();
-    assert!(
-        err.to_string()
-            .contains("unsupported `table.set` instruction"),
-        "bad error: {err}",
-    );
-
-    Ok(())
+    wizen_and_run_wasm("run", &[], 42, &wasm, wizer).await
 }
 
 #[tokio::test]
-async fn reject_table_get_set_with_reference_types_enabled() -> Result<()> {
+async fn preserve_table_fill() -> Result<()> {
     let result = run_wat(
         &[],
         42,
@@ -292,59 +302,46 @@ async fn reject_table_get_set_with_reference_types_enabled() -> Result<()> {
       (module
         (table 3 funcref)
 
-        (func $f (result i32) (i32.const 0))
-        (func $g (result i32) (i32.const 0))
-        (func $h (result i32) (i32.const 0))
+        (type $f (func (result i32)))
+        (func $f (result i32) (i32.const 11))
+        (func $g (result i32) (i32.const 42))
+        (func $h (result i32) (i32.const 93))
 
-        (func (export "main")
+        (func (export "wizer-initialize")
           i32.const 0
-          i32.const 1
-          table.get
-          table.set)
+          ref.func $g
+          i32.const 2
+          table.fill)
+        (func (export "run") (result i32) (call_indirect (type $f) (i32.const 1)))
 
         (elem (i32.const 0) $f $g $h)
       )"#,
     )
     .await;
-    assert!(result.is_err());
-
-    let err = result.unwrap_err();
-    assert!(
-        err.to_string()
-            .contains("unsupported `table.set` instruction"),
-    );
-
-    Ok(())
+    result
 }
 
 #[tokio::test]
-async fn reject_table_grow_with_reference_types_enabled() -> wasmtime::Result<()> {
+async fn preserve_table_grow() -> wasmtime::Result<()> {
     let wat = r#"
       (module
         (elem declare func $f)
-        (func $f)
+        (type $f (func (result i32)))
+        (func $f (result i32) i32.const 42)
         (table 0 funcref)
-        (func (export "_initialize") (result i32)
+        (func (export "wizer-initialize")
             ref.func $f
             i32.const 1
             table.grow
+            drop
         )
+        (func (export "run") (result i32) (call_indirect (type $f) (i32.const 0)))
       )"#;
 
     let _ = env_logger::try_init();
     let wizer = Wizer::new();
     let wasm = wat_to_wasm(wat)?;
-    let result = wizen_and_run_wasm("", &[], 42, &wasm, wizer).await;
-
-    assert!(result.is_err());
-
-    let err = result.unwrap_err();
-    assert!(
-        err.to_string()
-            .contains("unsupported `table.grow` instruction")
-    );
-
-    Ok(())
+    wizen_and_run_wasm("run", &[], 42, &wasm, wizer).await
 }
 
 #[tokio::test]
@@ -372,7 +369,7 @@ async fn indirect_call_with_reference_types() -> wasmtime::Result<()> {
 }
 
 #[tokio::test]
-async fn reject_table_init() -> Result<()> {
+async fn preserve_table_init() -> Result<()> {
     let result = run_wat(
         &[],
         42,
@@ -380,30 +377,24 @@ async fn reject_table_init() -> Result<()> {
 (module
   (table 3 funcref)
 
-  (func $f (result i32) (i32.const 0))
-  (func $g (result i32) (i32.const 0))
-  (func $h (result i32) (i32.const 0))
+  (type $f (func (result i32)))
+  (func $f (result i32) (i32.const 11))
+  (func $g (result i32) (i32.const 42))
+  (func $h (result i32) (i32.const 93))
 
   (elem $elem func $f $g $h)
 
-  (func (export "main")
+  (func (export "wizer-initialize")
     i32.const 0
     i32.const 0
     i32.const 3
     table.init $elem)
+  (func (export "run") (result i32) (call_indirect (type $f) (i32.const 1)))
 )
 "#,
     )
     .await;
-    assert!(result.is_err());
-
-    let err = result.unwrap_err();
-    assert!(
-        err.to_string()
-            .contains("unsupported `table.init` instruction")
-    );
-
-    Ok(())
+    result
 }
 
 #[tokio::test]
@@ -888,7 +879,7 @@ async fn relaxed_simd_deterministic() -> Result<()> {
 }
 
 #[tokio::test]
-async fn reject_mutable_globals_of_reference_types() -> Result<()> {
+async fn preserve_globals_of_reference_types() -> Result<()> {
     // Non-mutable globals are fine
     run_wat(
         &[],
@@ -903,8 +894,9 @@ async fn reject_mutable_globals_of_reference_types() -> Result<()> {
     )
     .await?;
 
-    // Mutable globals are not fine
-    fails_wizening(
+    run_wat(
+        &[],
+        42,
         r#"
 (module
   (global (mut funcref) (ref.null func))

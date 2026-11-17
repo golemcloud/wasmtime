@@ -84,7 +84,7 @@ pub(crate) fn instrument(module: &mut ModuleContext<'_>) -> Vec<u8> {
                 // and instantiations under well-known names so we can inspect
                 // them after initialization.
                 for (i, ty, _) in module.defined_globals() {
-                    if !ty.mutable {
+                    if !ty.mutable || matches!(ty.content_type, wasmparser::ValType::Ref(_)) {
                         continue;
                     }
                     let name = format!("__wizer_global_{i}");
