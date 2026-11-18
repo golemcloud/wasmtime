@@ -337,7 +337,11 @@ impl TcpSocket {
         })
     }
 
-    pub(crate) fn take_send_stream(&mut self) -> Result<TcpSendStream, ErrorCode> {
+    /// Takes the send half of a connected socket. The stream shares the connection, so the
+    /// socket may be dropped while the stream is in use. Dropping the stream shuts down the
+    /// write side. Fails with `InvalidState` when the socket is not connected or the send half
+    /// was already taken.
+    pub fn take_send_stream(&mut self) -> Result<TcpSendStream, ErrorCode> {
         match &mut self.tcp_state {
             TcpState::Connected {
                 stream, send_taken, ..
@@ -613,15 +617,19 @@ impl TcpListenStream {
     }
 }
 
-pub(crate) struct TcpSendStream {
+/// The send half of a connected TCP socket, taken with [`TcpSocket::take_send_stream`].
+pub struct TcpSendStream {
     inner: Arc<tokio::net::TcpStream>,
 }
 impl TcpSendStream {
-    pub(crate) fn poll_ready(&mut self, cx: &mut std::task::Context<'_>) -> Poll<()> {
+    /// Polls until the socket can accept more bytes.
+    pub fn poll_ready(&mut self, cx: &mut std::task::Context<'_>) -> Poll<()> {
         self.inner.poll_write_ready(cx).map(|_| ())
     }
 
-    pub(crate) fn poll_write(
+    /// Writes a prefix of `buf` and returns its length, or returns `Pending` without writing
+    /// anything. Dropping a pending poll therefore cancels the write without a partial effect.
+    pub fn poll_write(
         &mut self,
         cx: &mut std::task::Context<'_>,
         buf: &[u8],
