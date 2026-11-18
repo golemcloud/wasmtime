@@ -17,8 +17,8 @@ use wasmtime::component::{HasData, ResourceTable};
 pub(crate) mod ip_name_lookup;
 mod tcp;
 mod udp;
-pub use tcp::TcpSocket;
-pub(crate) use tcp::{TcpListenStream, TcpReceiveStream, TcpSendStream};
+pub use tcp::{TcpSendStream, TcpSocket};
+pub(crate) use tcp::{TcpListenStream, TcpReceiveStream};
 pub use udp::UdpSocket;
 
 /// A helper struct which implements [`HasData`] for the `wasi:sockets` APIs.
