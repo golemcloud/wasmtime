@@ -109,7 +109,7 @@ impl HostUdpSocket for WasiSocketsCtxView<'_> {
             .map_err(TrappableError::trap)
     }
 
-    fn disconnect(&mut self, socket: Resource<UdpSocket>) -> SocketResult<()> {
+    async fn disconnect(&mut self, socket: Resource<UdpSocket>) -> SocketResult<()> {
         let socket = get_socket_mut(self.table, &socket)?;
         socket.disconnect()?;
         Ok(())
@@ -253,8 +253,12 @@ mod named {
             super::HostUdpSocket::create(&mut self.0.sockets(id), address_family).await
         }
 
-        fn disconnect(&mut self, id: NamedId, socket: Resource<UdpSocket>) -> SocketResult<()> {
-            super::HostUdpSocket::disconnect(&mut self.0.sockets(id), socket)
+        async fn disconnect(
+            &mut self,
+            id: NamedId,
+            socket: Resource<UdpSocket>,
+        ) -> SocketResult<()> {
+            super::HostUdpSocket::disconnect(&mut self.0.sockets(id), socket).await
         }
 
         fn get_local_address(

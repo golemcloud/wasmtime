@@ -79,6 +79,15 @@ impl UdpSocket {
         self.is_bound
     }
 
+    /// Marks the socket as bound without a native bind. `disconnect` leaves a socket in this
+    /// state when the operating system released its port: it reads as bound on the unspecified
+    /// address or the bound IP address with port 0, `bind` fails with `invalid-state`, `receive`
+    /// waits, and the next `send` selects a port again. An embedder that reconstructs such a
+    /// socket on a new native socket restores the same state with this function.
+    pub fn assume_bound_after_disconnect(&mut self) {
+        self.is_bound = true;
+    }
+
     pub(crate) fn local_address(&mut self) -> Result<SocketAddr, ErrorCode> {
         if !self.is_bound() {
             return Err(ErrorCode::InvalidState);

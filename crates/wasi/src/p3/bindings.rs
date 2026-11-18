@@ -103,6 +103,7 @@ mod generated {
             "wasi:sockets/types.[static]udp-socket.create": async | tracing | trappable,
             "wasi:sockets/types.[method]udp-socket.bind": async | tracing | trappable,
             "wasi:sockets/types.[method]udp-socket.connect": async | tracing | trappable,
+            "wasi:sockets/types.[method]udp-socket.disconnect": async | tracing | trappable,
             "wasi:sockets/types.[method]tcp-socket.get-keep-alive-enabled": async | tracing | trappable,
             "wasi:sockets/types.[method]tcp-socket.get-keep-alive-idle-time": async | tracing | trappable,
             "wasi:sockets/types.[method]tcp-socket.get-keep-alive-interval": async | tracing | trappable,
