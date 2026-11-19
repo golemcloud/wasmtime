@@ -79,13 +79,26 @@ impl UdpSocket {
         self.is_bound
     }
 
-    /// Marks the socket as bound without a native bind. `disconnect` leaves a socket in this
-    /// state when the operating system released its port: it reads as bound on the unspecified
-    /// address or the bound IP address with port 0, `bind` fails with `invalid-state`, `receive`
-    /// waits, and the next `send` selects a port again. An embedder that reconstructs such a
-    /// socket on a new native socket restores the same state with this function.
-    pub fn assume_bound_after_disconnect(&mut self) {
+    /// Restores, on a socket that is not bound, the state that `disconnect` leaves when the
+    /// operating system released the port: bound on the IP address of `addr` with port 0, or on
+    /// the unspecified address. `bind` then fails with `invalid-state`, `receive` waits, and the
+    /// next `send` selects a port again. An embedder that reconstructs such a socket on a new
+    /// native socket restores the same state with this function. It binds the socket on `addr`
+    /// and dissolves the association at once, so it sends no packet; `addr` must have port 0.
+    pub async fn restore_released_bind(&mut self, addr: SocketAddr) -> Result<(), ErrorCode> {
+        if self.is_bound() {
+            return Err(ErrorCode::InvalidState);
+        }
+        if addr.port() != 0 || !is_valid_address_family(addr.ip(), self.family) {
+            return Err(ErrorCode::InvalidArgument);
+        }
+
+        self.permissions.check(addr, SocketAddrUse::UdpBind).await?;
+
+        bind(&self.socket, addr)?;
+        disconnect(&self.socket)?;
         self.is_bound = true;
+        Ok(())
     }
 
     pub(crate) fn local_address(&mut self) -> Result<SocketAddr, ErrorCode> {
