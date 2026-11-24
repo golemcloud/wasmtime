@@ -634,6 +634,13 @@ pub enum StreamResult {
 /// The interceptor may delegate to the native consumer, or consume a recorded
 /// prefix itself during reconstruction. Host-to-host transfers do not invoke it.
 pub trait GuestWriteInterceptor<D, T>: Send + 'static {
+    /// Called synchronously when the guest issues a write, before its first poll.
+    /// For a write already pending when interception begins, registration calls
+    /// this method before installing the consumer instead.
+    fn write_started(self: Pin<&mut Self>, _store: StoreContextMut<'_, D>) -> Result<()> {
+        Ok(())
+    }
+
     /// Poll one canonical write. `finish` requests cancellation. Returning
     /// `Pending` retains the write, including any items already accepted.
     fn poll_write(
@@ -659,15 +666,65 @@ type NativeWritePoll<'a> = dyn FnMut(
     ) -> Poll<Result<StreamResult>>
     + 'a;
 
-type WriteInterceptor = Box<
-    dyn FnMut(
-            &mut Context<'_>,
-            &mut dyn VMStore,
-            bool,
-            &mut NativeWritePoll<'_>,
-        ) -> Poll<Result<StreamResult>>
-        + Send,
->;
+type WriteInterceptor = Box<dyn ErasedWriteInterceptor>;
+
+trait ErasedWriteInterceptor: Send {
+    fn write_started(&mut self, store: &mut dyn VMStore) -> Result<()>;
+
+    fn poll_write(
+        &mut self,
+        cx: &mut Context<'_>,
+        store: &mut dyn VMStore,
+        finish: bool,
+        native: &mut NativeWritePoll<'_>,
+    ) -> Poll<Result<StreamResult>>;
+}
+
+struct TypedWriteInterceptor<D, T, I> {
+    token: StoreToken<D>,
+    id: TableId<TransmitState>,
+    interceptor: Pin<Box<I>>,
+    marker: PhantomData<fn() -> T>,
+}
+
+impl<D: 'static, T: 'static, I: GuestWriteInterceptor<D, T>> ErasedWriteInterceptor
+    for TypedWriteInterceptor<D, T, I>
+{
+    fn write_started(&mut self, store: &mut dyn VMStore) -> Result<()> {
+        self.interceptor
+            .as_mut()
+            .write_started(self.token.as_context_mut(store))
+    }
+
+    fn poll_write(
+        &mut self,
+        cx: &mut Context<'_>,
+        store: &mut dyn VMStore,
+        finish: bool,
+        native: &mut NativeWritePoll<'_>,
+    ) -> Poll<Result<StreamResult>> {
+        let mut native = |cx: &mut Context<'_>,
+                          store: StoreContextMut<'_, D>,
+                          mut source: Source<'_, T>,
+                          finish| {
+            let mut buffer = source
+                .host_buffer
+                .as_deref_mut()
+                .map(UntypedWriteBuffer::new);
+            native(cx, store.0, buffer.as_mut(), finish)
+        };
+        self.interceptor.as_mut().poll_write(
+            cx,
+            self.token.as_context_mut(store),
+            Source {
+                id: self.id,
+                host_buffer: None,
+            },
+            finish,
+            &mut native,
+        )
+    }
+}
 
 struct PendingWriteConsumer<D, T> {
     consumer: Option<Pin<Box<dyn StreamConsumer<D, Item = T>>>>,
@@ -718,34 +775,23 @@ fn register_write_interceptor<D: 'static, T: 'static>(
     ) {
         return Ok(());
     }
+    let pending_write = matches!(transmit.write, WriteState::GuestReady { .. });
     let mut interceptor = Box::pin(interceptor);
-    transmit.write_interceptor = Some(Arc::new(LockedState::new(Box::new(
-        move |cx: &mut Context<'_>,
-              store: &mut dyn VMStore,
-              finish: bool,
-              native: &mut NativeWritePoll<'_>| {
-            let mut native = |cx: &mut Context<'_>,
-                              store: StoreContextMut<'_, D>,
-                              mut source: Source<'_, T>,
-                              finish| {
-                let mut buffer = source
-                    .host_buffer
-                    .as_deref_mut()
-                    .map(UntypedWriteBuffer::new);
-                native(cx, store.0, buffer.as_mut(), finish)
-            };
-            interceptor.as_mut().poll_write(
-                cx,
-                token.as_context_mut(store),
-                Source {
-                    id,
-                    host_buffer: None,
-                },
-                finish,
-                &mut native,
-            )
-        },
-    ) as WriteInterceptor)));
+    if pending_write {
+        interceptor.as_mut().write_started(store.as_context_mut())?;
+    }
+    store
+        .0
+        .concurrent_state_mut()?
+        .get_mut(id)?
+        .write_interceptor = Some(Arc::new(LockedState::new(
+        Box::new(TypedWriteInterceptor::<D, T, _> {
+            token,
+            id,
+            interceptor,
+            marker: PhantomData,
+        }) as WriteInterceptor,
+    )));
     let pending = Arc::new(LockedState::new(PendingWriteConsumer::<D, T> {
         consumer: None,
         waker: None,
@@ -3292,7 +3338,7 @@ impl<T> StoreContextMut<'_, T> {
                                 }
                                 result
                             };
-                            interceptor(cx, store, cancel, &mut native)
+                            interceptor.poll_write(cx, store, cancel, &mut native)
                         } else {
                             mine.as_mut().poll_consume(
                                 cx,
@@ -4019,6 +4065,11 @@ impl Instance {
             });
         }
 
+        if let Some(interceptor) = transmit.write_interceptor.clone() {
+            interceptor.take()?.write_started(store.0)?;
+        }
+        let concurrent_state = store.0.concurrent_state_mut()?;
+        let transmit = concurrent_state.get_mut(transmit_id)?;
         let new_state = if let ReadState::Dropped = &transmit.read {
             ReadState::Dropped
         } else {
@@ -4550,48 +4601,22 @@ impl Instance {
             transmit.write
         );
         let waitable = Waitable::Transmit(transmit.write_handle);
-        let intercepted = transmit.write_interceptor.is_some();
 
         if !async_ {
             waitable.trap_if_in_waitable_set(state)?;
         }
 
         let code = if let Some(event) = waitable.take_event(state)? {
-            if intercepted {
-                let event = match event {
-                    Event::StreamWrite {
-                        code: ReturnCode::Completed(count),
-                        pending,
-                    } => Event::StreamWrite {
-                        code: ReturnCode::Cancelled(count),
-                        pending,
-                    },
-                    Event::StreamWrite { .. } | Event::FutureWrite { .. } => event,
-                    _ => bail_bug!("expected either a stream or future write event"),
-                };
-                waitable.set_event(state, Some(event))?;
-                if async_ {
-                    ReturnCode::Blocked
-                } else {
-                    let handle = store
-                        .concurrent_state_mut()?
-                        .get_mut(transmit_id)?
-                        .write_handle;
-                    self.wait_for_write(store, caller, handle)?
+            let (Event::FutureWrite { code, .. } | Event::StreamWrite { code, .. }) = event else {
+                bail_bug!("expected either a stream or future write event")
+            };
+            waitable.on_delivery(store, self, event)?;
+            match (code, event) {
+                (ReturnCode::Completed(count), Event::StreamWrite { .. }) => {
+                    ReturnCode::Cancelled(count)
                 }
-            } else {
-                let (Event::FutureWrite { code, .. } | Event::StreamWrite { code, .. }) = event
-                else {
-                    bail_bug!("expected either a stream or future write event")
-                };
-                waitable.on_delivery(store, self, event)?;
-                match (code, event) {
-                    (ReturnCode::Completed(count), Event::StreamWrite { .. }) => {
-                        ReturnCode::Cancelled(count)
-                    }
-                    (ReturnCode::Dropped(_) | ReturnCode::Completed(_), _) => code,
-                    _ => bail_bug!("unexpected code/event combo"),
-                }
+                (ReturnCode::Dropped(_) | ReturnCode::Completed(_), _) => code,
+                _ => bail_bug!("unexpected code/event combo"),
             }
         } else if let ReadState::HostReady {
             cancel,

@@ -10,9 +10,15 @@ struct Hook {
     pending: bool,
     prefix: bool,
     observations: Arc<Mutex<Vec<TerminalConsumption>>>,
+    starts: Arc<Mutex<usize>>,
 }
 
 impl GuestWriteInterceptor<(), u8> for Hook {
+    fn write_started(self: Pin<&mut Self>, _: StoreContextMut<'_, ()>) -> Result<()> {
+        *self.starts.lock().unwrap() += 1;
+        Ok(())
+    }
+
     fn poll_write(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -118,6 +124,7 @@ async fn partial_write_observed_at_callback_and_dropped_reader_is_intercepted() 
             (false, false, false, true, false),
             (false, false, false, false, true),
             (false, true, false, false, true),
+            (false, false, false, true, true),
         ] {
             // A cancelled future must be retried before dropping its writer.
             if is_future && cancel {
@@ -199,8 +206,24 @@ async fn partial_write_observed_at_callback_and_dropped_reader_is_intercepted() 
             } else {
                 wat.to_owned()
             };
+            let before_install = prefix && before_pipe;
+            let wat = if before_install {
+                let attach = "(call $attach (i32.wrap_i64 (local.get $pair)))";
+                let write = if is_future {
+                    "(if (i32.ne (call $write (global.get $writer) (i32.const 0)) (i32.const -1)) (then unreachable))"
+                } else {
+                    "(if (i32.ne (call $write (global.get $writer) (i32.const 0) (i32.const 4)) (i32.const -1)) (then unreachable))"
+                };
+                assert_eq!(wat.matches(attach).count(), 1);
+                assert_eq!(wat.matches(write).count(), 1);
+                wat.replace(attach, "")
+                    .replace(write, &format!("{write}\n{attach}"))
+            } else {
+                wat
+            };
             let component = Component::new(&engine, &wat)?;
             let observations = Arc::new(Mutex::new(Vec::new()));
+            let starts = Arc::new(Mutex::new(0));
             let bytes = Arc::new(Mutex::new(Vec::new()));
             let pending = Arc::new(Mutex::new(None::<StreamAny>));
             let pending_future = Arc::new(Mutex::new(None::<FutureAny>));
@@ -208,6 +231,7 @@ async fn partial_write_observed_at_callback_and_dropped_reader_is_intercepted() 
             if is_future {
                 linker.root().func_wrap("attach", {
                     let observations = observations.clone();
+                    let starts = starts.clone();
                     let bytes = bytes.clone();
                     let pending = pending_future.clone();
                     move |mut store: StoreContextMut<'_, ()>, (mut reader,): (FutureReader<u8>,)| {
@@ -218,8 +242,10 @@ async fn partial_write_observed_at_callback_and_dropped_reader_is_intercepted() 
                                 pending: false,
                                 prefix,
                                 observations: observations.clone(),
+                                starts: starts.clone(),
                             },
                         )?;
+                        assert_eq!(*starts.lock().unwrap(), usize::from(before_install));
                         assert!(reader.has_guest_write_interceptor(&mut store)?);
                         if drop_reader {
                             reader.close(store)?;
@@ -240,6 +266,7 @@ async fn partial_write_observed_at_callback_and_dropped_reader_is_intercepted() 
             } else {
                 linker.root().func_wrap("attach", {
                     let observations = observations.clone();
+                    let starts = starts.clone();
                     let bytes = bytes.clone();
                     let pending = pending.clone();
                     move |mut store: StoreContextMut<'_, ()>, (mut reader,): (StreamReader<u8>,)| {
@@ -250,8 +277,10 @@ async fn partial_write_observed_at_callback_and_dropped_reader_is_intercepted() 
                                 pending: false,
                                 prefix,
                                 observations: observations.clone(),
+                                starts: starts.clone(),
                             },
                         )?;
+                        assert_eq!(*starts.lock().unwrap(), usize::from(before_install));
                         assert!(reader.has_guest_write_interceptor(&mut store)?);
                         if drop_reader {
                             reader.close(store)?;
@@ -272,7 +301,9 @@ async fn partial_write_observed_at_callback_and_dropped_reader_is_intercepted() 
             }
             linker.root().func_wrap("drop-pending", {
                 let bytes = bytes.clone();
+                let starts = starts.clone();
                 move |mut store: StoreContextMut<'_, ()>, ()| {
+                    assert_eq!(*starts.lock().unwrap(), 1);
                     if before_pipe && cancel {
                         return Ok(());
                     }
@@ -301,7 +332,9 @@ async fn partial_write_observed_at_callback_and_dropped_reader_is_intercepted() 
             })?;
             linker.root().func_wrap("observed", {
                 let observations = observations.clone();
+                let starts = starts.clone();
                 move |_: StoreContextMut<'_, ()>, (code,): (u32,)| {
+                    assert_eq!(*starts.lock().unwrap(), 1);
                     assert_eq!(
                         code,
                         if cancel {
@@ -427,6 +460,7 @@ async fn cancelled_future_write_can_retry_before_and_after_consumer_installation
                         pending: false,
                         prefix: false,
                         observations: observations.clone(),
+                        starts: Arc::default(),
                     },
                 )?;
                 if before_pipe {
@@ -515,6 +549,7 @@ async fn unwritten_stream_can_close_before_its_consumer_is_installed() -> Result
                 pending: false,
                 prefix: false,
                 observations: observations.clone(),
+                starts: Arc::default(),
             }));
             let pending = pending.clone();
             move |mut store: StoreContextMut<'_, ()>, (mut reader,): (StreamReader<u8>,)| {
@@ -592,6 +627,7 @@ fn host_producers_bypass_interception() -> Result<()> {
         pending: false,
         prefix: false,
         observations: observations.clone(),
+        starts: Arc::default(),
     };
     let mut reader = StreamReader::new(&mut store, Producer(vec![19, 7, 3]))?;
     assert!(!reader.is_guest_produced(&mut store)?);
@@ -662,16 +698,20 @@ async fn synchronous_write_observes_immediate_and_scheduled_results() -> Result<
                         "(call $write (local.get $writer) (i32.const 0))",
                     )
             } else {
-                wat.to_owned()
+                let write = "(call $observed (call $write (local.get $writer) (i32.const 0) (i32.const 4)))";
+                assert_eq!(wat.matches(write).count(), 1);
+                wat.replace(write, &format!("{write}\n{write}"))
             };
             let component = Component::new(&engine, &wat)?;
             let observations = Arc::new(Mutex::new(Vec::new()));
             let bytes = Arc::new(Mutex::new(Vec::new()));
+            let starts = Arc::new(Mutex::new(0));
             let mut linker = Linker::new(&engine);
             if is_future {
                 linker.root().func_wrap("attach", {
                     let observations = observations.clone();
                     let bytes = bytes.clone();
+                    let starts = starts.clone();
                     move |mut store: StoreContextMut<'_, ()>, (mut reader,): (FutureReader<u8>,)| {
                         reader.intercept_guest_writes(
                             &mut store,
@@ -679,6 +719,7 @@ async fn synchronous_write_observes_immediate_and_scheduled_results() -> Result<
                                 pending: immediate,
                                 prefix: false,
                                 observations: observations.clone(),
+                                starts: starts.clone(),
                             },
                         )?;
                         reader.pipe(store, Consumer(bytes.clone(), false, false))
@@ -688,6 +729,7 @@ async fn synchronous_write_observes_immediate_and_scheduled_results() -> Result<
                 linker.root().func_wrap("attach", {
                     let observations = observations.clone();
                     let bytes = bytes.clone();
+                    let starts = starts.clone();
                     move |mut store: StoreContextMut<'_, ()>, (mut reader,): (StreamReader<u8>,)| {
                         reader.intercept_guest_writes(
                             &mut store,
@@ -695,6 +737,7 @@ async fn synchronous_write_observes_immediate_and_scheduled_results() -> Result<
                                 pending: immediate,
                                 prefix: false,
                                 observations: observations.clone(),
+                                starts: starts.clone(),
                             },
                         )?;
                         reader.pipe(store, Consumer(bytes.clone(), false, false))
@@ -703,11 +746,12 @@ async fn synchronous_write_observes_immediate_and_scheduled_results() -> Result<
             }
             linker.root().func_wrap("observed", {
                 let observations = observations.clone();
+                let starts = starts.clone();
                 move |_: StoreContextMut<'_, ()>, (code,): (u32,)| {
                     assert_eq!(code, if is_future { 0 } else { 16 });
                     assert_eq!(
                         *observations.lock().unwrap(),
-                        vec![TerminalConsumption::Delivered]
+                        vec![TerminalConsumption::Delivered; *starts.lock().unwrap()]
                     );
                     Ok(())
                 }
@@ -721,7 +765,9 @@ async fn synchronous_write_observes_immediate_and_scheduled_results() -> Result<
             )
             .await
             .unwrap()?;
-            assert_eq!(*bytes.lock().unwrap(), vec![b'a']);
+            let writes = if is_future { 1 } else { 2 };
+            assert_eq!(*starts.lock().unwrap(), writes);
+            assert_eq!(*bytes.lock().unwrap(), vec![b'a'; writes]);
         }
     }
     Ok(())
@@ -777,7 +823,7 @@ impl GuestWriteInterceptor<(), u8> for CancelGate {
 }
 
 #[tokio::test]
-async fn cancellation_has_the_same_boundary_for_queued_and_gated_writes() -> Result<()> {
+async fn cancellation_preserves_inline_results_for_queued_writes() -> Result<()> {
     for is_future in [false, true] {
         for async_cancel in [false, true] {
             for (queued, callback) in [(false, false), (true, false), (false, true)] {
@@ -928,18 +974,29 @@ async fn cancellation_has_the_same_boundary_for_queued_and_gated_writes() -> Res
                     })
                 })?;
                 linker.root().func_wrap("observed", {
-                        let observations = observations.clone();
-                        move |_: StoreContextMut<'_, ()>, (stage, code): (u32, u32)| {
-                            if stage == 0 && async_cancel {
-                                assert_eq!(code, u32::MAX, "async cancel must always schedule its result; future={is_future}, queued={queued}");
-                                assert!(observations.lock().unwrap().is_empty());
-                            } else {
-                                assert_eq!(code, if is_future { 0 } else { 18 }, "future={is_future}, queued={queued}, async={async_cancel}");
-                                assert_eq!(*observations.lock().unwrap(), vec![TerminalConsumption::Delivered]);
-                            }
-                            Ok(())
+                    let observations = observations.clone();
+                    move |_: StoreContextMut<'_, ()>, (stage, code): (u32, u32)| {
+                        if stage == 0 && async_cancel && !queued {
+                            assert_eq!(
+                                code,
+                                u32::MAX,
+                                "a gated acknowledgement is still pending; future={is_future}"
+                            );
+                            assert!(observations.lock().unwrap().is_empty());
+                        } else {
+                            assert_eq!(
+                                code,
+                                if is_future { 0 } else { 18 },
+                                "future={is_future}, queued={queued}, async={async_cancel}"
+                            );
+                            assert_eq!(
+                                *observations.lock().unwrap(),
+                                vec![TerminalConsumption::Delivered]
+                            );
                         }
-                    })?;
+                        Ok(())
+                    }
+                })?;
                 let mut store = Store::new(&engine, ());
                 let instance = linker.instantiate_async(&mut store, &component).await?;
                 let run = instance.get_typed_func::<(), ()>(&mut store, "run")?;
