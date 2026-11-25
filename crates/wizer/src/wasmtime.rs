@@ -95,6 +95,72 @@ pub struct WasmtimeWizer<'a, T: 'static> {
 }
 
 impl<T: Send> InstanceState for WasmtimeWizer<'_, T> {
+    async fn gc_read(&mut self, op: u32, target: u32, index: u64, part: u32) -> Result<u64> {
+        if part != 2 {
+            let read = self
+                .instance
+                .get_typed_func::<(u32, u32, u64, u32), u64>(&mut *self.store, "__wizer_gc_read")?;
+            let value = read
+                .call_async(&mut *self.store, (op, target, index, part))
+                .await?;
+            if op == 3 && part == 0 {
+                let table = self
+                    .instance
+                    .get_table(&mut *self.store, "__wizer_gc_objects")
+                    .unwrap();
+                let root = table.get(&mut *self.store, u64::from(target)).unwrap();
+                let object = root.unwrap_any().unwrap();
+                let marker = self
+                    .instance
+                    .get_func(
+                        &mut *self.store,
+                        &format!("__wizer_gc_type_{}", value as u32),
+                    )
+                    .unwrap();
+                let expected = marker.ty(&*self.store).params().next().unwrap();
+                wasmtime::ensure!(
+                    wasmtime::HeapType::eq(
+                        &object.ty(&*self.store)?,
+                        expected.unwrap_ref().heap_type()
+                    ),
+                    "snapshot contains an unknown host-owned GC subtype"
+                );
+            }
+            return Ok(value);
+        }
+        let read = self
+            .instance
+            .get_typed_func::<(u32, u32, u64), Option<wasmtime::Func>>(
+                &mut *self.store,
+                "__wizer_gc_function",
+            )?;
+        let function = read
+            .call_async(&mut *self.store, (op, target, index))
+            .await?
+            .ok_or_else(|| wasmtime::format_err!("function root became null during capture"))?;
+        let identity = function.to_raw(&mut *self.store) as usize;
+        let exports: Vec<_> = self
+            .instance
+            .exports(&mut *self.store)
+            .filter_map(|export| {
+                let index = export
+                    .name()
+                    .strip_prefix("__wizer_function_")?
+                    .parse::<u32>()
+                    .ok()?;
+                Some((index, export.into_func()?))
+            })
+            .collect();
+        for (index, function) in exports {
+            if function.to_raw(&mut *self.store) as usize == identity {
+                return Ok(u64::from(index));
+            }
+        }
+        wasmtime::bail!(
+            "snapshot contains an unknown host-owned function at operation {op}, root {target}, field {index}"
+        )
+    }
+
     async fn global_get(&mut self, name: &str, _: ValType) -> SnapshotVal {
         let global = self.instance.get_global(&mut *self.store, name).unwrap();
         match global.get(&mut *self.store) {

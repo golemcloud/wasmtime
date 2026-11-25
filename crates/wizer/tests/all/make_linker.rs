@@ -1,5 +1,4 @@
 use wasmtime::{Result, error::Context as _, format_err};
-use wasmtime_wasi::WasiCtxBuilder;
 use wasmtime_wizer::Wizer;
 use wat::parse_str as wat_to_wasm;
 
@@ -14,8 +13,7 @@ async fn run_wasm(args: &[wasmtime::Val], expected: i32, wasm: &[u8]) -> Result<
     config.wasm_multi_value(true);
 
     let engine = wasmtime::Engine::new(&config)?;
-    let wasi_ctx = WasiCtxBuilder::new().build_p1();
-    let mut store = wasmtime::Store::new(&engine, wasi_ctx);
+    let mut store = wasmtime::Store::new(&engine, ());
     let wasm = Wizer::new()
         .run(&mut store, &wasm, async |store, module| {
             let mut linker = wasmtime::Linker::new(module.engine());
@@ -33,8 +31,7 @@ async fn run_wasm(args: &[wasmtime::Val], expected: i32, wasm: &[u8]) -> Result<
         std::fs::write("test.wasm", &wasm).unwrap();
     }
 
-    let wasi_ctx = WasiCtxBuilder::new().build_p1();
-    let mut store = wasmtime::Store::new(&engine, wasi_ctx);
+    let mut store = wasmtime::Store::new(&engine, ());
     let module =
         wasmtime::Module::new(store.engine(), wasm).context("Wasm test case failed to compile")?;
 

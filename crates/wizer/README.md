@@ -100,8 +100,10 @@ wasmtime wizer --help
 
 * The Wasm module may not import globals, tables, or memories.
 
-* Reference types are not supported yet. It isn't 100% clear yet what the best
-  approach to snapshotting `externref` tables is.
+* GC structs, arrays, reference globals, and tables are snapshotted together to
+  preserve shared references and cycles. Non-null external, exception, and
+  continuation references, and unknown host-owned function references or GC
+  subtypes cannot be snapshotted.
 
 ## Using Wizer as a Library
 
