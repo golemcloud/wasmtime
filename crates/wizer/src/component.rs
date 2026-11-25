@@ -81,15 +81,7 @@ impl Wizer {
         let graph = if inputs.is_empty() {
             None
         } else {
-            Some(
-                crate::gc::capture::capture_shared(
-                    &inputs,
-                    async |module, op, target, index, part| {
-                        instance.gc_read(module, op, target, index, part).await
-                    },
-                )
-                .await?,
-            )
+            Some(crate::gc::capture::capture_shared(&inputs, &mut *instance).await?)
         };
         let rewritten_wasm = self.rewrite_component(cx, &snapshot);
         let rewritten_wasm = if let Some(graph) = graph {
