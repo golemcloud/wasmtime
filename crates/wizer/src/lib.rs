@@ -247,11 +247,7 @@ impl Wizer {
         let rewritten_wasm = self.rewrite(cx, &snapshot, &renames, true);
         let rewritten_wasm = if gc::needs_snapshot(cx)? {
             let original = gc::original(cx);
-            let gc_snapshot =
-                gc::capture::capture(&original, 0, async |op, target, index, part| {
-                    instance.gc_read(op, target, index, part).await
-                })
-                .await?;
+            let gc_snapshot = gc::capture::capture(&original, 0, &mut *instance).await?;
             gc::restore::restore(&rewritten_wasm, 0, &gc_snapshot)?
         } else {
             rewritten_wasm
