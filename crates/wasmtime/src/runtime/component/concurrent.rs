@@ -2733,6 +2733,39 @@ impl StoreOpaque {
         Ok(())
     }
 
+    /// Dual of `host_task_create` for a host call that failed while it was
+    /// still a deferred host call.
+    ///
+    /// The deferred host call that `host_task_create` recorded is removed and
+    /// the caller becomes the current thread again, as `host_task_delete`
+    /// does, so that a Store which keeps running host work after the failure
+    /// does not see a deferred call context without its deferred thread.
+    /// Nothing changes when the call is no longer deferred: `host_task_delete`
+    /// already ran, or the call was materialized into a host task.
+    pub(crate) fn host_task_delete_after_error(
+        &mut self,
+        original_task: EnteredHostTask,
+    ) -> Result<()> {
+        match original_task {
+            Some(caller) => {
+                let CurrentThread::DeferredHost(current) = self.current_thread()? else {
+                    return Ok(());
+                };
+                debug_assert!(
+                    current == caller,
+                    "a failed host call left another deferred call"
+                );
+                self.set_thread(caller)?;
+                let state = self.concurrent_state_mut()?;
+                state.deferred_host_call.take();
+                state.deferred_host_call_context.take();
+                state.debug_assert_deferred_host_invariant();
+            }
+            None => self.exit_call_not_concurrent(),
+        }
+        Ok(())
+    }
+
     /// Helper function to retrieve the `InstanceState` for the
     /// specified instance.
     fn instance_state(&mut self, instance: RuntimeInstance) -> &mut InstanceState {
