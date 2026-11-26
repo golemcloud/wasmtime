@@ -1907,12 +1907,19 @@ pub unsafe extern "C" fn path_open(
     opened_fd: &mut Fd,
 ) -> Errno {
     cfg_filesystem_available! {
-        let _ = fs_rights_inheriting;
-
         let path = unsafe { slice::from_raw_parts(path_ptr, path_len) };
         let at_flags = at_flags_from_lookupflags(dirflags);
         let o_flags = o_flags_from_oflags(oflags);
-        let flags = descriptor_flags_from_flags(fs_rights_base, fdflags);
+        let mut flags = descriptor_flags_from_flags(fs_rights_base, fdflags);
+        // `mutate-directory` may only be requested for directories. A
+        // directory needs it to change its entries, and to open existing
+        // files beneath it for writing.
+        if oflags & wasip1::OFLAGS_DIRECTORY == wasip1::OFLAGS_DIRECTORY
+            && ((fs_rights_base | fs_rights_inheriting) & DIRECTORY_MUTATION_RIGHTS != 0
+                || fs_rights_inheriting & wasip1::RIGHTS_FD_WRITE != 0)
+        {
+            flags |= filesystem::DescriptorFlags::MUTATE_DIRECTORY;
+        }
         let append = fdflags & wasip1::FDFLAGS_APPEND == wasip1::FDFLAGS_APPEND;
 
         #[cfg(feature = "proxy")]
@@ -2520,6 +2527,7 @@ fn o_flags_from_oflags(flags: Oflags) -> filesystem::OpenFlags {
 #[cfg(not(feature = "proxy"))]
 const DIRECTORY_MUTATION_RIGHTS: Rights = wasip1::RIGHTS_PATH_CREATE_DIRECTORY
     | wasip1::RIGHTS_PATH_CREATE_FILE
+    | wasip1::RIGHTS_PATH_LINK_SOURCE
     | wasip1::RIGHTS_PATH_LINK_TARGET
     | wasip1::RIGHTS_PATH_RENAME_SOURCE
     | wasip1::RIGHTS_PATH_RENAME_TARGET
@@ -2527,7 +2535,8 @@ const DIRECTORY_MUTATION_RIGHTS: Rights = wasip1::RIGHTS_PATH_CREATE_DIRECTORY
     | wasip1::RIGHTS_PATH_REMOVE_DIRECTORY
     | wasip1::RIGHTS_PATH_UNLINK_FILE
     | wasip1::RIGHTS_PATH_FILESTAT_SET_SIZE
-    | wasip1::RIGHTS_PATH_FILESTAT_SET_TIMES;
+    | wasip1::RIGHTS_PATH_FILESTAT_SET_TIMES
+    | wasip1::RIGHTS_FD_FILESTAT_SET_TIMES;
 
 #[cfg(not(feature = "proxy"))]
 fn descriptor_flags_from_flags(rights: Rights, fdflags: Fdflags) -> filesystem::DescriptorFlags {
@@ -2537,11 +2546,6 @@ fn descriptor_flags_from_flags(rights: Rights, fdflags: Fdflags) -> filesystem::
     }
     if rights & wasip1::RIGHTS_FD_WRITE == wasip1::RIGHTS_FD_WRITE {
         flags |= filesystem::DescriptorFlags::WRITE;
-    }
-    // A directory descriptor needs `mutate-directory` to create, rename or
-    // remove entries, or to change their metadata, through it.
-    if rights & DIRECTORY_MUTATION_RIGHTS != 0 {
-        flags |= filesystem::DescriptorFlags::MUTATE_DIRECTORY;
     }
     if fdflags & wasip1::FDFLAGS_SYNC == wasip1::FDFLAGS_SYNC {
         flags |= filesystem::DescriptorFlags::FILE_INTEGRITY_SYNC;
