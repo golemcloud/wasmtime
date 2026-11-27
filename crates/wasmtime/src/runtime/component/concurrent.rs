@@ -1260,7 +1260,8 @@ pub(crate) fn poll_and_block<R: Send + Sync + 'static>(
             // Wrap the future in a closure which will stash its result in the
             // host task and resume this fiber when it completes.
             let future = Box::pin(async move {
-                let result = run_with_host_task_set(task, future).await??;
+                let result =
+                    note_trapping_host_task(task, run_with_host_task_set(task, future).await?)?;
                 tls::get(move |store| {
                     let state = store.concurrent_state_mut()?;
                     let host_state = &mut state.get_mut(task)?.state;
@@ -4321,7 +4322,7 @@ impl Instance {
         // the task returned.
         let future = Box::pin(async move {
             let result = match run_with_host_task_set(task, future).await? {
-                Some(result) => Some(result?),
+                Some(result) => Some(note_trapping_host_task(task, result)?),
                 None => None,
             };
             let on_complete = move |store: &mut dyn VMStore| {
@@ -5688,6 +5689,19 @@ impl<T: 'static> VMComponentAsyncStore for StoreInner<T> {
 
 type HostTaskFuture = Pin<Box<dyn Future<Output = Result<()>> + Send + 'static>>;
 
+/// Notes `task` as the task whose failed host call is about to poison the store
+/// when `result` is an error, so the trap is reported for its task group.
+fn note_trapping_host_task<R>(task: TableId<HostTask>, result: Result<R>) -> Result<R> {
+    if result.is_err() {
+        tls::get(|store| {
+            if let Ok(state) = store.concurrent_state_mut() {
+                state.note_trapping_host_task(task);
+            }
+        });
+    }
+    result
+}
+
 /// Runs the given future with the current thread set to `task` each time it is
 /// polled.
 async fn run_with_host_task_set<F>(task: TableId<HostTask>, future: F) -> Result<F::Output>
@@ -6656,6 +6670,11 @@ pub struct ConcurrentState {
     /// See [TaskGroupHook].
     #[cfg(feature = "task-group-hook")]
     task_group_hook: Option<Box<dyn TaskGroupHook>>,
+
+    /// The host task whose failed host call is about to poison the store, if
+    /// any. See [TaskGroupHook::handle_trap].
+    #[cfg(feature = "task-group-hook")]
+    trapping_thread: Option<CurrentThread>,
 }
 
 impl Default for ConcurrentState {
@@ -6684,6 +6703,8 @@ impl Default for ConcurrentState {
             saved_next_switch_items: Vec::new(),
             #[cfg(feature = "task-group-hook")]
             task_group_hook: None,
+            #[cfg(feature = "task-group-hook")]
+            trapping_thread: None,
         }
     }
 }
@@ -6818,6 +6839,8 @@ impl ConcurrentState {
             event_loop_running: _,
             #[cfg(feature = "task-group-hook")]
                 task_group_hook: _,
+            #[cfg(feature = "task-group-hook")]
+                trapping_thread: _,
         } = self;
 
         for (_, entry) in table.get_mut().iter_mut() {

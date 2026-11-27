@@ -1349,6 +1349,8 @@ async fn test_task_group_hook(variant: TaskGroupHookTestVariant) -> Result<()> {
         ids: HashMap<TaskGroupId, usize>,
         entered: Option<usize>,
         call_count: usize,
+        failed_call: Option<usize>,
+        trapped: Option<usize>,
     }
 
     #[derive(Clone)]
@@ -1388,6 +1390,14 @@ async fn test_task_group_hook(variant: TaskGroupHookTestVariant) -> Result<()> {
             let mut inner = self.0.try_lock().unwrap();
             let id = inner.ids.remove(&group).unwrap();
             inner.events.push((Event::Finish, id));
+            Ok(())
+        }
+
+        fn handle_trap(&mut self, group: TaskGroupId) -> Result<()> {
+            let mut inner = self.0.try_lock().unwrap();
+            // The trapping group is reported once, before it is finished:
+            let id = *inner.ids.get(&group).unwrap();
+            assert!(inner.trapped.replace(id).is_none());
             Ok(())
         }
     }
@@ -1432,6 +1442,7 @@ async fn test_task_group_hook(variant: TaskGroupHookTestVariant) -> Result<()> {
                 if let TaskGroupHookTestVariant::Trap = variant
                     && inner.call_count == call_count
                 {
+                    inner.failed_call = previous_id;
                     Err(wasmtime::format_err!("yikes"))
                 } else {
                     Ok(())
@@ -1490,6 +1501,15 @@ async fn test_task_group_hook(variant: TaskGroupHookTestVariant) -> Result<()> {
 
     assert_eq!(None, hook.0.try_lock().unwrap().entered);
     assert!(hook.0.try_lock().unwrap().ids.is_empty());
+
+    // The group whose host call failed is the one reported as trapping:
+    let inner = hook.0.try_lock().unwrap();
+    if let TaskGroupHookTestVariant::Trap = variant {
+        assert!(inner.failed_call.is_some());
+        assert_eq!(inner.failed_call, inner.trapped);
+    } else {
+        assert_eq!(None, inner.trapped);
+    }
 
     Ok(())
 }
