@@ -106,8 +106,8 @@ pub use func::{FuncCallConcurrent, TypedFuncCallConcurrent};
 pub use future_stream_any::{FutureAny, StreamAny};
 pub use futures_and_streams::{
     Destination, DirectDestination, DirectSource, ErrorContext, FutureConsumer, FutureProducer,
-    FutureReader, GuardedFutureReader, GuardedStreamReader, ReadBuffer, Source, StreamConsumer,
-    StreamProducer, StreamReader, StreamResult, VecBuffer, WriteBuffer,
+    FutureReader, GuardedFutureReader, GuardedStreamReader, GuestWriteInterceptor, ReadBuffer,
+    Source, StreamConsumer, StreamProducer, StreamReader, StreamResult, VecBuffer, WriteBuffer,
 };
 use observation::{ActivityGuard, DriverProbe};
 pub use observation::{
