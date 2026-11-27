@@ -187,5 +187,5 @@ impl StoreOpaque {
             .map(|id| CurrentScope::Id(Scope::Id(id))))
     }
 
-    pub(crate) fn clean_up_task_groups(&mut self) {}
+    pub(crate) fn clean_up_task_groups(&mut self, _trapped: bool) {}
 }

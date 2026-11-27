@@ -10,10 +10,16 @@ pub struct TaskGroupId {
 }
 
 impl StoreOpaque {
-    pub(crate) fn clean_up_task_groups(&mut self) {}
+    pub(crate) fn clean_up_task_groups(&mut self, _trapped: bool) {}
 }
 
 impl ConcurrentState {
+    pub(super) fn note_trapping_host_task(
+        &mut self,
+        _task: crate::component::concurrent::table::TableId<crate::component::concurrent::HostTask>,
+    ) {
+    }
+
     pub(super) fn handle_thread_switch(
         &mut self,
         _old: CurrentThread,

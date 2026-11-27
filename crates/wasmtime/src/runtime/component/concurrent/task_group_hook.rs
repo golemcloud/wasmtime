@@ -1,5 +1,5 @@
 use crate::component::concurrent::table::{TableDebug, TableId};
-use crate::component::concurrent::{ConcurrentState, CurrentThread};
+use crate::component::concurrent::{ConcurrentState, CurrentThread, HostTask};
 use crate::error::Result;
 use crate::store::StoreOpaque;
 use crate::{AsContextMut as _, Store, StoreContextMut};
@@ -84,6 +84,17 @@ pub trait TaskGroupHook: Send + Sync + 'static {
     /// created by that task, and the guest has dropped any and all handles to
     /// those tasks).
     fn handle_finish(&mut self, id: TaskGroupId) -> Result<()>;
+    /// Handle notification that the store was poisoned by code of the specified
+    /// task group: guest code of one of its threads trapped, or a host call that
+    /// one of its tasks made failed.
+    ///
+    /// This is called at most once per store, when it is poisoned, before the
+    /// entered group is exited and the started groups are finished. It is not
+    /// called when the failure cannot be traced to a task group.
+    fn handle_trap(&mut self, id: TaskGroupId) -> Result<()> {
+        let _ = id;
+        Ok(())
+    }
 }
 
 impl<T> Store<T> {
@@ -105,7 +116,10 @@ impl<T> StoreContextMut<'_, T> {
 }
 
 impl StoreOpaque {
-    pub(crate) fn clean_up_task_groups(&mut self) {
+    /// Exits the entered group and finishes every started group. When `trapped`,
+    /// the store has just been poisoned, and the group whose code poisoned it is
+    /// reported first (see [`TaskGroupHook::handle_trap`]).
+    pub(crate) fn clean_up_task_groups(&mut self, trapped: bool) {
         if !self.concurrency_support() {
             return;
         }
@@ -116,8 +130,12 @@ impl StoreOpaque {
         // because we're disposing of the store entirely.
 
         let state = self.concurrent_state_mut_without_forcing_current_thread();
+        let trapping_thread = state.trapping_thread.take();
         if let Some(mut hook) = state.task_group_hook.take() {
             let thread = state.unforced_current_thread;
+            if trapped && let Ok(Some(group)) = trapping_thread.unwrap_or(thread).group(state) {
+                _ = hook.handle_trap(group);
+            }
             if let Ok(Some(group)) = thread.group(state) {
                 _ = hook.handle_exit(group);
             }
@@ -158,6 +176,11 @@ impl CurrentThread {
 }
 
 impl ConcurrentState {
+    pub(super) fn note_trapping_host_task(&mut self, task: TableId<HostTask>) {
+        self.trapping_thread
+            .get_or_insert(CurrentThread::Host(task));
+    }
+
     pub(super) fn handle_thread_switch(
         &mut self,
         old: CurrentThread,
