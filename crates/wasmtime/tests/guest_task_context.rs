@@ -643,3 +643,116 @@ async fn legacy_async_resource_destructor_keeps_ambient_guest_task_context() -> 
     let run = instance.get_typed_func::<(Resource<u32>,), ()>(&mut store, "run")?;
     run.call_async(&mut store, (Resource::new_own(1),)).await
 }
+
+// A host call that fails, whether in the host function or while lifting its
+// parameters, leaves no deferred host call behind, so the Store can keep
+// running host work after the trap, such as a host task that the guest left
+// pending.
+#[tokio::test]
+#[cfg_attr(miri, ignore)]
+async fn failed_host_call_leaves_no_deferred_host_call() -> Result<()> {
+    let mut config = Config::new();
+    config.wasm_component_model_async(true);
+    let engine = Engine::new(&config)?;
+    let mut linker = Linker::new(&engine);
+    linker.root().func_wrap_concurrent("pending", |_, ()| {
+        Box::pin(async {
+            std::future::pending::<()>().await;
+            Ok(())
+        })
+    })?;
+    linker
+        .root()
+        .func_wrap("fail", |_: StoreContextMut<()>, ()| -> Result<()> {
+            Err(wasmtime::format_err!("host failure"))
+        })?;
+    linker.root().func_wrap_concurrent("fail-async", |_, ()| {
+        Box::pin(async { Err::<(), _>(wasmtime::format_err!("host failure")) })
+    })?;
+    linker
+        .root()
+        .func_wrap("take", |_: StoreContextMut<()>, (_,): (String,)| Ok(()))?;
+
+    // Each case: how `run` makes the failing call, and the expected error.
+    let cases = [
+        ("host error, sync lower", "(call $fail)", "host failure"),
+        (
+            "host error, async lower",
+            "(drop (call $fail_async))",
+            "host failure",
+        ),
+        (
+            "lift error, sync lower",
+            "(call $take (i32.const 65536) (i32.const 8))",
+            "out of bounds",
+        ),
+    ];
+    for (name, call, expected) in cases {
+        let component = Component::new(
+            &engine,
+            format!(
+                r#"
+                (component
+                  (import "pending" (func $pending async))
+                  (import "fail" (func $fail))
+                  (import "fail-async" (func $fail-async async))
+                  (import "take" (func $take (param "s" string)))
+
+                  (core module $libc (memory (export "memory") 1))
+                  (core instance $libc (instantiate $libc))
+
+                  (core module $m
+                    (import "" "pending" (func $pending (result i32)))
+                    (import "" "fail" (func $fail))
+                    (import "" "fail_async" (func $fail_async (result i32)))
+                    (import "" "take" (func $take (param i32 i32)))
+
+                    (func (export "run") (result i32)
+                      (drop (call $pending))
+                      {call}
+                      unreachable)
+
+                    (func (export "callback") (param i32 i32 i32) (result i32)
+                      unreachable)
+                  )
+
+                  (core func $pending (canon lower (func $pending) async))
+                  (core func $fail (canon lower (func $fail)))
+                  (core func $fail_async (canon lower (func $fail-async) async))
+                  (core func $take (canon lower (func $take) (memory (core memory $libc "memory"))))
+                  (core instance $i (instantiate $m (with "" (instance
+                    (export "pending" (func $pending))
+                    (export "fail" (func $fail))
+                    (export "fail_async" (func $fail_async))
+                    (export "take" (func $take))
+                  ))))
+                  (func (export "run") async
+                    (canon lift (core func $i "run") async
+                      (callback (core func $i "callback"))))
+                )
+                "#
+            ),
+        )?;
+        let mut store = Store::new(&engine, ());
+        let instance = linker.instantiate_async(&mut store, &component).await?;
+        let func = instance.get_typed_func::<(), ()>(&mut store, "run")?;
+
+        let error = store
+            .run_concurrent(async |store| func.call_concurrent(store, ()).await)
+            .await
+            .and_then(std::convert::identity)
+            .unwrap_err();
+        assert!(format!("{error:?}").contains(expected), "{name}: {error:?}");
+
+        // Polling the pending host task switches threads, which checks the
+        // deferred host state.
+        store
+            .run_concurrent(async |_| {
+                for _ in 0..5 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await?;
+    }
+    Ok(())
+}

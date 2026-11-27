@@ -177,6 +177,10 @@ impl StoreOpaque {
         Ok(self.exit_call_not_concurrent())
     }
 
+    pub(crate) fn host_task_delete_after_error(&mut self, (): ()) -> Result<()> {
+        Ok(self.exit_call_not_concurrent())
+    }
+
     pub(crate) fn current_materialized_host_task(&mut self) -> Result<()> {
         Ok(())
     }

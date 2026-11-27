@@ -584,7 +584,36 @@ where
         storage: &mut [MaybeUninit<ValRaw>],
     ) -> Result<()> {
         let entered_host_task = store.0.host_task_create()?;
+        let mut task_deleted = false;
+        let result = self.call_sync_lower_entered(
+            store.as_context_mut(),
+            instance,
+            ty,
+            options,
+            storage,
+            entered_host_task,
+            &mut task_deleted,
+        );
+        if result.is_err() && !task_deleted {
+            store.0.host_task_delete_after_error(entered_host_task)?;
+        }
+        result
+    }
 
+    /// The part of `call_sync_lower` that runs inside the host task entered
+    /// by `host_task_create`. `task_deleted` records whether it reached
+    /// `host_task_delete`, so that its caller leaves the task exactly once on
+    /// an error.
+    fn call_sync_lower_entered(
+        &self,
+        mut store: StoreContextMut<'_, T>,
+        instance: Instance,
+        ty: TypeFuncIndex,
+        options: OptionsIndex,
+        storage: &mut [MaybeUninit<ValRaw>],
+        entered_host_task: EnteredHostTask,
+        task_deleted: &mut bool,
+    ) -> Result<()> {
         let mut lift = LiftContext::new(store.0.store_opaque_mut(), options, instance)?;
         let (params, rest) = self.load_params(&mut lift, ty, MAX_FLAT_PARAMS, storage)?;
 
@@ -613,6 +642,7 @@ where
         let materialized_host_task = lower.store.0.current_materialized_host_task()?;
         #[cfg(feature = "component-model-async")]
         let observer = lower.store.0.take_current_terminal_observer()?;
+        *task_deleted = true;
         lower
             .store
             .0
@@ -633,11 +663,41 @@ where
     #[cfg(feature = "component-model-async")]
     fn call_async_lower(
         &self,
+        mut store: StoreContextMut<'_, T>,
+        instance: Instance,
+        ty: TypeFuncIndex,
+        options: OptionsIndex,
+        storage: &mut [MaybeUninit<ValRaw>],
+    ) -> Result<()> {
+        let entered_host_task = store.0.host_task_create()?;
+        let result = self.call_async_lower_entered(
+            store.as_context_mut(),
+            instance,
+            ty,
+            options,
+            storage,
+            entered_host_task,
+        );
+        // Async lowering needs concurrency support, so the task is a deferred
+        // host call until `lower` deletes it or the call is materialized;
+        // `host_task_delete_after_error` leaves it alone in both cases.
+        if result.is_err() {
+            store.0.host_task_delete_after_error(entered_host_task)?;
+        }
+        result
+    }
+
+    /// The part of `call_async_lower` that runs inside the host task entered
+    /// by `host_task_create`.
+    #[cfg(feature = "component-model-async")]
+    fn call_async_lower_entered(
+        &self,
         store: StoreContextMut<'_, T>,
         instance: Instance,
         ty: TypeFuncIndex,
         options: OptionsIndex,
         storage: &mut [MaybeUninit<ValRaw>],
+        entered_host_task: EnteredHostTask,
     ) -> Result<()> {
         use wasmtime_environ::component::MAX_FLAT_ASYNC_PARAMS;
 
@@ -645,7 +705,6 @@ where
         let mut store = StoreContextMut(store);
         let types = component.types();
         let fty = &types[ty];
-        let entered_host_task = store.0.host_task_create()?;
 
         // Lift the parameters, either from flat storage or from linear
         // memory.
